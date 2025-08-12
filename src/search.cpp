@@ -479,6 +479,13 @@ thread_local static Move killerMoves[64][2];
 // index [from][to] corresponds to moves from a square to a square.
 thread_local static int historyTable[64][64];
 
+// Countermove heuristic: For each previous move (from‑square × to‑square)
+// store the best reply that has previously caused a beta cutoff.  When
+// exploring moves after a given previous move, the stored countermove
+// is prioritised in move ordering.  We use thread‑local storage to
+// avoid contention between threads.
+thread_local static Move counterMoves[64][64];
+
 // Helper to obtain the material value of a piece code.  Input must
 // be non‑zero.  The absolute piece code minus one indexes into the
 // orderingMaterial array.  White and black pieces have the same
@@ -493,8 +500,19 @@ static inline int orderingPieceValue(int8_t p) {
 // search path.  When a position occurs three times, the game is
 // drawn and zero is returned.  The half‑move clock is checked for
 // the fifty‑move rule.  Insufficient material also yields a draw.
+// Extended minimax with alpha‑beta pruning and draw detection.  The
+// repetitions map counts occurrences of positions along the current
+// search path.  When a position occurs three times, the game is
+// drawn and zero is returned.  The half‑move clock is checked for
+// the fifty‑move rule.  Insufficient material also yields a draw.
+//
+// The `prevMove` parameter points to the move that led to this
+// position.  It is used by the countermove heuristic to prioritise
+// replies that have previously caused beta cutoffs after the same
+// opponent move.  At the root of the search, prevMove should be
+// nullptr.
 static int minimax(const nikola::Board& board, int depth, int ply, int alpha, int beta, bool maximizing,
-                   std::unordered_map<uint64_t,int>& repetitions) {
+                   std::unordered_map<uint64_t,int>& repetitions, const nikola::Move* prevMove) {
     // Fifty-move rule: if 100 half moves have occurred without a
     // capture, pawn move or promotion, return a draw score.
     if (board.halfMoveClock >= 100) {
@@ -583,7 +601,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                     // independently.
                     std::unordered_map<uint64_t,int> repsNull = repetitions;
                 int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
-                                        !maximizing, repsNull);
+                                        !maximizing, repsNull, prevMove);
                     // If the null move evaluation triggers a cutoff, perform a verification search
                     // at reduced depth to reduce the risk of incorrect pruning in zugzwang.  Only
                     // prune if both the initial null move and the verification search fail.
@@ -597,7 +615,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                             // Copy repetition map for verification search
                             std::unordered_map<uint64_t,int> repsVerify = repetitions;
                             int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, beta - 1, beta,
-                                                     !maximizing, repsVerify);
+                                                     !maximizing, repsVerify, prevMove);
                             if (verifyScore >= beta) {
                                 prune = true;
                             }
@@ -609,7 +627,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                             Board verifyBoard = nullBoard;
                             std::unordered_map<uint64_t,int> repsVerify = repetitions;
                             int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, alpha,
-                                                     alpha + 1, !maximizing, repsVerify);
+                                                     alpha + 1, !maximizing, repsVerify, prevMove);
                             if (verifyScore <= alpha) {
                                 prune = true;
                             }
@@ -759,6 +777,20 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         int fromIdx = m.fromRow * 8 + m.fromCol;
         int toIdx = m.toRow * 8 + m.toCol;
         score += historyTable[fromIdx][toIdx];
+
+        // Countermove bonus: if this move is the stored best reply to the
+        // previous move, give it a bonus to prioritise it after killers.
+        if (prevMove != nullptr) {
+            int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
+            int pTo = prevMove->toRow * 8 + prevMove->toCol;
+            const Move& cm = counterMoves[pFrom][pTo];
+            if (m.fromRow == cm.fromRow && m.fromCol == cm.fromCol &&
+                m.toRow == cm.toRow && m.toCol == cm.toCol &&
+                m.promotedTo == cm.promotedTo) {
+                // Assign a bonus between killer moves and history.
+                score += 850000;
+            }
+        }
         scored.emplace_back(score, m);
     }
     // Sort moves by descending score to improve pruning.  A stable
@@ -796,15 +828,15 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 }
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
-                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, false, repetitions);
+                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, false, repetitions, &m);
                 eval = evalReduced;
                 // If the reduced search suggests the move is good, re‑search
                 // at full depth to confirm.
                 if (evalReduced > alpha) {
-                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions);
+                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions, &m);
                 }
             } else {
-                eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions);
+                eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions, &m);
             }
             if (eval > bestVal) {
                 bestVal = eval;
@@ -825,6 +857,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int fIdx = m.fromRow * 8 + m.fromCol;
                 int tIdx = m.toRow * 8 + m.toCol;
                 historyTable[fIdx][tIdx] += depth * depth;
+                // Record countermove: store this move as the best reply to the previous move.
+                if (prevMove != nullptr) {
+                    int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
+                    int pTo = prevMove->toRow * 8 + prevMove->toCol;
+                    counterMoves[pFrom][pTo] = m;
+                }
                 break; // beta cutoff
             }
         }
@@ -843,13 +881,13 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 }
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
-                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, true, repetitions);
+                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, true, repetitions, &m);
                 eval = evalReduced;
                 if (evalReduced < beta) {
-                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions);
+                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions, &m);
                 }
             } else {
-                eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions);
+                eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions, &m);
             }
             if (eval < bestVal) {
                 bestVal = eval;
@@ -869,6 +907,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int fIdx = m.fromRow * 8 + m.fromCol;
                 int tIdx = m.toRow * 8 + m.toCol;
                 historyTable[fIdx][tIdx] += depth * depth;
+                // Record countermove for alpha cutoff as well.
+                if (prevMove != nullptr) {
+                    int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
+                    int pTo = prevMove->toRow * 8 + prevMove->toCol;
+                    counterMoves[pFrom][pTo] = m;
+                }
                 break;
             }
         }
@@ -914,7 +958,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         std::lock_guard<std::mutex> lock(ttMutex);
         transTable.clear();
     }
-    // Reset killer moves and history heuristic tables at the start of
+    // Reset killer moves, history heuristic and countermove tables at the start of
     // a new search.  This ensures that ordering heuristics reflect
     // only information gathered during the current search.
     for (int i = 0; i < 64; ++i) {
@@ -923,6 +967,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         }
         for (int j = 0; j < 64; ++j) {
             historyTable[i][j] = 0;
+            counterMoves[i][j] = Move{};
         }
     }
     // If no moves are available, return an empty move immediately.
@@ -1032,7 +1077,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             int bestLocalScore = board.whiteToMove ? INT_MIN : INT_MAX;
             // Lambda for worker threads.
             auto worker = [&]() {
-                // Each thread resets its own killer and history tables
+                // Each thread resets its own killer, history and countermove tables
                 // before starting the search to avoid interference from
                 // previous searches.  The thread_local variables ensure
                 // isolation across threads.
@@ -1042,6 +1087,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                     }
                     for (int j = 0; j < 64; ++j) {
                         historyTable[i][j] = 0;
+                        counterMoves[i][j] = Move{};
                     }
                 }
                 
@@ -1069,7 +1115,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                     // alpha‑beta bounds.  We do not use aspiration
                     // windows here to avoid coordination overhead.
                     int score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
-                                        !board.whiteToMove, reps);
+                                        !board.whiteToMove, reps, &m);
                     // Update the best move/score found so far.  Use
                     // locks to protect shared state.
                     {
@@ -1132,10 +1178,10 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                 int alpha = prevBestScore - aspirationWindow;
                 int beta = prevBestScore + aspirationWindow;
                 int score = minimax(child, currentDepth - 1, 1, alpha, beta,
-                                    !board.whiteToMove, reps);
+                                    !board.whiteToMove, reps, &m);
                 if (score <= alpha || score >= beta) {
                     score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
-                                    !board.whiteToMove, reps);
+                                    !board.whiteToMove, reps, &m);
                 }
                 if (board.whiteToMove) {
                     if (score > bestScoreAtDepth) {

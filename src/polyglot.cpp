@@ -204,19 +204,32 @@ std::optional<Move> probeBook(const Board& board) {
     if (it == g_book.end() || it->second.empty()) {
         return std::nullopt;
     }
-    // Choose the entry with the highest weight.  Some books may include
-    // multiple entries for the same position.  A more sophisticated
-    // selection could use weighted randomness or learning values.
+    // Choose a book entry using weighted randomness.  The weight field
+    // indicates the popularity or quality of a move.  We sum the
+    // weights of all entries and select one based on a uniform random
+    // number in [0, totalWeight).  Entries with higher weight are more
+    // likely to be chosen.  If all weights are zero we simply return
+    // the first entry.  We use a thread‑local RNG to avoid contention.
     const auto& vec = it->second;
-    const BookEntry* bestEntry = &vec[0];
+    uint64_t totalWeight = 0;
     for (const auto& e : vec) {
-        if (e.weight > bestEntry->weight) {
-            bestEntry = &e;
+        totalWeight += static_cast<uint64_t>(e.weight);
+    }
+    if (totalWeight == 0) {
+        return vec[0].move;
+    }
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist(0, totalWeight - 1);
+    uint64_t r = dist(rng);
+    uint64_t acc = 0;
+    for (const auto& e : vec) {
+        acc += static_cast<uint64_t>(e.weight);
+        if (r < acc) {
+            return e.move;
         }
     }
-    // Return the move stored in the best entry.  The captured field
-    // will be filled by the caller based on the current board state.
-    return bestEntry->move;
+    // Fallback: return the first entry (should not reach here).
+    return vec[0].move;
 }
 
 } // namespace nikola
