@@ -113,3 +113,13 @@ target_sources(nikolachess PRIVATE ${SRC_HPC})
 
 # Ensure property is set on the target (redundant but explicit)
 set_target_properties(nikolachess PROPERTIES CXX_STANDARD 17)
+
+enable_testing()
+
+add_executable(tbprobe_tests
+  tests/tbprobe_tests.cpp
+  tests/fathom_stub.cpp
+  src/tbprobe.cpp
+)
+target_include_directories(tbprobe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME tbprobe_tests COMMAND tbprobe_tests)
