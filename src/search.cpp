@@ -217,6 +217,20 @@ static std::unordered_map<uint64_t, TTEntry> transTable;
 // these values to prioritise captures and promotions during search.
 static const int orderingMaterial[6] = {100, 320, 330, 500, 900, 100000};
 
+// Killer move heuristic: for each ply store the two moves that most
+// recently caused a beta cutoff.  Moves are promoted to the front
+// of the move ordering at the corresponding depth.  The indices
+// correspond to the ply from the root (0 at root).  We support
+// depths up to 64 plies.
+static Move killerMoves[64][2];
+
+// History heuristic: a table accumulating a score for each move
+// (from square × to square).  Moves that frequently cause beta
+// cutoffs at deeper depths receive higher scores and are tried
+// earlier.  The table index is [fromSquare][toSquare] where
+// fromSquare = fromRow * 8 + fromCol and toSquare = toRow * 8 + toCol.
+static int historyTable[64][64];
+
 // Helper to obtain the material value of a piece code.  Input must
 // be non‑zero.  The absolute piece code minus one indexes into the
 // orderingMaterial array.  White and black pieces have the same
@@ -231,7 +245,7 @@ static inline int orderingPieceValue(int8_t p) {
 // search path.  When a position occurs three times, the game is
 // drawn and zero is returned.  The half‑move clock is checked for
 // the fifty‑move rule.  Insufficient material also yields a draw.
-static int minimax(const nikola::Board& board, int depth, int alpha, int beta, bool maximizing,
+static int minimax(const nikola::Board& board, int depth, int ply, int alpha, int beta, bool maximizing,
                    std::unordered_map<uint64_t,int>& repetitions) {
     // Fifty-move rule: if 100 half moves have occurred without a
     // capture, pawn move or promotion, return a draw score.
@@ -326,6 +340,26 @@ static int minimax(const nikola::Board& board, int depth, int alpha, int beta, b
             int attackerVal = orderingPieceValue(board.squares[m.fromRow][m.fromCol]);
             score += 10 * capturedVal - attackerVal;
         }
+        // Killer move bonus: moves that previously caused a beta cutoff
+        // at this ply are tried earlier.  First killer receives a
+        // large bonus; second killer a slightly smaller bonus.
+        if (ply < 64) {
+            const Move& k0 = killerMoves[ply][0];
+            if (m.fromRow == k0.fromRow && m.fromCol == k0.fromCol &&
+                m.toRow == k0.toRow && m.toCol == k0.toCol && m.promotedTo == k0.promotedTo) {
+                score += 900000;
+            } else {
+                const Move& k1 = killerMoves[ply][1];
+                if (m.fromRow == k1.fromRow && m.fromCol == k1.fromCol &&
+                    m.toRow == k1.toRow && m.toCol == k1.toCol && m.promotedTo == k1.promotedTo) {
+                    score += 800000;
+                }
+            }
+        }
+        // History heuristic: accumulate scores based on past beta cutoffs.
+        int fromIdx = m.fromRow * 8 + m.fromCol;
+        int toIdx = m.toRow * 8 + m.toCol;
+        score += historyTable[fromIdx][toIdx];
         scored.emplace_back(score, m);
     }
     // Sort moves by descending score to improve pruning.  A stable
@@ -344,26 +378,55 @@ static int minimax(const nikola::Board& board, int depth, int alpha, int beta, b
         for (const auto& pair : scored) {
             const Move& m = pair.second;
             Board child = makeMove(board, m);
-            int eval = minimax(child, depth - 1, alpha, beta, false, repetitions);
+            int eval = minimax(child, depth - 1, ply + 1, alpha, beta, false, repetitions);
             if (eval > bestVal) {
                 bestVal = eval;
                 bestChildMove = m;
             }
             if (eval > alpha) alpha = eval;
-            if (beta <= alpha) break; // beta cutoff
+            if (beta <= alpha) {
+                // Beta cutoff: record killer move and update history.
+                if (ply < 64) {
+                    // Promote to first killer if different.
+                    if (!(killerMoves[ply][0].fromRow == m.fromRow && killerMoves[ply][0].fromCol == m.fromCol &&
+                          killerMoves[ply][0].toRow == m.toRow && killerMoves[ply][0].toCol == m.toCol &&
+                          killerMoves[ply][0].promotedTo == m.promotedTo)) {
+                        killerMoves[ply][1] = killerMoves[ply][0];
+                        killerMoves[ply][0] = m;
+                    }
+                }
+                int fIdx = m.fromRow * 8 + m.fromCol;
+                int tIdx = m.toRow * 8 + m.toCol;
+                historyTable[fIdx][tIdx] += depth * depth;
+                break; // beta cutoff
+            }
         }
     } else {
         bestVal = INT_MAX;
         for (const auto& pair : scored) {
             const Move& m = pair.second;
             Board child = makeMove(board, m);
-            int eval = minimax(child, depth - 1, alpha, beta, true, repetitions);
+            int eval = minimax(child, depth - 1, ply + 1, alpha, beta, true, repetitions);
             if (eval < bestVal) {
                 bestVal = eval;
                 bestChildMove = m;
             }
             if (eval < beta) beta = eval;
-            if (beta <= alpha) break; // alpha cutoff
+            if (beta <= alpha) {
+                // Alpha cutoff: record killer move and update history.
+                if (ply < 64) {
+                    if (!(killerMoves[ply][0].fromRow == m.fromRow && killerMoves[ply][0].fromCol == m.fromCol &&
+                          killerMoves[ply][0].toRow == m.toRow && killerMoves[ply][0].toCol == m.toCol &&
+                          killerMoves[ply][0].promotedTo == m.promotedTo)) {
+                        killerMoves[ply][1] = killerMoves[ply][0];
+                        killerMoves[ply][0] = m;
+                    }
+                }
+                int fIdx = m.fromRow * 8 + m.fromCol;
+                int tIdx = m.toRow * 8 + m.toCol;
+                historyTable[fIdx][tIdx] += depth * depth;
+                break;
+            }
         }
     }
     // Store the result in the transposition table.  Only store
@@ -400,6 +463,17 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     // deepening depths to allow re‑use of work from shallower
     // searches but clear it on each new top‑level search.
     transTable.clear();
+    // Reset killer moves and history heuristic tables at the start of
+    // a new search.  This ensures that ordering heuristics reflect
+    // only information gathered during the current search.
+    for (int i = 0; i < 64; ++i) {
+        for (int k = 0; k < 2; ++k) {
+            killerMoves[i][k] = Move{};
+        }
+        for (int j = 0; j < 64; ++j) {
+            historyTable[i][j] = 0;
+        }
+    }
     // If no moves are available, return an empty move immediately.
     auto initialMoves = generateMoves(board);
     if (initialMoves.empty()) return chosenMove;
@@ -413,6 +487,13 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     // ordering in deeper searches.  If a time limit is set and
     // exceeded, we stop searching and return the best move found
     // thus far.
+    // Previous best score used to centre the aspiration window.  We
+    // initialise with zero at the root.  The aspiration window is
+    // centred around this score to restrict the alpha‑beta window and
+    // accelerate search.  On a fail high or fail low we research
+    // with the full window.
+    int prevBestScore = 0;
+    int aspirationWindow = 50;
     for (int currentDepth = 1; currentDepth <= depth; ++currentDepth) {
         Move bestMoveAtDepth{};
         int bestScoreAtDepth = board.whiteToMove ? INT_MIN : INT_MAX;
@@ -465,8 +546,18 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             // update its own count when entering minimax.
             std::unordered_map<uint64_t,int> reps;
             reps[rootHash] = 1;
-            int score = minimax(child, currentDepth - 1, INT_MIN, INT_MAX,
+            // Use aspiration window centred on the previous best score
+            int alpha = prevBestScore - aspirationWindow;
+            int beta = prevBestScore + aspirationWindow;
+            int score = minimax(child, currentDepth - 1, 1, alpha, beta,
                                 !board.whiteToMove, reps);
+            // If the evaluation falls outside the window, research with
+            // the full bounds.  This handles fail high or fail low
+            // conditions and ensures correctness.
+            if (score <= alpha || score >= beta) {
+                score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
+                                 !board.whiteToMove, reps);
+            }
             if (board.whiteToMove) {
                 if (score > bestScoreAtDepth) {
                     bestScoreAtDepth = score;
@@ -481,6 +572,10 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         }
         // After completing the current depth, update the chosen move.
         chosenMove = bestMoveAtDepth;
+        // Update the previous best score for the next iteration.  This
+        // centres the aspiration window on the most recent principal
+        // variation value.
+        prevBestScore = bestScoreAtDepth;
         // Check for time expiry after finishing the depth.  If the
         // allowed time is exceeded, break out of the iterative
         // deepening loop and return the best move found so far.

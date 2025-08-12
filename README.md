@@ -49,6 +49,13 @@ kernel, freeing the CPU to continue the search.
   efficiency.  A simple **time management system** aborts the search
   when a specified time limit expires, returning the best move found
   so far.  Depth is measured in plies.
+* **Advanced move ordering:** In addition to PV and MVV‑LVA ordering,
+  the engine uses **killer move** and **history heuristics** to
+  prioritise moves that have historically led to alpha‑beta cutoffs.
+  These heuristics update a table on each cutoff and boost the
+  ordering score of successful moves.  **Aspiration windows** centre
+  the search window around the previously observed principal
+  variation value to accelerate convergence.
 * **Draw detection:** The search detects draw claims by the
   fifty‑move rule, threefold repetition and a wide variety of
   insufficient material scenarios.  In addition to classical
