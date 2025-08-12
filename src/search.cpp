@@ -13,6 +13,9 @@
 // is kept modest.
 
 #include "board.h"
+#include "tt_entry.h"
+#include "tt_sharded.h"
+#include "thread_affinity.h"
 
 #include <climits>
 #include <chrono>
@@ -380,24 +383,11 @@ static bool isInsufficientMaterial(const nikola::Board& board) {
 // values: EXACT indicates the stored score is the precise evaluation;
 // LOWERBOUND means the score is a lower bound (alpha cutoff);
 // UPPERBOUND means the score is an upper bound (beta cutoff).
-struct TTEntry {
-    int depth;
-    int score;
-    int flag;
-    nikola::Move bestMove;
-};
+// TTEntry moved to tt_entry.h
 static const int TT_EXACT = 0;
 static const int TT_LOWERBOUND = 1;
 static const int TT_UPPERBOUND = 2;
-static std::unordered_map<uint64_t, TTEntry> transTable;
-
-// Mutex to protect access to the transposition table across
-// multiple threads.  The transposition table is shared among all
-// search threads so that work from one thread benefits others.  A
-// coarse‑grained lock is used for simplicity.  For high
-// performance engines, a finer‑grained or lock‑free table would
-// be preferable.
-static std::mutex ttMutex;
+// Transposition table now implemented via sharded module
 
 // Quiescence search.  This helper evaluates only capture and
 // promotion moves to avoid the horizon effect in leaf nodes.  It
@@ -546,13 +536,8 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     TTEntry ttEntry;
     bool ttFound = false;
     {
-        std::lock_guard<std::mutex> lock(ttMutex);
-        auto it = transTable.find(h);
-        if (it != transTable.end()) {
-            ttEntry = it->second;
-            ttFound = true;
-        }
-    }
+    ttFound = tt_lookup(h, ttEntry);
+}
     if (ttFound && ttEntry.depth >= depth) {
         if (ttEntry.flag == TT_EXACT) {
             cnt--;
@@ -931,13 +916,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         flag = TT_EXACT;
     }
     TTEntry newEntry{depth, bestVal, flag, bestChildMove};
-    {
-        std::lock_guard<std::mutex> lock(ttMutex);
-        auto existing = transTable.find(h);
-        if (existing == transTable.end() || existing->second.depth < depth) {
-            transTable[h] = newEntry;
-        }
-    }
+    { tt_store(h, newEntry); }
     // Restore repetition count when backtracking.
     cnt--;
     return bestVal;
@@ -948,16 +927,13 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
 // or lowest (for Black) evaluation.  If there are no legal moves,
 // returns a zeroed move.
 Move findBestMove(const Board& board, int depth, int timeLimitMs) {
+    tt_configure_from_env();
     Move chosenMove{};
     // Clear the transposition table to avoid interference from
     // previous searches.  We retain the table across iterative
     // deepening depths to allow re‑use of work from shallower
     // searches but clear it on each new top‑level search.
-    {
-        // Clear the transposition table under lock to avoid races
-        std::lock_guard<std::mutex> lock(ttMutex);
-        transTable.clear();
-    }
+    { tt_clear(); }
     // Reset killer moves, history heuristic and countermove tables at the start of
     // a new search.  This ensures that ordering heuristics reflect
     // only information gathered during the current search.
@@ -1076,7 +1052,9 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             Move bestLocalMove{};
             int bestLocalScore = board.whiteToMove ? INT_MIN : INT_MAX;
             // Lambda for worker threads.
-            auto worker = [&]() {
+            auto worker = [&](int tid) {
+                const char* pinEnv = std::getenv("NIKOLA_PIN_THREADS");
+                if (pinEnv && pinEnv[0] == '1') { nikola_pin_thread_to_core(tid); }
                 // Each thread resets its own killer, history and countermove tables
                 // before starting the search to avoid interference from
                 // previous searches.  The thread_local variables ensure
@@ -1140,10 +1118,10 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             std::vector<std::thread> threads;
             threads.reserve(numThreads - 1);
             for (int t = 1; t < numThreads; ++t) {
-                threads.emplace_back(worker);
+                threads.emplace_back(worker, t);
             }
             // Run worker in the current thread.
-            worker();
+            worker(0);
             // Join all spawned threads.
             for (auto& th : threads) {
                 if (th.joinable()) th.join();

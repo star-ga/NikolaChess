@@ -56,3 +56,12 @@ if(NIKOLA_USE_MPI)
     target_include_directories(nikolachess PRIVATE ${MPI_INCLUDE_PATH})
     target_link_libraries(nikolachess PRIVATE MPI::MPI_CXX)
 endif()
+# HPC additions
+set(SRC_HPC
+  src/tt_entry.h
+  src/tt_sharded.cpp
+  src/thread_affinity.cpp
+  src/cpu_features.cpp)
+
+set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 17)
+target_sources(${PROJECT_NAME} PRIVATE ${SRC_HPC})

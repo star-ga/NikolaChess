@@ -256,3 +256,18 @@ which is a key component of tree search.  We hope this project
 serves as a robust baseline for experiments with more sophisticated
 search strategies and evaluation methods on modern heterogeneous
 architectures.
+
+
+## HPC / Supercomputer Notes
+
+NikolaChess is optimized for high-concurrency and GPU-heavy environments.
+
+**Environment variables**
+- `NIKOLA_TT_SHARDS` (default: 64) — number of transposition-table shards (striped locks) to reduce contention.
+- `NIKOLA_PIN_THREADS=1` — pin search worker threads to distinct CPU cores (Linux only; safe no-op elsewhere).
+
+**CPU features**
+Runtime detects: AVX2, AVX-512F, BMI2, POPCNT. These flags will be used for future SIMD-optimized code paths (e.g., NNUE and move gen).
+
+**Cluster usage**
+Combine Lazy SMP with GPU batching. For distributed/MPI searches, see `distributed.cpp` (experimental).
