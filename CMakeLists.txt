@@ -14,12 +14,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(nikolachess
     src/main.cpp
     src/board.h
+    src/board.cpp
     src/move_generation.cu
     src/evaluate.cu
     src/search.cpp
     src/perft.cpp
         src/gpu_eval.cpp
         src/uci.cpp
+    src/micro_batcher.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.

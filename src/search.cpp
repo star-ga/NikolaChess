@@ -23,6 +23,11 @@
 #include <cstdlib> // for getenv
 #include <vector>
 
+// Include the micro-batcher for GPU evaluation.  The batcher
+// collects evaluation requests from multiple threads and processes
+// them in batches on the GPU.  See micro_batcher.h for details.
+#include "micro_batcher.h"
+
 namespace nikola {
 
 // Forward declaration of move generator and evaluation functions.
@@ -50,23 +55,69 @@ static EvaluationBackend g_evalBackend = []() {
     return EvaluationBackend::CPU_NNUE;
 }();
 
+// Global pointer to the micro-batcher.  It is initialised on first
+// use when GPU_BATCHED backend is selected.  The batcher collects
+// boards from calls to staticEvaluate() and performs batched
+// evaluation on a worker thread.  When the program exits the
+// batcher is destroyed, which signals the worker to stop.
+static MicroBatcher* g_batcher = nullptr;
+
+// Helper struct to lazily create and destroy the micro-batcher.
+// The constructor reads environment variables NIKOLA_GPU_MAX_BATCH
+// and NIKOLA_GPU_MICROBATCH_MS to configure the batch size and
+// flush interval.  If these are not set, default values are used.
+struct MicroBatcherInitializer {
+    MicroBatcherInitializer() {
+        if (g_evalBackend == EvaluationBackend::GPU_BATCHED) {
+            int maxBatch = 32;
+            int flushMs = 2;
+            if (const char* mb = std::getenv("NIKOLA_GPU_MAX_BATCH")) {
+                int v = std::atoi(mb);
+                if (v > 0) maxBatch = v;
+            }
+            if (const char* fm = std::getenv("NIKOLA_GPU_MICROBATCH_MS")) {
+                int v = std::atoi(fm);
+                if (v > 0) flushMs = v;
+            }
+            g_batcher = new MicroBatcher(static_cast<size_t>(maxBatch), flushMs);
+        }
+    }
+    ~MicroBatcherInitializer() {
+        if (g_batcher) {
+            // Force a final flush and destroy the batcher.
+            g_batcher->flush();
+            delete g_batcher;
+            g_batcher = nullptr;
+        }
+    }
+};
+
+// Static instance ensures the initializer runs before main().
+static MicroBatcherInitializer g_batcherInit;
+
 // Evaluate a board position using the selected backend.  When the
 // GPU backend is selected, this function batches a single board and
 // calls evaluateBoardsGPU.  If GPU evaluation fails or returns
 // empty, falls back to the CPU evaluator.
 static int staticEvaluate(const Board& b) {
-    if (g_evalBackend == EvaluationBackend::GPU_BATCHED) {
+    // If GPU batched evaluation is selected and a batcher exists,
+    // submit the board to the batcher and wait for the result.  This
+    // call may block if the batch has not yet been flushed.  Any
+    // exceptions thrown by the batcher are caught and we fall back to
+    // CPU evaluation.
+    if (g_evalBackend == EvaluationBackend::GPU_BATCHED && g_batcher) {
         try {
-            std::vector<Board> boards;
-            boards.push_back(b);
-            std::vector<int> scores = evaluateBoardsGPU(boards.data(), (int)boards.size());
-            if (!scores.empty()) {
-                return scores[0];
-            }
+            std::future<int> fut = g_batcher->submit(b);
+            // Wait for the result.  The future will be fulfilled
+            // when the batcher processes the batch, which may occur
+            // immediately or after a short delay.
+            return fut.get();
         } catch (...) {
-            // Swallow exceptions and fall back to CPU path.
+            // If submitting to the batcher throws (e.g., due to
+            // shutdown), fall back to CPU evaluation.
         }
     }
+    // Default path: evaluate on the CPU.
     return evaluateBoardCPU(b);
 }
 
