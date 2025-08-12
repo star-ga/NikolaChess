@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --gpu-streams must be non-negative.\n";
                 return 2;
             }
-            setGpuStreams(n);
+            ::setGpuStreams(n);
             // Remove the option and its value from argv/argc (compact in-place)
             for (int j = i; j + 2 <= argc; ++j) {
                 argv[j] = argv[j + 2];
