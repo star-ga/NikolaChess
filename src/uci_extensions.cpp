@@ -1,3 +1,53 @@
+// Additional UCI commands beyond the minimal set handled in uci.cpp.
+// This implementation depends on various engine subsystems and was
+// previously missing required includes, causing standalone builds to
+// fail.  We include the necessary headers and place the implementation
+// in the nikola namespace to match its declaration.
+
+#include "uci_extensions.h"
+#include "engine_options.h"
+#include "uci.h"
+#include "multipv_search.h"
+#include "time_manager.h"
+#include "tablebase.h"
+#include "pv.h"
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <sstream>
+
+namespace nikola {
+
+void uci_print_id_and_options() {
+    std::cout << "id name NikolaChess" << std::endl;
+    std::cout << "id author CPUTER Inc." << std::endl;
+    std::cout << "uciok" << std::endl;
+}
+
+void uci_isready() {
+    std::cout << "readyok" << std::endl;
+}
+
+void uci_setoption(const std::vector<std::string>& /*tokens*/) {
+    // Option handling is not yet implemented.
+}
+
+// Helper to extract an integer value from tokenised UCI arguments.
+static int to_i(const std::vector<std::string>& tokens,
+                const std::string& key, int def) {
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i] == key) {
+            try {
+                return std::stoi(tokens[i + 1]);
+            } catch (...) {
+                return def;
+            }
+        }
+    }
+    return def;
+}
+
 void uci_go(const Board& current, const std::vector<std::string>& tokens) {
     EngineOptions& o = opts();
 
@@ -70,3 +120,5 @@ void uci_go(const Board& current, const std::vector<std::string>& tokens) {
         std::cout << "bestmove 0000" << std::endl;
     }
 }
+
+} // namespace nikola
