@@ -19,6 +19,9 @@
 #include <cstdint>
 
 
+// setGpuStreams is now provided elsewhere in the nikola namespace
+// (no local stub here to avoid ODR/linkage ambiguity).
+
 // Forward declaration of search entrypoint (implemented in search.cpp).
 // If you have a public header that declares this (e.g. search.h), you can
 // include it instead of this forward declaration.
