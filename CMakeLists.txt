@@ -114,6 +114,20 @@ if(NIKOLA_USE_NCCL)
   endif()
 endif()
 
+# Optional TensorRT support for NNUE inference
+option(NIKOLA_USE_TENSORRT "Enable TensorRT NNUE inference" OFF)
+if(NIKOLA_USE_TENSORRT)
+  find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
+  find_library(TENSORRT_LIBRARY nvinfer)
+  if(TENSORRT_INCLUDE_DIR AND TENSORRT_LIBRARY)
+    target_compile_definitions(nikola_core PRIVATE NIKOLA_USE_TENSORRT)
+    target_include_directories(nikola_core PRIVATE ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(nikola_core PRIVATE ${TENSORRT_LIBRARY})
+  else()
+    message(WARNING "NIKOLA_USE_TENSORRT=ON but TensorRT not found – continuing without TensorRT")
+  endif()
+endif()
+
 # HPC / TT / affinity bits
 set(SRC_HPC
   src/tt_entry.h

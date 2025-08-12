@@ -169,7 +169,8 @@ __global__ void evalKernel(const Board* boards, int* outScores, int n) {
 // kernel with enough threads, and copies back the results.
 std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
     if (nBoards <= 0) return {};
-    cudaError_t err;
+    // Track CUDA errors so we can perform clean-up before throwing.
+    cudaError_t err = cudaSuccess;
     size_t boardsBytes = sizeof(Board) * nBoards;
     size_t scoresBytes = sizeof(int) * nBoards;
 
@@ -315,9 +316,21 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
         evalKernel<<<numBlocks, blockSize, 0, streams[s]>>>(dBoards + offset,
                                                             dScores + offset,
                                                             count);
+        // Capture any kernel launch failure immediately.
+        err = cudaGetLastError();
+        if (err != cudaSuccess) break;
         err = cudaMemcpyAsync(hScoresPinned + offset, dScores + offset, sBytes,
                               cudaMemcpyDeviceToHost, streams[s]);
         if (err != cudaSuccess) break;
+    }
+
+    if (err != cudaSuccess) {
+        for (int s = 0; s < streamCount; ++s) cudaStreamDestroy(streams[s]);
+        cudaFree(dBoards);
+        cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
+        throw std::runtime_error("CUDA asynchronous launch failed");
     }
 
     for (int s = 0; s < streamCount; ++s) {
