@@ -19,7 +19,7 @@ CPUFeatures detect_cpu_features() {
     unsigned int a,b,c,d;
     // Leaf 1 for POPCNT (ECX bit 23) actually POPCNT is SSE4.2? We'll check leaf 1 ECX bit 23 = POPCNT is actually bit 23 for POPCNT in ECX of leaf 1? POPCNT is ECX bit 23.
     __cpuid(1, a,b,c,d);
-    f.popcnt = (ecx & (1u<<23)) != 0; // fix below by defining ecx
+    f.popcnt = (c & (1u<<23)) != 0;
 #endif
     return f;
 }
