@@ -21,6 +21,7 @@
 #include "uci.h"
 #include "search.h"
 #include "board.h"
+#include "engine_options.h" // access to global UCI options
 #include "gpu_eval.h" // for possible future integration
 #include "tablebase.h" // for setting tablebase path
 #include "pgn_logger.h" // for recording moves and saving PGN
@@ -40,6 +41,12 @@ static std::string g_pgnFilePath = "game.pgn";
 // Opening book configuration
 static bool g_useBook = false;
 static std::string g_bookFilePath;
+
+// Exposed strength settings (stored in EngineOptions singleton)
+bool getLimitStrength() { return opts().LimitStrength; }
+int  getStrength()      { return opts().Strength; }
+void setLimitStrength(bool v) { opts().LimitStrength = v; }
+void setStrength(int v) { opts().Strength = v; }
 
 // Helper to convert from row,col to algebraic notation.
 static std::string toAlgebraic(int row, int col) {
@@ -88,7 +95,14 @@ void runUciLoop() {
         std::string cmd;
         if (!(iss >> cmd)) continue;
         if (cmd == "uci") {
-            nikola::uci_print_id_and_options();
+            std::cout << "id name NikolaChess" << std::endl;
+            std::cout << "id author CPUTER Inc." << std::endl;
+            std::cout << "option name MultiPV type spin default 1 min 1 max 8" << std::endl;
+            std::cout << "option name UseGPU type check default false" << std::endl;
+            std::cout << "option name OwnBook type check default false" << std::endl;
+            std::cout << "option name BookFile type string default" << std::endl;
+            std::cout << "option name PGNFile type string default game.pgn" << std::endl;
+            std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             nikola::uci_isready();
         } else if (cmd == "ucinewgame") {
@@ -204,7 +218,13 @@ void runUciLoop() {
                 }
             }
         } else if (cmd == "go") {
-            nikola::uci_go(board, tokens);
+            int depth = 3;
+            int movetime = 0;
+            for (size_t i = 1; i + 1 < tokens.size(); ++i) {
+                if (tokens[i] == "depth") depth = std::stoi(tokens[i+1]);
+                if (tokens[i] == "movetime") movetime = std::stoi(tokens[i+1]);
+            }
+            findBestMove(board, depth, movetime);
         } else if (cmd == "stop") {
             // Synchronous search returns immediately; nothing to stop.
             // A real implementation would signal the search thread to halt.
@@ -290,6 +310,12 @@ void runUciLoop() {
                     } else {
                         g_bookFilePath.clear();
                         nikola::setBookFile("");
+                    }
+                } else if (name == "MultiPV") {
+                    if (!value.empty()) {
+                        int v = std::stoi(value);
+                        if (v < 1) v = 1; else if (v > 8) v = 8;
+                        g_multiPV = v;
                     }
                 }
                 // Other options (Hash, Threads) are currently ignored.

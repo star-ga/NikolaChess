@@ -18,14 +18,13 @@
 #include <exception>
 #include <cstdint>
 
-// GPU stream configuration is provided by the evaluation module.
-
-// Forward declaration of search entrypoint (implemented in search.cpp).
-// If you have a public header that declares this (e.g. search.h), you can
-// include it instead of this forward declaration.
 namespace nikola {
+// Provided by search.cpp
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
-}
+
+// Provided by the GPU evaluation module (e.g., gpu_eval.cpp/.h)
+void setGpuStreams(int n);
+} // namespace nikola
 
 // Utility to convert a zero-based square coordinate into algebraic
 // notation (e.g. (0,0) -> "a1", (7,7) -> "h8").

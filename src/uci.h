@@ -21,4 +21,10 @@ namespace nikola {
 // specification.
 void runUciLoop();
 
+// Accessors for strength limiting options
+bool getLimitStrength();
+int  getStrength();
+void setLimitStrength(bool v);
+void setStrength(int v);
+
 } // namespace nikola
