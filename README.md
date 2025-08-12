@@ -159,6 +159,16 @@ GPU evaluation of starting position: 0
 Engine selects move: b1 -> a3
 ```
 
+To experiment with the experimental distributed search prototype,
+build the engine with MPI (and optionally NCCL) enabled and launch it
+with the `--distributed` flag using `mpirun` or a compatible MPI
+launcher.  Each rank will search a different root move and the master
+process will report the best result:
+
+```sh
+mpirun -n 4 ./nikolachess --distributed
+```
+
 The current move generator enforces the rules of chess: castling,
 en passant and pawn promotions are all implemented, and moves that
 leave the moving side in check are discarded.  The engine detects

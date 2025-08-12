@@ -90,6 +90,18 @@ if(NIKOLA_USE_MPI)
   target_link_libraries(nikolachess PRIVATE MPI::MPI_CXX)
 endif()
 
+# Optional NCCL support for multi-GPU communication
+option(NIKOLA_USE_NCCL "Enable NCCL multi-GPU communication" OFF)
+if(NIKOLA_USE_NCCL)
+  find_path(NCCL_INCLUDE_DIR nccl.h)
+  find_library(NCCL_LIBRARY nccl)
+  if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    target_compile_definitions(nikolachess PRIVATE NIKOLA_USE_NCCL)
+    target_include_directories(nikolachess PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(nikolachess PRIVATE ${NCCL_LIBRARY})
+  endif()
+endif()
+
 # HPC / TT / affinity bits
 set(SRC_HPC
   src/tt_entry.h
