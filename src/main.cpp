@@ -13,16 +13,8 @@
 #include <vector>
 #include <string>
 #include "uci.h"
+#include "search.h"
 
-// Forward declaration of search function defined in search.cpp.
-namespace nikola {
-// Find the best move using minimax search to the given depth.  When
-// timeLimitMs is positive, iterative deepening will stop when the
-// allotted time in milliseconds expires.  The default value of
-// zero disables the time limit and searches to the specified
-// depth.
-Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
-}
 
 // Utility to convert a zero‑based square coordinate into algebraic
 // notation (e.g. (0,0) -> "a1", (7,7) -> "h8").

@@ -3,6 +3,8 @@
 // Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for details.
 #include "board.h"
+#include "bitboard.h"
+#include "nnue.h"
 
 #include <algorithm>
 #include <fstream>
@@ -192,118 +194,6 @@ static void initPestoTables(int mgTable[2][6][64]) {
     }
 }
 
-// Neural network evaluation stub.  This demonstrates how a neural
-// network can be integrated into the evaluation pipeline.  A real
-// engine would train weights offline and embed them here; we use
-// simple deterministic weights for demonstration.  The network takes
-// 768 binary input features (12 piece types × 64 squares) flattened
-// into a vector.  We implement one hidden layer with 32 neurons and
-// ReLU activations, and a single output neuron.  The output is
-// interpreted as a score in centipawns.
-static int nnEvaluateBoard(const Board& board) {
-    // Define dimensions.
-    const int inputSize = 12 * 64;
-    const int hiddenSize = 32;
-    // Static weight matrices.  These are initialised on first use.
-    // The network has a single hidden layer of size `hiddenSize` and
-    // uses 768 binary input features (12 piece types × 64 squares).
-    // To support loading a fully‑trained NNUE network, the code will
-    // attempt to read weights from a binary file.  The file format
-    // consists of the following data in little‑endian order:
-    //   - w1 (hiddenSize × inputSize floats)
-    //   - b1 (hiddenSize floats)
-    //   - w2 (hiddenSize floats)
-    //   - b2 (single float)
-    // If the file cannot be read or does not match the expected
-    // length, we fall back to deterministic pseudo‑random weights as
-    // before.  Users can specify the weight file via the
-    // `NNUE_WEIGHTS_FILE` environment variable.  If unset, a file
-    // named `nnue_weights.bin` in the current working directory is
-    // attempted.
-    static bool weightsInit = false;
-    static float w1[hiddenSize][inputSize];
-    static float b1[hiddenSize];
-    static float w2[hiddenSize];
-    static float b2;
-    if (!weightsInit) {
-        bool loaded = false;
-        // Determine the weights file path from the environment or default.
-        const char* envPath = std::getenv("NNUE_WEIGHTS_FILE");
-        std::string path = envPath ? std::string(envPath) : std::string("nnue_weights.bin");
-        std::ifstream in(path, std::ios::binary);
-        if (in) {
-            // Compute expected size in bytes.
-            size_t expected = sizeof(w1) + sizeof(b1) + sizeof(w2) + sizeof(b2);
-            // Read file into a buffer.
-            in.seekg(0, std::ios::end);
-            size_t fileSize = (size_t)in.tellg();
-            in.seekg(0, std::ios::beg);
-            if (fileSize == expected) {
-                in.read(reinterpret_cast<char*>(w1), sizeof(w1));
-                in.read(reinterpret_cast<char*>(b1), sizeof(b1));
-                in.read(reinterpret_cast<char*>(w2), sizeof(w2));
-                in.read(reinterpret_cast<char*>(&b2), sizeof(b2));
-                if (in) {
-                    loaded = true;
-                }
-            }
-        }
-        if (!loaded) {
-            // Fall back to deterministic pseudo‑random weights.
-            unsigned int seed = 42;
-            auto randf = [&seed]() {
-                seed = seed * 1664525u + 1013904223u;
-                return (seed & 0xFFFF) / 65535.0f - 0.5f;
-            };
-            for (int i = 0; i < hiddenSize; ++i) {
-                b1[i] = randf() * 0.1f;
-                for (int j = 0; j < inputSize; ++j) {
-                    w1[i][j] = randf() * 0.01f;
-                }
-            }
-            for (int i = 0; i < hiddenSize; ++i) {
-                w2[i] = randf() * 0.01f;
-            }
-            b2 = randf() * 0.1f;
-        }
-        weightsInit = true;
-    }
-    // Construct input vector.  We encode each square with a one‑hot
-    // representation over 12 piece types.  Index mapping: piece codes
-    // ±1..±6 map to 0..11; White pieces occupy indices 0..5 and
-    // Black pieces occupy 6..11.  Empty squares contribute zero.
-    float hidden[32] = {0};
-    // Feedforward first layer: accumulate w1[i][j] * x[j] + b1[i].
-    for (int i = 0; i < hiddenSize; ++i) {
-        float sum = b1[i];
-        // Loop over board squares and accumulate weights for
-        // corresponding feature indices.  This avoids constructing
-        // the entire 768‑element input vector explicitly.
-        for (int r = 0; r < 8; ++r) {
-            for (int c = 0; c < 8; ++c) {
-                int8_t p = board.squares[r][c];
-                if (p == EMPTY) continue;
-                int type = (p > 0 ? p - 1 : (-p - 1));
-                int colorIdx = (p > 0 ? 0 : 1);
-                int featureIdx = colorIdx * 6 * 64 + type * 64 + (r * 8 + c);
-                sum += w1[i][featureIdx];
-            }
-        }
-        // ReLU activation.
-        hidden[i] = sum > 0 ? sum : 0;
-    }
-    // Output layer.
-    float out = b2;
-    for (int i = 0; i < hiddenSize; ++i) {
-        out += w2[i] * hidden[i];
-    }
-    // Convert to integer score.  Scale by 100 centipawns for small
-    // values.  Clamp to avoid integer overflow.
-    int score = static_cast<int>(out * 100);
-    if (score > 100000) score = 100000;
-    if (score < -100000) score = -100000;
-    return score;
-}
 
 int evaluateBoardCPU(const Board& board) {
     // Switch between traditional heuristic evaluation and neural network
@@ -321,27 +211,26 @@ int evaluateBoardCPU(const Board& board) {
         useNeuralNet = true;
     }
     if (useNeuralNet) {
-        return nnEvaluateBoard(board);
+        return nnueEvaluate(board);
     }
     // Initialize piece‑square table on first use.
     int mgTable[2][6][64];
     initPestoTables(mgTable);
     int scoreWhite = 0;
     int scoreBlack = 0;
-    // Sum piece‑square values for each side.
-    for (int r = 0; r < 8; ++r) {
-        for (int c = 0; c < 8; ++c) {
-            int8_t p = board.squares[r][c];
-            if (p == EMPTY) continue;
-            int type = (p > 0 ? p - 1 : (-p - 1));
-            int colorIdx = (p > 0 ? 0 : 1);
-            int sq = r * 8 + c;
-            int val = mgTable[colorIdx][type][sq];
-            if (p > 0) {
-                scoreWhite += val;
-            } else {
-                scoreBlack += val;
-            }
+    Bitboards bb = boardToBitboards(board);
+    for (int p = 0; p < 6; ++p) {
+        Bitboard w = bb.pieces[p];
+        while (w) {
+            int sq = bb_lsb(w);
+            bb_pop_lsb(w);
+            scoreWhite += mgTable[0][p][sq];
+        }
+        Bitboard b = bb.pieces[p + 6];
+        while (b) {
+            int sq = bb_lsb(b);
+            bb_pop_lsb(b);
+            scoreBlack += mgTable[1][p][sq];
         }
     }
     int eval = scoreWhite - scoreBlack;
