@@ -493,6 +493,60 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             cnt--;
             return ttEntry.score;
         }
+
+    // Null‑move pruning.  If the side to move is not in check and
+    // sufficient depth remains, try a null move (skip the turn) to
+    // quickly detect quiet positions where the opponent cannot take
+    // advantage.  We avoid null moves in situations with very few
+    // pieces to reduce the risk of zugzwang.  A reduction R of 2 or
+    // 3 plies is applied based on remaining depth.  If the null
+    // move causes a fail‑high (maximizing) or fail‑low (minimizing)
+    // condition, the branch is pruned.
+    if (depth >= 2) {
+        // Only attempt a null move if the side to move is not in check.
+        bool inCheck = isKingInCheck(board, board.whiteToMove);
+        if (!inCheck) {
+            // Require more than three pieces on the board to avoid
+            // zugzwang in simple endgames.
+            int numPieces = nikola::countPieces(board);
+            if (numPieces > 3) {
+                // Determine the reduction.  Use a larger reduction for
+                // deeper nodes to make null‑move pruning more
+                // aggressive.
+                int R = (depth > 6 ? 3 : 2);
+                if (depth - 1 - R >= 0) {
+                    Board nullBoard = board;
+                    // Switch side to move and clear en passant target.
+                    nullBoard.whiteToMove = !board.whiteToMove;
+                    nullBoard.enPassantCol = -1;
+                    // Increment halfmove clock since no capture or pawn
+                    // move occurred.
+                    nullBoard.halfMoveClock = board.halfMoveClock + 1;
+                    // Copy the repetition map so the null move does not
+                    // affect other branches.  The minimax call will
+                    // increment/decrement repetition counts
+                    // independently.
+                    std::unordered_map<uint64_t,int> repsNull = repetitions;
+                    int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
+                                            !maximizing, repsNull);
+                    // If the null move evaluation triggers a cutoff, prune.
+                    if (maximizing) {
+                        // For the maximizing side, a score >= beta is a fail‑high.
+                        if (nullScore >= beta) {
+                            cnt--;
+                            return nullScore;
+                        }
+                    } else {
+                        // For the minimizing side, a score <= alpha is a fail‑low.
+                        if (nullScore <= alpha) {
+                            cnt--;
+                            return nullScore;
+                        }
+                    }
+                }
+            }
+        }
+    }
     }
     // If depth is zero or no moves, perform static evaluation.  We do
     // not consult the TT again here because shallow positions are
