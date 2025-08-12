@@ -39,6 +39,13 @@
 
 namespace nikola {
 
+// Result payload exchanged between master and workers.  Each worker sends its
+// evaluated score together with the originating move back to rank 0.
+struct Result {
+    int score;
+    Move move;
+};
+
 int distributed_search() {
 #ifdef NIKOLA_USE_MPI
     int provided;
@@ -110,12 +117,9 @@ int distributed_search() {
         Move bestMove{};
 
         while (active > 0) {
-            struct Result {
-                int score;
-                Move move;
-            } res;
+            Result res;
             MPI_Status st;
-            MPI_Recv(&res, sizeof(res), MPI_BYTE, MPI_ANY_SOURCE, 1,
+            MPI_Recv(&res, sizeof(Result), MPI_BYTE, MPI_ANY_SOURCE, 1,
                      MPI_COMM_WORLD, &st);
 
             if (root.whiteToMove) {
@@ -162,11 +166,8 @@ int distributed_search() {
 
             Board child = makeMove(root, m);
             int score = evaluateBoardCPU(child);
-            struct Result {
-                int score;
-                Move move;
-            } res{score, m};
-            MPI_Send(&res, sizeof(res), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+            Result res{score, m};
+            MPI_Send(&res, sizeof(Result), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
         }
 
 #ifdef NIKOLA_USE_NCCL
