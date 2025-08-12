@@ -58,30 +58,102 @@ void GpuEval::flush() {
 // previous behaviour and keeps the rest of the engine unchanged.
 // ---------------------------------------------------------------------------
 
+// Simple CPU thread-pool implementation that mirrors a production TensorRT
+// backend.  Tasks consisting of NNUE feature vectors are queued and processed
+// asynchronously by a fixed number of worker threads.  This keeps the public
+// API intact while providing an actual evaluation pipeline.
+
+#include "nnue.h"
+#include "bitboard.h"
+
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
+
 namespace nikola {
+namespace {
+
+struct Task {
+    std::vector<float> features;
+    std::promise<float> promise;
+};
+
+std::vector<std::thread> workers;
+std::queue<Task> tasks;
+std::mutex mtx;
+std::condition_variable cv;
+bool stopWorkers = false;
+NNUE gNet; // default network instance
+
+void workerLoop() {
+    while (true) {
+        Task t;
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [] { return stopWorkers || !tasks.empty(); });
+            if (stopWorkers && tasks.empty()) return;
+            t = std::move(tasks.front());
+            tasks.pop();
+        }
+        Bitboards bb{};
+        for (int piece = 0; piece < 12; ++piece) {
+            for (int sq = 0; sq < 64; ++sq) {
+                if (t.features[piece * 64 + sq] > 0.5f)
+                    bb_set(bb.pieces[piece], sq);
+            }
+        }
+        float score = static_cast<float>(gNet.evaluate(bb));
+        t.promise.set_value(score);
+    }
+}
+
+void shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stopWorkers = true;
+    }
+    cv.notify_all();
+    for (auto& th : workers) {
+        if (th.joinable()) th.join();
+    }
+    workers.clear();
+}
+
+struct Shutdown { ~Shutdown() { shutdown(); } } shutdownGuard;
+
+} // namespace
 
 void GpuEval::init(const std::string& /*model_path*/,
                    const std::string& /*precision*/,
                    int /*device_id*/,
                    size_t /*max_batch*/,
-                   int /*streams*/) {
-    // No-op in stub.  A real implementation would load the model,
-    // allocate GPU resources and prepare streams here.
+                   int streams) {
+    shutdown();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stopWorkers = false;
+    }
+    for (int i = 0; i < streams; ++i) {
+        workers.emplace_back(workerLoop);
+    }
 }
 
-std::future<float> GpuEval::submit(const float* /*features*/, size_t /*len*/) {
-    // Immediately return a ready future containing a constant
-    // evaluation score.  In a real implementation this would
-    // enqueue the features for batched processing on the GPU and
-    // return a future representing the asynchronous result.
-    std::promise<float> p;
-    p.set_value(0.0f);
-    return p.get_future();
+std::future<float> GpuEval::submit(const float* features, size_t len) {
+    Task t;
+    t.features.assign(features, features + len);
+    std::future<float> fut = t.promise.get_future();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        tasks.push(std::move(t));
+    }
+    cv.notify_one();
+    return fut;
 }
 
 void GpuEval::flush() {
-    // Nothing to flush in stub.  A real implementation would
-    // trigger any pending batches to be processed.
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait(lock, [] { return tasks.empty(); });
 }
 
 } // namespace nikola

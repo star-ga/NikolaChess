@@ -3,6 +3,8 @@
 unsigned last_castling = 0;
 unsigned last_ep = 0;
 
+extern "C" int tb_init(const char*) { return 1; }
+
 extern "C" unsigned tb_probe_wdl(
     uint64_t white,
     uint64_t black,
