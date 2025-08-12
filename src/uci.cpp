@@ -146,6 +146,10 @@ void runUciLoop() {
                             // Capture the piece currently on the destination square.
                             m.captured = board.squares[m.toRow][m.toCol];
                             board = makeMove(board, m);
+                            // Record the move for PGN logging.  Use the original
+                            // move string from the UCI list (mv).  This will
+                            // preserve promotion suffixes if present.
+                            addMoveToPgn(mv);
                         }
                     }
                 }
@@ -197,6 +201,8 @@ void runUciLoop() {
                             }
                             m.captured = board.squares[m.toRow][m.toCol];
                             board = makeMove(board, m);
+                            // Record the move for PGN logging.
+                            addMoveToPgn(mv);
                         }
                     }
                 }

@@ -563,6 +563,53 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         cnt--;
         return val;
     }
+
+    // Futility pruning and razoring.  At shallow depths where only
+    // a limited amount of search remains, we can sometimes prune a
+    // branch based on a quick static evaluation.  If the static
+    // evaluation is so bad that it cannot raise alpha (in the
+    // maximizing case) or so good that it cannot lower beta (in
+    // the minimizing case), we return the static score without
+    // exploring children.  A small margin accounts for the fact
+    // that captures or promotions might slightly change the score.
+    // We skip these heuristics if the side to move is in check to
+    // avoid pruning tactical positions and when depth is large.
+    if (depth <= 2) {
+        bool inCheck = isKingInCheck(board, board.whiteToMove);
+        if (!inCheck) {
+            int staticScore = staticEvaluate(board);
+            // Futility margin grows with depth: deeper nodes allow a
+            // larger margin because there is more time to recover.
+            int margin = 50 * depth; // e.g. 50 for depth 1, 100 for depth 2
+            if (maximizing) {
+                if (staticScore + margin <= alpha) {
+                    cnt--;
+                    return staticScore;
+                }
+            } else {
+                if (staticScore - margin >= beta) {
+                    cnt--;
+                    return staticScore;
+                }
+            }
+            // Razoring: If the position appears hopeless at depth 2
+            // (two plies remaining), prune immediately based on the
+            // static evaluation.  Use a larger margin to account for
+            // possible tactical swings.  This is a simple form of
+            // razoring that does not perform a verification search.
+            int razorMargin = 150;
+            if (depth == 2) {
+                if (maximizing && staticScore + razorMargin <= alpha) {
+                    cnt--;
+                    return staticScore;
+                }
+                if (!maximizing && staticScore - razorMargin >= beta) {
+                    cnt--;
+                    return staticScore;
+                }
+            }
+        }
+    }
     // Determine principal variation (PV) move from the TT if available
     // to improve move ordering.  This move should be searched first.
     Move pvMove{};
