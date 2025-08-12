@@ -10,8 +10,14 @@
 // position contains a small number of pieces.
 
 #include "tablebase.h"
-#include <string>
 #include <mutex>
+#include <string>
+
+// Fathom tablebase library entry point.  Returns non-zero on success.
+extern "C" int tb_init(const char* path);
+
+// Probe wrapper implemented in tbprobe.cpp.
+namespace nikola { unsigned tbProbeWDL(const Board& b); }
 
 namespace nikola {
 
@@ -22,15 +28,21 @@ static bool g_tbAvailable = false;
 static int g_tbPathUpdates = 0;
 static std::mutex g_tbMutex;
 
+static int countPiecesLocal(const Board& b) {
+    int count = 0;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            if (b.squares[r][c] != EMPTY) ++count;
+    return count;
+}
+
 void setTablebasePath(const std::string& path) {
     std::lock_guard<std::mutex> lock(g_tbMutex);
     g_tbPath = path;
-    // In this stub we simply record whether a non‑empty path has
-    // been provided.  A real implementation would verify that
-    // required tablebase files exist and set g_tbAvailable
-    // accordingly.  The Lomonosov 7‑man tablebases, for example,
-    // consist of multiple files per configuration.
-    g_tbAvailable = !path.empty();
+    g_tbAvailable = false;
+    if (!path.empty()) {
+        g_tbAvailable = tb_init(path.c_str()) != 0;
+    }
     ++g_tbPathUpdates;
 }
 
@@ -49,16 +61,21 @@ int tablebasePathUpdateCount() {
     return g_tbPathUpdates;
 }
 
-int probeWDL(const Board& /*board*/) {
-    // Always return unknown.  A future implementation will count
-    // the number of pieces on the board, index into the relevant
-    // tablebase and return win/draw/loss.  Syzygy WDL files encode
-    // results as 0 (unknown), 1 (draw), 2 (win), 3 (loss) with
-    // respect to the side to move.  Here we adopt a simpler
-    // convention: +1 for White win, 0 draw, -1 for Black win,
-    // 2 unknown.  Because we cannot probe anything in this stub
-    // implementation we always return unknown.
-    return 2;
+int probeWDL(const Board& board) {
+    if (!tablebaseAvailable()) {
+        return 2;
+    }
+    // For now we rely on Fathom which supports up to 7 pieces.
+    if (countPiecesLocal(board) > 7) {
+        return 2;
+    }
+    unsigned res = tbProbeWDL(board);
+    switch (res) {
+        case 4: return 1;   // win
+        case 2: return 0;   // draw
+        case 0: return -1;  // loss
+        default: return 2;  // unknown
+    }
 }
 
 } // namespace nikola

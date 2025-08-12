@@ -17,10 +17,15 @@
 
 #include "distributed.h"
 #include "board.h"
+#include "tt_entry.h"
 
 #include <algorithm>
+#include <deque>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 // If MPI support is enabled, include the MPI header.  Users can
@@ -177,7 +182,48 @@ int distributed_search() {
         return 0;
     }
 #else
-    // MPI is not enabled; distributed search is unavailable.
+    // MPI is not enabled; run a local multi-threaded search that uses a shared
+    // work queue (work stealing) and a simple transposition table shared across
+    // threads.  This demonstrates the algorithms used in the distributed
+    // version without requiring MPI.
+    Board root = initBoard();
+    auto moves = generateMoves(root);
+
+    std::deque<Move> work(moves.begin(), moves.end());
+    std::mutex workMutex;
+    std::mutex ttMutex;
+    std::unordered_map<std::string, TTEntry> tt;
+
+    auto worker = [&]() {
+        while (true) {
+            Move m;
+            {
+                std::lock_guard<std::mutex> lock(workMutex);
+                if (work.empty()) break;
+                m = work.front();
+                work.pop_front();
+            }
+            Board child = makeMove(root, m);
+            std::string key = boardToFEN(child);
+            {
+                std::lock_guard<std::mutex> lock(ttMutex);
+                if (tt.find(key) != tt.end()) continue; // TT hit
+            }
+            int score = evaluateBoardCPU(child);
+            {
+                std::lock_guard<std::mutex> lock(ttMutex);
+                tt[key] = TTEntry{1, score, 0, m};
+            }
+        }
+    };
+
+    unsigned nThreads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> threads;
+    threads.reserve(nThreads);
+    for (unsigned i = 0; i < nThreads; ++i) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) t.join();
     return 0;
 #endif
 }

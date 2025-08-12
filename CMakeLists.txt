@@ -46,6 +46,8 @@ set(NIKOLA_LIB_SOURCES
   src/pv.cpp
   src/multipv_search.cpp
   src/uci_extensions.cpp
+  src/tbprobe.cpp
+  src/fathom_bridge.cpp
 )
 
 # GPU-specific sources or CPU fallbacks
@@ -182,6 +184,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/syzygy_path_option_test.cpp")
     tests/syzygy_path_option_test.cpp
     src/engine_options.cpp
     src/tablebase.cpp
+    src/tbprobe.cpp
+    src/fathom_bridge.cpp
   )
   target_include_directories(syzygy_path_option_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME syzygy_path_option_test COMMAND syzygy_path_option_test)

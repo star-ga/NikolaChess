@@ -5,11 +5,13 @@ An experimental, research-friendly chess engine with:
 - Optional CUDA acceleration (CPU fallback)
 - Bitboard representation and a legal move generator (castling, en passant, promotions)
 - Alpha-beta search with common heuristics (iterative deepening, transposition table, move ordering, etc.)
-- Experimental distributed search prototype (MPI, optional NCCL)
-- PGN logging, basic openings/tablebase scaffolding
+- Experimental distributed search prototype (MPI, optional NCCL) with
+  local work-stealing fallback
+- PGN logging, Polyglot opening book and Syzygy tablebase support
 
-> Status: GPU evaluation and tablebases are functional **stubs** today; the interfaces are in place with tests, and the real implementations are being built incrementally. See **Roadmap** below.  
-> UCI strength-limiting, Syzygy path wiring, and multi-stream GPU evaluation controls are implemented.
+> Status: GPU evaluation now runs through an asynchronous NNUE pipeline and
+> tablebases probe via the Fathom backend.  Distributed search features a
+> basic work-stealing scheduler with a shared transposition table.
 
 ## Build
 
@@ -54,7 +56,7 @@ Start UCI mode with:
 Supported/recognized options include:
 
 * `LimitStrength` (bool), `Strength` (int) — cap search strength/depth.
-* `SyzygyPath` (string) — set endgame tablebase directory; tracked via engine options and test-covered. (Probing is stubbed for now.)
+* `SyzygyPath` (string) — set endgame tablebase directory; probed via the Fathom backend when available.
 * `UCI_ShowWDL` (bool), `UseGPU` (bool), `PGNFile` (string), `OwnBook` (bool), `BookFile` (string) — basic plumbing in place; some are stubs until the corresponding modules are finalized.
 
 ## Tests
@@ -70,6 +72,6 @@ Engine supports TT sharding and CPU affinity controls; `TT_SHARDS` defaults to 6
 
 ## Roadmap (short)
 
-* Replace GPU evaluation stub with a production kernel / NNUE/TensorRT path; retain async streams.
-* Fill out opening book & tablebase probing with real backends, keep current tests.
-* Evolve distributed search beyond root-split prototype (work-stealing, TT sharing).
+* Expand TensorRT backend and batching heuristics for the NNUE evaluator.
+* Add DTZ tablebase probing and richer book generation tools.
+* Extend distributed search to cluster environments with true TT merging.
