@@ -102,10 +102,10 @@ Board makeMove(const Board& board, const Move& m) {
     // Update half-move clock after determining whether this move
     // constitutes a capture, pawn move or promotion.  We use the
     // original move fields rather than inspecting the modified board.
-    bool isPawn = (piece == WP || piece == BP);
+    bool pawnMove = (piece == WP || piece == BP);
     bool isCapture = (m.captured != EMPTY);
     bool isPromotion = (m.promotedTo != 0);
-    if (isPawn || isCapture || isPromotion) {
+    if (pawnMove || isCapture || isPromotion) {
         nb.halfMoveClock = 0;
     } else {
         // Increment the counter for a quiet move.

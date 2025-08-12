@@ -15,6 +15,7 @@
 #include "board.h"
 
 #include <climits>
+#include <chrono>
 
 namespace nikola {
 
@@ -179,8 +180,50 @@ static bool isInsufficientMaterial(const nikola::Board& board) {
     if (whiteKnights == 1 && blackKnights == 1 && whiteBishops == 0 && blackBishops == 0) {
         return true;
     }
+    // Two knights vs bare king is insufficient to force mate.  If one side
+    // has exactly two knights and the other has no minor pieces, it is a draw.
+    if (whiteKnights == 2 && whiteBishops == 0 && whitePawns + whiteRooks + whiteQueens == 0 &&
+        blackKnights == 0 && blackBishops == 0 && blackPawns + blackRooks + blackQueens == 0) {
+        return true;
+    }
+    if (blackKnights == 2 && blackBishops == 0 && blackPawns + blackRooks + blackQueens == 0 &&
+        whiteKnights == 0 && whiteBishops == 0 && whitePawns + whiteRooks + whiteQueens == 0) {
+        return true;
+    }
     // All other cases: assume sufficient material to continue.
     return false;
+}
+
+// Transposition table entry.  Stores the depth at which a position
+// was evaluated, the evaluation score, a bound flag and the best
+// move found from this position.  The flag takes one of three
+// values: EXACT indicates the stored score is the precise evaluation;
+// LOWERBOUND means the score is a lower bound (alpha cutoff);
+// UPPERBOUND means the score is an upper bound (beta cutoff).
+struct TTEntry {
+    int depth;
+    int score;
+    int flag;
+    nikola::Move bestMove;
+};
+static const int TT_EXACT = 0;
+static const int TT_LOWERBOUND = 1;
+static const int TT_UPPERBOUND = 2;
+static std::unordered_map<uint64_t, TTEntry> transTable;
+
+// Piece material values used for move ordering.  These mirror the
+// values used in the evaluation function: pawn = 100, knight = 320,
+// bishop = 330, rook = 500, queen = 900, king = 100000.  We use
+// these values to prioritise captures and promotions during search.
+static const int orderingMaterial[6] = {100, 320, 330, 500, 900, 100000};
+
+// Helper to obtain the material value of a piece code.  Input must
+// be non‑zero.  The absolute piece code minus one indexes into the
+// orderingMaterial array.  White and black pieces have the same
+// absolute value.
+static inline int orderingPieceValue(int8_t p) {
+    int idx = std::abs(p) - 1;
+    return orderingMaterial[idx];
 }
 
 // Extended minimax with alpha‑beta pruning and draw detection.  The
@@ -199,18 +242,42 @@ static int minimax(const nikola::Board& board, int depth, int alpha, int beta, b
     if (isInsufficientMaterial(board)) {
         return 0;
     }
-    // Threefold repetition detection.  Compute the hash and update
-    // count; if this is the third occurrence return draw.  We update
-    // counts before descending so that deeper calls include the
-    // current position.
+    // Compute the Zobrist hash once for both repetition detection and
+    // transposition table lookup.
     uint64_t h = computeZobrist(board);
+    // Threefold repetition detection.  Update count for the current
+    // position.  If this is the third occurrence, return a draw.
     int& cnt = repetitions[h];
     cnt++;
     if (cnt >= 3) {
         cnt--;
         return 0;
     }
-    // Depth‑limited search or no moves triggers static evaluation.
+    // Check the transposition table for a cached result at sufficient
+    // depth.  If found, use the stored bounds to narrow the window or
+    // return an exact evaluation.  Note: transposition table entries
+    // do not account for repetition counts or 50‑move rule, so draw
+    // detection happens before TT lookup.
+    auto ttIt = transTable.find(h);
+    if (ttIt != transTable.end() && ttIt->second.depth >= depth) {
+        const TTEntry& entry = ttIt->second;
+        if (entry.flag == TT_EXACT) {
+            cnt--;
+            return entry.score;
+        } else if (entry.flag == TT_LOWERBOUND) {
+            if (entry.score > alpha) alpha = entry.score;
+        } else if (entry.flag == TT_UPPERBOUND) {
+            if (entry.score < beta) beta = entry.score;
+        }
+        if (alpha >= beta) {
+            cnt--;
+            return entry.score;
+        }
+    }
+    // If depth is zero or no moves, perform static evaluation.  We do
+    // not consult the TT again here because shallow positions are
+    // inexpensive to evaluate and we still need to adjust the
+    // repetition count.
     if (depth == 0) {
         int val = evaluateBoardCPU(board);
         cnt--;
@@ -222,25 +289,100 @@ static int minimax(const nikola::Board& board, int depth, int alpha, int beta, b
         cnt--;
         return val;
     }
+    // Determine principal variation (PV) move from the TT if available
+    // to improve move ordering.  This move should be searched first.
+    Move pvMove{};
+    bool hasPV = false;
+    if (ttIt != transTable.end()) {
+        pvMove = ttIt->second.bestMove;
+        // Only consider PV if it has a non‑zero from square (valid move).
+        if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 && pvMove.toRow == 0 && pvMove.toCol == 0)) {
+            hasPV = true;
+        }
+    }
+    // Assign ordering scores to moves.  Moves that capture a high
+    // valued piece or promote are ordered first.  The principal
+    // variation move receives the highest priority.
+    std::vector<std::pair<int, Move>> scored;
+    scored.reserve(moves.size());
+    for (const Move& m : moves) {
+        int score = 0;
+        // PV move bonus
+        if (hasPV && m.fromRow == pvMove.fromRow && m.fromCol == pvMove.fromCol &&
+            m.toRow == pvMove.toRow && m.toCol == pvMove.toCol && m.promotedTo == pvMove.promotedTo) {
+            score += 1000000;
+        }
+        // Promotion bonus
+        if (m.promotedTo != 0) {
+            // Promotions are highly valuable.  Use the value of the
+            // promoted piece (minus pawn) to scale.
+            int idx = std::abs(m.promotedTo) - 1;
+            score += 10000 + orderingMaterial[idx];
+        }
+        // Capture bonus using MVV‑LVA heuristic: prioritize captures
+        // of high valued pieces with low valued attackers.
+        if (m.captured != nikola::EMPTY) {
+            int capturedVal = orderingPieceValue((int8_t)m.captured);
+            int attackerVal = orderingPieceValue(board.squares[m.fromRow][m.fromCol]);
+            score += 10 * capturedVal - attackerVal;
+        }
+        scored.emplace_back(score, m);
+    }
+    // Sort moves by descending score to improve pruning.  A stable
+    // sort ensures the relative order of equally scored moves
+    // remains deterministic.
+    std::stable_sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    });
     int bestVal;
+    Move bestChildMove{};
+    // Save original alpha and beta to determine the TT flag later.
+    int alphaOrig = alpha;
+    int betaOrig = beta;
     if (maximizing) {
         bestVal = INT_MIN;
-        for (const Move& m : moves) {
+        for (const auto& pair : scored) {
+            const Move& m = pair.second;
             Board child = makeMove(board, m);
             int eval = minimax(child, depth - 1, alpha, beta, false, repetitions);
-            if (eval > bestVal) bestVal = eval;
+            if (eval > bestVal) {
+                bestVal = eval;
+                bestChildMove = m;
+            }
             if (eval > alpha) alpha = eval;
-            if (beta <= alpha) break;
+            if (beta <= alpha) break; // beta cutoff
         }
     } else {
         bestVal = INT_MAX;
-        for (const Move& m : moves) {
+        for (const auto& pair : scored) {
+            const Move& m = pair.second;
             Board child = makeMove(board, m);
             int eval = minimax(child, depth - 1, alpha, beta, true, repetitions);
-            if (eval < bestVal) bestVal = eval;
+            if (eval < bestVal) {
+                bestVal = eval;
+                bestChildMove = m;
+            }
             if (eval < beta) beta = eval;
-            if (beta <= alpha) break;
+            if (beta <= alpha) break; // alpha cutoff
         }
+    }
+    // Store the result in the transposition table.  Only store
+    // positions evaluated at this depth or deeper to avoid
+    // overwriting more accurate information.  Determine the flag
+    // based on the relation of bestVal to the original alpha/beta
+    // window.
+    int flag;
+    if (bestVal <= alphaOrig) {
+        flag = TT_UPPERBOUND;
+    } else if (bestVal >= betaOrig) {
+        flag = TT_LOWERBOUND;
+    } else {
+        flag = TT_EXACT;
+    }
+    TTEntry newEntry{depth, bestVal, flag, bestChildMove};
+    auto existing = transTable.find(h);
+    if (existing == transTable.end() || existing->second.depth < depth) {
+        transTable[h] = newEntry;
     }
     // Restore repetition count when backtracking.
     cnt--;
@@ -251,34 +393,106 @@ static int minimax(const nikola::Board& board, int depth, int alpha, int beta, b
 // given depth.  Returns the move that yields the highest (for White)
 // or lowest (for Black) evaluation.  If there are no legal moves,
 // returns a zeroed move.
-Move findBestMove(const Board& board, int depth) {
-    Move bestMove{};
-    int bestScore = board.whiteToMove ? INT_MIN : INT_MAX;
-    auto moves = generateMoves(board);
-    // If no moves are available, return a default move.
-    if (moves.empty()) return bestMove;
-    for (const Move& m : moves) {
-        Board child = makeMove(board, m);
-        // Initialise repetition table for this root move.  Start with
-        // the current position counted once.  The child board will
-        // update its own count when entering minimax.
-        std::unordered_map<uint64_t,int> reps;
-        reps[computeZobrist(board)] = 1;
-        int score = minimax(child, depth - 1, INT_MIN, INT_MAX,
-                            !board.whiteToMove, reps);
-        if (board.whiteToMove) {
-            if (score > bestScore) {
-                bestScore = score;
-                bestMove = m;
+Move findBestMove(const Board& board, int depth, int timeLimitMs) {
+    Move chosenMove{};
+    // Clear the transposition table to avoid interference from
+    // previous searches.  We retain the table across iterative
+    // deepening depths to allow re‑use of work from shallower
+    // searches but clear it on each new top‑level search.
+    transTable.clear();
+    // If no moves are available, return an empty move immediately.
+    auto initialMoves = generateMoves(board);
+    if (initialMoves.empty()) return chosenMove;
+    // Track the start time when a time limit is provided.  We use
+    // steady_clock to avoid issues with system clock adjustments.
+    using clock = std::chrono::steady_clock;
+    auto start = clock::now();
+    // Iterative deepening: search incrementally deeper and keep track
+    // of the best move at each depth.  The principal variation
+    // information stored in the transposition table will guide move
+    // ordering in deeper searches.  If a time limit is set and
+    // exceeded, we stop searching and return the best move found
+    // thus far.
+    for (int currentDepth = 1; currentDepth <= depth; ++currentDepth) {
+        Move bestMoveAtDepth{};
+        int bestScoreAtDepth = board.whiteToMove ? INT_MIN : INT_MAX;
+        // Re‑generate root moves at each depth because the transposition
+        // table may have learned a new principal variation.  Use
+        // simple ordering: search the PV move first if available.
+        auto moves = generateMoves(board);
+        // Try to move the PV move (if any) to the front of the list.
+        uint64_t rootHash = computeZobrist(board);
+        auto itPV = transTable.find(rootHash);
+        Move pv{};
+        bool pvExists = false;
+        if (itPV != transTable.end()) {
+            pv = itPV->second.bestMove;
+            if (!(pv.fromRow == 0 && pv.fromCol == 0 && pv.toRow == 0 && pv.toCol == 0)) {
+                pvExists = true;
             }
-        } else {
-            if (score < bestScore) {
-                bestScore = score;
-                bestMove = m;
+        }
+        if (pvExists) {
+            // Find pv in moves and move it to the front.
+            for (size_t i = 0; i < moves.size(); ++i) {
+                const Move& m = moves[i];
+                if (m.fromRow == pv.fromRow && m.fromCol == pv.fromCol &&
+                    m.toRow == pv.toRow && m.toCol == pv.toCol && m.promotedTo == pv.promotedTo) {
+                    if (i != 0) {
+                        std::swap(moves[0], moves[i]);
+                    }
+                    break;
+                }
+            }
+        }
+        // Evaluate each move at the current depth.
+        for (const Move& m : moves) {
+            // Time check: if a time limit is set and exceeded, break
+            // out of the search.  We perform the check at the
+            // beginning of each iteration to ensure a responsive
+            // cutoff.
+            if (timeLimitMs > 0) {
+                auto now = clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                if (elapsed >= timeLimitMs) {
+                    // Return the best move found so far at this depth.
+                    chosenMove = (currentDepth == 1 ? m : chosenMove);
+                    return chosenMove;
+                }
+            }
+            Board child = makeMove(board, m);
+            // Initialise repetition table for this root move.  Start with
+            // the current position counted once.  The child board will
+            // update its own count when entering minimax.
+            std::unordered_map<uint64_t,int> reps;
+            reps[rootHash] = 1;
+            int score = minimax(child, currentDepth - 1, INT_MIN, INT_MAX,
+                                !board.whiteToMove, reps);
+            if (board.whiteToMove) {
+                if (score > bestScoreAtDepth) {
+                    bestScoreAtDepth = score;
+                    bestMoveAtDepth = m;
+                }
+            } else {
+                if (score < bestScoreAtDepth) {
+                    bestScoreAtDepth = score;
+                    bestMoveAtDepth = m;
+                }
+            }
+        }
+        // After completing the current depth, update the chosen move.
+        chosenMove = bestMoveAtDepth;
+        // Check for time expiry after finishing the depth.  If the
+        // allowed time is exceeded, break out of the iterative
+        // deepening loop and return the best move found so far.
+        if (timeLimitMs > 0) {
+            auto now = clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+            if (elapsed >= timeLimitMs) {
+                break;
             }
         }
     }
-    return bestMove;
+    return chosenMove;
 }
 
 } // namespace nikola

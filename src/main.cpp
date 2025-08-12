@@ -14,7 +14,12 @@
 
 // Forward declaration of search function defined in search.cpp.
 namespace nikola {
-Move findBestMove(const Board& board, int depth);
+// Find the best move using minimax search to the given depth.  When
+// timeLimitMs is positive, iterative deepening will stop when the
+// allotted time in milliseconds expires.  The default value of
+// zero disables the time limit and searches to the specified
+// depth.
+Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
 }
 
 // Utility to convert a zero‑based square coordinate into algebraic
@@ -47,7 +52,9 @@ int main() {
     // Search for a move.  Depth 2 (one move for each side) keeps the
     // runtime reasonable.  Depth can be increased on powerful GPUs and
     // CPUs, but branching grows exponentially.
-    Move best = findBestMove(board, 2);
+    // Search up to depth 3 or stop after 3000 milliseconds.  A deeper
+    // search and longer time limit can be chosen on powerful systems.
+    Move best = findBestMove(board, 3, 3000);
     std::cout << "Engine selects move: " << toAlgebraic(best.fromRow, best.fromCol)
               << " -> " << toAlgebraic(best.toRow, best.toCol) << std::endl;
     return 0;

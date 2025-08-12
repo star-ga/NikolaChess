@@ -301,14 +301,151 @@ int evaluateBoardCPU(const Board& board) {
     // perspective by toggling the side to move.  Greater mobility is
     // rewarded.  The weight controls the influence on the final score.
     const int mobilityWeight = 5;
-    // Count moves for White.
+    // Count moves for White and Black by toggling whiteToMove.  We
+    // create a copy of the board to avoid modifying the original
+    // board’s state.  generateMoves honours legality, so the counts
+    // reflect available legal moves.
     Board tmp = board;
     tmp.whiteToMove = true;
     int whiteMoves = static_cast<int>(generateMoves(tmp).size());
-    // Count moves for Black.
     tmp.whiteToMove = false;
     int blackMoves = static_cast<int>(generateMoves(tmp).size());
     eval += mobilityWeight * (whiteMoves - blackMoves);
+    // Pawn structure and bishop pair heuristics.  These heuristics
+    // provide additional positional insight beyond material and
+    // piece‑square tables.  We penalise doubled and isolated pawns,
+    // reward passed pawns as they advance, and grant a small bonus
+    // for possessing the bishop pair.  See Chessprogramming Wiki
+    // articles on Pawn Structure and Passed Pawns for guidance.
+    const int doubledPenalty = 20;
+    const int isolatedPenalty = 30;
+    const int bishopPairBonus = 50;
+    // Bonuses for passed pawns by their rank (0–7).  A pawn on the
+    // second rank (index 1) receives a small bonus, increasing as it
+    // advances towards promotion.  The first and last ranks are
+    // unused because pawns cannot occupy them in a normal game.
+    static const int passedBonusByRank[8] = {0, 10, 20, 30, 50, 80, 130, 0};
+    // Count pawns on each file for both sides and record their
+    // positions for passed and isolated detection.  At most eight
+    // pawns per side.
+    int whiteFileCount[8] = {0};
+    int blackFileCount[8] = {0};
+    int whitePawnRows[8];
+    int whitePawnCols[8];
+    int blackPawnRows[8];
+    int blackPawnCols[8];
+    int whitePawnCount = 0;
+    int blackPawnCount = 0;
+    int whiteBishops = 0;
+    int blackBishops = 0;
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            int8_t p = board.squares[r][c];
+            if (p == EMPTY) continue;
+            if (p == WP) {
+                whiteFileCount[c]++;
+                if (whitePawnCount < 8) {
+                    whitePawnRows[whitePawnCount] = r;
+                    whitePawnCols[whitePawnCount] = c;
+                    whitePawnCount++;
+                }
+            } else if (p == BP) {
+                blackFileCount[c]++;
+                if (blackPawnCount < 8) {
+                    blackPawnRows[blackPawnCount] = r;
+                    blackPawnCols[blackPawnCount] = c;
+                    blackPawnCount++;
+                }
+            } else if (p == WB) {
+                whiteBishops++;
+            } else if (p == BB) {
+                blackBishops++;
+            }
+        }
+    }
+    // Penalise doubled pawns: subtract for each extra pawn on the
+    // same file.  Doubled pawns are typically weak because they
+    // cannot protect each other and block lines for rooks and bishops.
+    for (int f = 0; f < 8; ++f) {
+        if (whiteFileCount[f] > 1) {
+            eval -= doubledPenalty * (whiteFileCount[f] - 1);
+        }
+        if (blackFileCount[f] > 1) {
+            eval += doubledPenalty * (blackFileCount[f] - 1);
+        }
+    }
+    // Penalise isolated pawns: those without a friendly pawn on an
+    // adjacent file.  Isolated pawns cannot be defended by other
+    // pawns and often become targets.【797182168246702†L14-L17】
+    for (int i = 0; i < whitePawnCount; ++i) {
+        int f = whitePawnCols[i];
+        bool noLeft = (f == 0) || (whiteFileCount[f - 1] == 0);
+        bool noRight = (f == 7) || (whiteFileCount[f + 1] == 0);
+        if (noLeft && noRight) {
+            eval -= isolatedPenalty;
+        }
+    }
+    for (int i = 0; i < blackPawnCount; ++i) {
+        int f = blackPawnCols[i];
+        bool noLeft = (f == 0) || (blackFileCount[f - 1] == 0);
+        bool noRight = (f == 7) || (blackFileCount[f + 1] == 0);
+        if (noLeft && noRight) {
+            eval += isolatedPenalty;
+        }
+    }
+    // Reward passed pawns: pawns with no opposing pawns ahead on
+    // their file or adjacent files.  Passed pawns become more
+    // valuable as they advance towards promotion.  We scan the
+    // position for opposing pawns on the three files ahead of a pawn.
+    for (int i = 0; i < whitePawnCount; ++i) {
+        int r = whitePawnRows[i];
+        int c = whitePawnCols[i];
+        bool passed = true;
+        // For White pawns, any Black pawn on row > r blocks the path.
+        for (int j = 0; j < blackPawnCount && passed; ++j) {
+            int br = blackPawnRows[j];
+            int bc = blackPawnCols[j];
+            if (br > r && (bc == c || bc == c - 1 || bc == c + 1)) {
+                passed = false;
+            }
+        }
+        if (passed) {
+            // r ranges from 0 (back rank) to 7 (promotion rank).  We
+            // index the bonus by the pawn’s rank to encourage
+            // advancement.
+            int bonus = passedBonusByRank[r];
+            eval += bonus;
+        }
+    }
+    for (int i = 0; i < blackPawnCount; ++i) {
+        int r = blackPawnRows[i];
+        int c = blackPawnCols[i];
+        bool passed = true;
+        // For Black pawns, any White pawn on row < r blocks the path.
+        for (int j = 0; j < whitePawnCount && passed; ++j) {
+            int wr = whitePawnRows[j];
+            int wc = whitePawnCols[j];
+            if (wr < r && (wc == c || wc == c - 1 || wc == c + 1)) {
+                passed = false;
+            }
+        }
+        if (passed) {
+            // Use mirror index 7 - r to reflect advancement towards the
+            // first rank (promotion for Black).  As r decreases, the
+            // bonus increases.
+            int rankFromPromotion = 7 - r;
+            int bonus = passedBonusByRank[rankFromPromotion];
+            eval -= bonus;
+        }
+    }
+    // Bishop pair bonus: reward owning two bishops, which often
+    // control long diagonals and work well together in open positions.
+    if (whiteBishops >= 2) {
+        eval += bishopPairBonus;
+    }
+    if (blackBishops >= 2) {
+        eval -= bishopPairBonus;
+    }
     return eval;
 }
 

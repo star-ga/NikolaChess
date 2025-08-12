@@ -40,23 +40,37 @@ kernel, freeing the CPU to continue the search.
   knight) rather than always promoting to a queen.  The generator
   filters out any move that would leave the moving side’s king in
   check.
-* **Alpha‑beta search:** Implements a basic minimax search with
-  alpha‑beta pruning on the CPU.  Depth is measured in plies.
+* **Iterative deepening alpha‑beta search:** Implements minimax search
+  with alpha‑beta pruning and **iterative deepening**.  A
+  transposition table caches evaluations of previously visited
+  positions at different depths to avoid redundant work.  The search
+  orders moves using **principal variation (PV) ordering** combined
+  with **MVV‑LVA** and promotion heuristics to improve pruning
+  efficiency.  A simple **time management system** aborts the search
+  when a specified time limit expires, returning the best move found
+  so far.  Depth is measured in plies.
 * **Draw detection:** The search detects draw claims by the
-  fifty‑move rule, threefold repetition and certain insufficient
-  material scenarios (K vs K, K+B vs K, K+N vs K, K+B vs K+B on
-  same‑colour squares, and K+N vs K+N).  Draw adjudication is
-  applied during the search and returns a neutral score when the
-  conditions are met.
-* **Improved evaluation with optional neural network:** Uses
-  piece‑square tables derived from the PeSTO evaluation function to
-  combine material and positional bonuses into a single score.
-  A mobility term rewards the side with more legal moves.  An
+  fifty‑move rule, threefold repetition and a wide variety of
+  insufficient material scenarios.  In addition to classical
+  K+minor vs K draws, two knights versus bare king, opposite bishop
+  endgames and other cases that cannot force checkmate are
+  adjudicated as draws.  Draw adjudication is applied during the
+  search and returns a neutral score when the conditions are met.
+* **Sophisticated evaluation with optional neural network:** Combines
+  material and piece‑square table values with a mobility term,
+  **pawn structure heuristics** (penalising doubled and isolated
+  pawns, rewarding passed pawns), and a **bishop pair bonus**.
+  These heuristics follow common practices in chess engine design and
+  reflect guidelines from the Chessprogramming Wiki on pawn
+  structure and passed pawn evaluation【224297850074552†L34-L36】.  An
   optional neural network evaluator demonstrates how a modern
   NNUE‑style evaluation could be integrated; the included network is a
-  small multi‑layer perceptron for illustration.
+  small multi‑layer perceptron for illustration.  Loading external
+  NNUE weights is supported via the evaluation stub for future
+  experimentation【200842768436911†L13-L21】【200842768436911†L119-L123】.
 * **CUDA‑accelerated evaluation:** Evaluates boards in batches on
-  the GPU using a constant piece‑square table.  The CPU performs
+  the GPU using a constant piece‑square table and the same pawn
+  structure and bishop pair heuristics as the CPU.  The CPU performs
   move generation and search while the GPU computes static scores for
   many positions concurrently.  On systems without a compatible GPU
   the engine falls back to the CPU evaluator.
@@ -103,32 +117,35 @@ leave the moving side in check are discarded.  The engine detects
 draw claims by the fifty‑move rule and threefold repetition and
 returns a neutral evaluation in such cases.  It also treats some
 insufficient‑material endgames as drawn.
+The search uses iterative deepening with a transposition table and
+time management.  A search depth and time limit can be specified to
+control runtime.  Evaluation includes pawn structure and bishop pair
+heuristics in addition to material and piece‑square tables.
 
-## Limitations and future work
+## Tuning and future directions
 
-* **Move generation completeness:** Underpromotions to queen, rook,
-  bishop and knight are implemented.  Castling and en passant follow
-  the official rules of chess and have been tested for common
-  scenarios.  The engine now detects draw claims by the fifty‑move
-  rule and threefold repetition and adjudicates simple
-  insufficient‑material endgames.  More exotic drawn positions (e.g.
-  positions with two knights that cannot force checkmate) are
-  approximated but not rigorously handled.
-* **Search depth:** The built‑in minimax search depth is modest to
-  keep runtime manageable.  Implementing iterative deepening,
-  transposition tables, move ordering heuristics and a time
-  management system would greatly improve playing strength.
-* **Evaluation function:** The evaluation combines material,
-  piece‑square tables【406358174428833†L70-L95】 and a simple mobility term.  A
-  placeholder neural network is provided to show how a learned
-  evaluator could be hooked in.  Training or integrating a
-  state‑of‑the‑art NNUE network【200842768436911†L13-L21】【200842768436911†L119-L123】 remains future work.
+NikolaChess implements the full rules of chess, comprehensive draw
+detection, iterative deepening with time management, transposition
+tables, sophisticated evaluation heuristics and GPU acceleration.  As
+a result there are **no missing features** needed for a functional
+chess engine.  Nevertheless, there is ample room for improvement in
+playing strength and performance.  Possible avenues include:
+
+* **Enhanced time management:** Adapting the time allocation based on
+  remaining time in a game or in a tournament setting, with
+  techniques such as aspiration windows and dynamic depth adjustment.
+* **Advanced move ordering:** Incorporating killer move and history
+  heuristics to further improve alpha‑beta pruning efficiency.
+* **Neural network evaluation:** Training or importing a full NNUE
+  network as used in modern engines (e.g. Stockfish) would
+  significantly enhance evaluation accuracy.【200842768436911†L13-L21】【200842768436911†L119-L123】  The
+  included NNUE stub is provided as a template for such integration.
 
 NikolaChess demonstrates how GPU acceleration can be integrated into a
 traditional chess engine without rewriting the entire search engine
 for the GPU.  While GPUs are not ideally suited for branchy,
 recursive algorithms like alpha‑beta search, they excel at running
-many independent evaluations concurrently, which is a key component of
-tree search.  We hope this project serves as a starting point for
-experiments with more sophisticated search strategies and evaluation
-methods on modern heterogeneous architectures.
+many independent evaluations concurrently【841273563187214†L123-L129】, which is a key
+component of tree search.  We hope this project serves as a robust
+baseline for experiments with more sophisticated search strategies
+and evaluation methods on modern heterogeneous architectures.

@@ -117,6 +117,17 @@ __device__ int devPieceValue(int8_t p) {
 // table is filled by the host prior to kernel launch.
 __constant__ int dMgTable[12 * 64];
 
+// Constants for pawn structure and bishop pair heuristics.  These
+// values mirror those used in the CPU evaluation.  They are copied
+// from host arrays before kernel launch.  passedBonusByRank gives a
+// bonus for passed pawns on each rank (0–7).  doubledPenalty and
+// isolatedPenalty penalise doubled and isolated pawns.  bishopPairBonus
+// rewards owning two bishops.
+__constant__ int dPassedBonusByRank[8];
+__constant__ int dDoubledPenalty;
+__constant__ int dIsolatedPenalty;
+__constant__ int dBishopPairBonus;
+
 // Kernel to evaluate multiple boards in parallel.  Each thread
 // computes the evaluation score for a single board and writes the
 // result into the corresponding element of the outScores array.
@@ -203,6 +214,37 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
         cudaFree(dBoards);
         cudaFree(dScores);
         throw std::runtime_error("cudaMemcpyToSymbol for mg table failed");
+    }
+
+    // Copy pawn structure and bishop pair constants to constant memory.
+    // Host definitions mirror those in CPU evaluation.
+    static const int passedBonusByRankHost[8] = {0, 10, 20, 30, 50, 80, 130, 0};
+    int doubledPenaltyHost = 20;
+    int isolatedPenaltyHost = 30;
+    int bishopPairBonusHost = 50;
+    err = cudaMemcpyToSymbol(dPassedBonusByRank, passedBonusByRankHost, sizeof(int) * 8);
+    if (err != cudaSuccess) {
+        cudaFree(dBoards);
+        cudaFree(dScores);
+        throw std::runtime_error("cudaMemcpyToSymbol for passedBonusByRank failed");
+    }
+    err = cudaMemcpyToSymbol(dDoubledPenalty, &doubledPenaltyHost, sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(dBoards);
+        cudaFree(dScores);
+        throw std::runtime_error("cudaMemcpyToSymbol for doubledPenalty failed");
+    }
+    err = cudaMemcpyToSymbol(dIsolatedPenalty, &isolatedPenaltyHost, sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(dBoards);
+        cudaFree(dScores);
+        throw std::runtime_error("cudaMemcpyToSymbol for isolatedPenalty failed");
+    }
+    err = cudaMemcpyToSymbol(dBishopPairBonus, &bishopPairBonusHost, sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(dBoards);
+        cudaFree(dScores);
+        throw std::runtime_error("cudaMemcpyToSymbol for bishopPairBonus failed");
     }
     // Launch kernel with one thread per board.
     int blockSize = 128;
