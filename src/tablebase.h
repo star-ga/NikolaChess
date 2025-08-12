@@ -22,6 +22,11 @@ namespace nikola {
 // valid tablebase files.
 void setTablebasePath(const std::string& path);
 
+// For testing purposes, expose the currently configured tablebase path and
+// how many times it has been set.
+std::string currentTablebasePath();
+int tablebasePathUpdateCount();
+
 // Return true if tablebase probing is enabled and at least one
 // tablebase file has been detected.  In this stub implementation
 // this simply returns whether a non‑empty path has been set.

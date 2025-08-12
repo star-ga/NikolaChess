@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include "tablebase.h"
 
 namespace nikola {
 
@@ -50,6 +51,7 @@ void set_option_from_tokens(const std::vector<std::string>& t) {
         G.Strength = v;
     } else if (name == "syzygypath") {
         G.SyzygyPath = value;
+        setTablebasePath(value);
     } else if (name == "uci_showwdl") {
         std::string v = lower(value);
         G.UCI_ShowWDL = (v == "true" || v == "1" || v == "on" || v == "yes");

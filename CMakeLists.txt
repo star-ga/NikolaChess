@@ -123,3 +123,11 @@ add_executable(tbprobe_tests
 )
 target_include_directories(tbprobe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME tbprobe_tests COMMAND tbprobe_tests)
+
+add_executable(syzygy_path_option_test
+  tests/syzygy_path_option_test.cpp
+  src/engine_options.cpp
+  src/tablebase.cpp
+)
+target_include_directories(syzygy_path_option_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME syzygy_path_option_test COMMAND syzygy_path_option_test)

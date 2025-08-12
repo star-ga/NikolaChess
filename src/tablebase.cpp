@@ -19,6 +19,7 @@ namespace nikola {
 // by a mutex to allow thread‑safe updates and reads.
 static std::string g_tbPath;
 static bool g_tbAvailable = false;
+static int g_tbPathUpdates = 0;
 static std::mutex g_tbMutex;
 
 void setTablebasePath(const std::string& path) {
@@ -30,11 +31,22 @@ void setTablebasePath(const std::string& path) {
     // accordingly.  The Lomonosov 7‑man tablebases, for example,
     // consist of multiple files per configuration.
     g_tbAvailable = !path.empty();
+    ++g_tbPathUpdates;
 }
 
 bool tablebaseAvailable() {
     std::lock_guard<std::mutex> lock(g_tbMutex);
     return g_tbAvailable;
+}
+
+std::string currentTablebasePath() {
+    std::lock_guard<std::mutex> lock(g_tbMutex);
+    return g_tbPath;
+}
+
+int tablebasePathUpdateCount() {
+    std::lock_guard<std::mutex> lock(g_tbMutex);
+    return g_tbPathUpdates;
 }
 
 int probeWDL(const Board& /*board*/) {

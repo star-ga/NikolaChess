@@ -272,15 +272,6 @@ void runUciLoop() {
                         use = (c == '1' || c == 't' || c == 'y');
                     }
                     setUseGpu(use);
-                } else if (name == "TablebasePath") {
-                    // Set the path to the directory containing endgame
-                    // tablebases.  When a non‑empty path is provided
-                    // the engine will attempt to probe positions with
-                    // few pieces against the tablebase.  The actual
-                    // probing is implemented in tablebase.cpp; this
-                    // stub will simply record that a path has been
-                    // provided.
-                    nikola::setTablebasePath(value);
                 } else if (name == "PGNFile") {
                     // Set the PGN output file.  If the provided value is
                     // empty, retain the current file path.  This option
