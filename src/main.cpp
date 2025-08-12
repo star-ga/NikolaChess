@@ -13,6 +13,7 @@
 #include <vector>
 #include <string>
 #include "uci.h"
+#include "distributed.h"
 
 // Forward declaration of search function defined in search.cpp.
 namespace nikola {
@@ -37,6 +38,12 @@ static std::string toAlgebraic(int row, int col) {
 
 int main(int argc, char* argv[]) {
     using namespace nikola;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--distributed") {
+            distributed_search();
+            return 0;
+        }
+    }
     // Command‑line interface.  If the first argument is "perft",
     // compute and print the perft value at the specified depth.
     // Example: `./nikolachess perft 4` will output the number of leaf
