@@ -1,4 +1,3 @@
-```cpp
 // NikolaChess entry point.
 //
 // Copyright (c) 2025 CPUTER Inc.
@@ -19,17 +18,21 @@
 #include <exception>
 #include <cstdint>
 
-// Some builds expose GPU configuration via a separate header; declare here to
-// avoid a hard dependency if the include is missing.
-void setGpuStreams(int n);
+// Optional GPU stream configuration hook.
+// If your build provides a real implementation, define
+// HAVE_NIKOLA_SET_GPU_STREAMS at compile time and link the provider.
+namespace {
+#if defined(HAVE_NIKOLA_SET_GPU_STREAMS)
+void setGpuStreams(int n);            // provided elsewhere
+#else
+inline void setGpuStreams(int) {}     // no-op stub
+#endif
+}
 
-// Forward declaration of search function defined in search.cpp.
+// Forward declaration of search entrypoint (implemented in search.cpp).
+// If you have a public header that declares this (e.g. search.h), you can
+// include it instead of this forward declaration.
 namespace nikola {
-// Find the best move using minimax search to the given depth.  When
-// timeLimitMs is positive, iterative deepening will stop when the
-// allotted time in milliseconds expires.  The default value of
-// zero disables the time limit and searches to the specified
-// depth.
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
 }
 
@@ -153,9 +156,11 @@ int main(int argc, char* argv[]) {
     // Evaluate using GPU.  We wrap the single board in an array of length one.
     std::vector<Board> boards = {board};
     try {
-        std::vector<int> gpuScores = evaluateBoardsGPU(boards.data(), static_cast<int>(boards.size()));
+        std::vector<int> gpuScores =
+            evaluateBoardsGPU(boards.data(), static_cast<int>(boards.size()));
         if (!gpuScores.empty()) {
-            std::cout << "GPU evaluation of starting position: " << gpuScores[0] << std::endl;
+            std::cout << "GPU evaluation of starting position: "
+                      << gpuScores[0] << std::endl;
         }
     } catch (std::exception& ex) {
         std::cerr << "GPU evaluation failed: " << ex.what() << std::endl;
@@ -169,4 +174,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-```

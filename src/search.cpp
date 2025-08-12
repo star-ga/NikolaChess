@@ -467,6 +467,16 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 }
             }
         }
+      // ProbCut using static evaluation to prune unlikely branches
+      if (depth >= 3) {
+          int staticScore = staticEvaluate(board);
+          int margin = 200 + 50 * depth;
+          if (maximizing) {
+              if (staticScore - margin >= beta) { cnt--; return staticScore; }
+          } else {
+              if (staticScore + margin <= alpha) { cnt--; return staticScore; }
+          }
+      }
     }
 
     // Quiescence at depth 0
@@ -586,6 +596,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
             int nextDepth = depth - 1;
+            int extension = 0;
+            if (idx == 0 && depth >= 3) {
+                int shallow = minimax(child, depth - 2, ply + 1, alpha, beta, false, repetitions, &m);
+                if (shallow <= alpha) extension = 1;
+            }
+            nextDepth += extension;
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
@@ -632,6 +648,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
             int nextDepth = depth - 1;
+            int extension = 0;
+            if (idx == 0 && depth >= 3) {
+                int shallow = minimax(child, depth - 2, ply + 1, alpha, beta, true, repetitions, &m);
+                if (shallow >= beta) extension = 1;
+            }
+            nextDepth += extension;
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {

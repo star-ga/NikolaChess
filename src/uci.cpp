@@ -19,6 +19,7 @@
 // management, ponder hit, multiPV and other features.
 
 #include "uci.h"
+#include "search.h"
 #include "board.h"
 #include "gpu_eval.h" // for possible future integration
 #include "tablebase.h" // for setting tablebase path
@@ -32,27 +33,13 @@
 #include <vector>
 #include <cctype>
 
-// Forward declaration of search function.
+
 namespace nikola {
-
-// Global PGN file path used when saving games.  The default can be
-// changed via the UCI option PGNFile.
+// Global PGN file path used when saving games.  The default can be changed via the UCI option PGNFile.
 static std::string g_pgnFilePath = "game.pgn";
-
-// Global variables controlling opening book usage.  When g_useBook
-// is true and a book file has been provided via the BookFile
-// option, the engine will attempt to select a move from the
-// opening book before searching.  g_bookFilePath stores the path
-// to the Polyglot book file.  See polyglot.cpp for details.
+// Opening book configuration
 static bool g_useBook = false;
 static std::string g_bookFilePath;
-// Forward declaration for runtime GPU switching.  Defined in search.cpp.
-void setUseGpu(bool use);
-Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
-Board makeMove(const Board& board, const Move& m);
-}
-
-namespace nikola {
 
 // Helper to convert from row,col to algebraic notation.
 static std::string toAlgebraic(int row, int col) {
