@@ -1,7 +1,7 @@
 # NikolaChess: Supercomputer Chess Engine
 
-Harness the power of supercomputing for chess!  The **Supercomputer
-Chess Engine** (formerly *NikolaChess*) is a high‑performance chess
+Harness the power of supercomputing for chess!  The **NikolaChess** (*Supercomputer
+Chess Engine*) is a high‑performance chess
 engine optimised for supercomputer‑scale computing.  It leverages
 CUDA to parallelise evaluations on GPUs, scales from a single
 laptop to multi‑node GPU clusters, and retains a clean, modern C++
