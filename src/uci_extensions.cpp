@@ -1,5 +1,6 @@
 #include "uci_extensions.h"
 #include "engine_options.h"
+#include "uci.h" // for strength accessors
 #include "time_manager.h"
 #include "multipv_search.h"
 #include "pv.h"
@@ -22,23 +23,23 @@ static int to_i(const std::vector<std::string>& t, const char* key, int def=-1){
 void uci_go(const Board& current, const std::vector<std::string>& tokens) {
     EngineOptions& o = opts();
 
-    int depth = to_i(tokens, "depth", -1);
+    int searchDepth = to_i(tokens, "depth", -1);
     int wtime = to_i(tokens, "wtime", -1);
     int btime = to_i(tokens, "btime", -1);
     int winc  = to_i(tokens, "winc", 0);
     int binc  = to_i(tokens, "binc", 0);
     int mtg   = to_i(tokens, "movestogo", 0);
 
-    if (o.LimitStrength) {
-        int cap = 1 + o.Strength;
-        if (depth < 0 || depth > cap) depth = cap;
+    if (getLimitStrength()) {
+        int cap = 1 + getStrength();
+        searchDepth = (searchDepth < 0) ? cap : std::min(searchDepth, cap);
     }
 
     // compute budget
     int budget = compute_time_budget(current, current.whiteToMove, wtime, btime, winc, binc, mtg, o.MoveOverhead, 0.10);
 
     // Run root MultiPV
-    auto results = search_multipv(current, std::max(1,o.MultiPV), depth, budget);
+    auto results = search_multipv(current, std::max(1,o.MultiPV), searchDepth, budget);
 
     // Emit info lines
     for (size_t i=0; i<results.size(); ++i) {

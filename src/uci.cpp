@@ -21,6 +21,7 @@
 #include "uci.h"
 #include "search.h"
 #include "board.h"
+#include "engine_options.h" // access to global UCI options
 #include "gpu_eval.h" // for possible future integration
 #include "tablebase.h" // for setting tablebase path
 #include "pgn_logger.h" // for recording moves and saving PGN
@@ -40,6 +41,12 @@ static std::string g_pgnFilePath = "game.pgn";
 // Opening book configuration
 static bool g_useBook = false;
 static std::string g_bookFilePath;
+
+// Exposed strength settings (stored in EngineOptions singleton)
+bool getLimitStrength() { return opts().LimitStrength; }
+int  getStrength()      { return opts().Strength; }
+void setLimitStrength(bool v) { opts().LimitStrength = v; }
+void setStrength(int v) { opts().Strength = v; }
 
 // Helper to convert from row,col to algebraic notation.
 static std::string toAlgebraic(int row, int col) {
