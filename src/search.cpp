@@ -3,7 +3,7 @@
 // Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
-// This module contains a simple minimax search with alpha‑beta
+// This module contains a simple minimax search with alpha-beta
 // pruning.  It operates on copies of the Board structure and
 // generates moves using the functions in move_generation.cu.  At leaf
 // nodes the static evaluation is obtained by calling the CPU
@@ -23,12 +23,12 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
-#include <cstdlib> // for getenv
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
 #include <random>
 #include <algorithm>
+#include <future>   // for std::future in staticEvaluate()
 
 // Include tablebase probing functions and piece counting utility.  The
 // engine will consult endgame tablebases when the position has
@@ -51,7 +51,7 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards);
 
 // Enumeration of available evaluation backends.  By default the
 // engine uses the CPU implementation (NNUE or classical).  If
-// NIKOLA_GPU environment variable is set to a non‑zero value, the
+// NIKOLA_GPU environment variable is set to a non-zero value, the
 // engine will attempt to use the GPU batched evaluation.
 enum class EvaluationBackend {
     CPU_NNUE,
@@ -168,12 +168,6 @@ static int staticEvaluate(const Board& b) {
     // heuristic evaluation.
     if (nikola::tablebaseAvailable()) {
         int numPieces = nikola::countPieces(b);
-        // Lomonosov 7‑man and Syzygy 6‑man tablebases support up to
-        // seven pieces including kings.  Since we do not yet have a
-        // real probing implementation, the probeWDL function always
-        // returns unknown.  Nevertheless this logic is ready for
-        // future integration: adjust the threshold as appropriate when
-        // adding an actual tablebase engine.
         if (numPieces <= 6) {
             int wdl = nikola::probeWDL(b);
             if (wdl == 1) {
@@ -190,20 +184,13 @@ static int staticEvaluate(const Board& b) {
         }
     }
     // If GPU batched evaluation is selected and a batcher exists,
-    // submit the board to the batcher and wait for the result.  This
-    // call may block if the batch has not yet been flushed.  Any
-    // exceptions thrown by the batcher are caught and we fall back to
-    // CPU evaluation.
+    // submit the board to the batcher and wait for the result.
     if (g_evalBackend == EvaluationBackend::GPU_BATCHED && g_batcher) {
         try {
             std::future<int> fut = g_batcher->submit(b);
-            // Wait for the result.  The future will be fulfilled
-            // when the batcher processes the batch, which may occur
-            // immediately or after a short delay.
             return fut.get();
         } catch (...) {
-            // If submitting to the batcher throws (e.g., due to
-            // shutdown), fall back to CPU evaluation.
+            // Fall back to CPU evaluation on any failure.
         }
     }
     // Default path: evaluate on the CPU.
@@ -212,15 +199,15 @@ static int staticEvaluate(const Board& b) {
 
 
 // The following code extends the basic minimax implementation with
-// detection of draw conditions: threefold repetition, the fifty‑move
+// detection of draw conditions: threefold repetition, the fifty-move
 // rule and insufficient material.  We implement Zobrist hashing to
 // uniquely identify positions (including side to move, castling
 // rights and en passant targets) and track the number of times each
 // position has occurred along the current search path.  When a
 // position appears three times, the function returns a score of zero
-// (draw).  The half‑move clock stored in the Board tracks the
+// (draw).  The half-move clock stored in the Board tracks the
 // number of half moves since the last capture or pawn move; if this
-// reaches 100, the fifty‑move rule applies and the game is drawn.
+// reaches 100, the fifty-move rule applies and the game is drawn.
 
 namespace {
 
@@ -232,7 +219,7 @@ static uint64_t computeZobrist(const nikola::Board& board) {
     using nikola::Piece;
     // Static tables of random values.  Index 0..5 for White pieces
     // (pawn..king) and 6..11 for Black pieces.  The 64 squares are
-    // numbered 0..63 in rank‑file order.
+    // numbered 0..63 in rank-file order.
     static bool init = false;
     static uint64_t pieceTable[12][64];
     static uint64_t castlingTable[4];
@@ -280,23 +267,14 @@ static uint64_t computeZobrist(const nikola::Board& board) {
     if (board.enPassantCol >= 0 && board.enPassantCol < 8) {
         h ^= enPassantTable[board.enPassantCol];
     }
-    // Side to move: we flip the key when White is to move to
-    // distinguish positions with the same piece placement but
-    // different players to move.
+    // Side to move
     if (board.whiteToMove) h ^= sideToMoveKey;
     return h;
 }
 
 // Determine whether a position has insufficient material to force a
 // checkmate.  Returns true if both sides lack sufficient force to
-// deliver mate according to simplified heuristics.  We treat the
-// following scenarios as draws: (1) king vs king; (2) king and
-// single bishop or single knight vs king; (3) king and bishop vs
-// king and bishop with both bishops on the same colour; (4) king and
-// single knight vs king and single knight.  Positions with pawns,
-// rooks or queens are never considered insufficient.  Positions with
-// more than one minor piece (bishop or knight) on a side are
-// considered sufficient.
+// deliver mate according to simplified heuristics.
 static bool isInsufficientMaterial(const nikola::Board& board) {
     int whitePawns = 0, blackPawns = 0;
     int whiteRooks = 0, blackRooks = 0;
@@ -341,30 +319,25 @@ static bool isInsufficientMaterial(const nikola::Board& board) {
     if (whitePawns + blackPawns > 0) return false;
     if (whiteRooks + blackRooks > 0) return false;
     if (whiteQueens + blackQueens > 0) return false;
-    // Count minor pieces.
+
     int whiteMinor = whiteBishops + whiteKnights;
     int blackMinor = blackBishops + blackKnights;
-    // Both sides with no minor pieces: king vs king.
+
+    // King vs king.
     if (whiteMinor == 0 && blackMinor == 0) return true;
-    // One side has a single minor, other has none: K+B vs K or K+N vs K.
+    // K+B vs K or K+N vs K.
     if ((whiteMinor == 1 && blackMinor == 0) || (whiteMinor == 0 && blackMinor == 1)) {
         return true;
     }
-    // Both sides with exactly one bishop and no knights: K+B vs K+B with bishops on same colour.
+    // K+B vs K+B with same-color bishops.
     if (whiteBishops == 1 && blackBishops == 1 && whiteKnights == 0 && blackKnights == 0) {
-        // Both bishops must be on the same colour squares.
-        // If both have both colours, it cannot be insufficient.
-        if (whiteBishopColors == 1 && blackBishopColors == 1) return true;
-        if (whiteBishopColors == 2 && blackBishopColors == 2) return true;
-        // If one has dark and the other has dark, or both have light.
         if (whiteBishopColors == blackBishopColors) return true;
     }
-    // Both sides with a single knight: K+N vs K+N.
+    // K+N vs K+N.
     if (whiteKnights == 1 && blackKnights == 1 && whiteBishops == 0 && blackBishops == 0) {
         return true;
     }
-    // Two knights vs bare king is insufficient to force mate.  If one side
-    // has exactly two knights and the other has no minor pieces, it is a draw.
+    // Two knights vs bare king is insufficient.
     if (whiteKnights == 2 && whiteBishops == 0 && whitePawns + whiteRooks + whiteQueens == 0 &&
         blackKnights == 0 && blackBishops == 0 && blackPawns + blackRooks + blackQueens == 0) {
         return true;
@@ -373,171 +346,71 @@ static bool isInsufficientMaterial(const nikola::Board& board) {
         whiteKnights == 0 && whiteBishops == 0 && whitePawns + whiteRooks + whiteQueens == 0) {
         return true;
     }
-    // All other cases: assume sufficient material to continue.
     return false;
 }
 
-// Transposition table entry.  Stores the depth at which a position
-// was evaluated, the evaluation score, a bound flag and the best
-// move found from this position.  The flag takes one of three
-// values: EXACT indicates the stored score is the precise evaluation;
-// LOWERBOUND means the score is a lower bound (alpha cutoff);
-// UPPERBOUND means the score is an upper bound (beta cutoff).
-// TTEntry moved to tt_entry.h
+// TT flags (kept for compatibility with stored values).
 static const int TT_EXACT = 0;
 static const int TT_LOWERBOUND = 1;
 static const int TT_UPPERBOUND = 2;
-// Transposition table now implemented via sharded module
 
-// Quiescence search.  This helper evaluates only capture and
-// promotion moves to avoid the horizon effect in leaf nodes.  It
-// performs a stand‑pat evaluation and then recursively explores
-// capturing continuations while maintaining alpha‑beta bounds.  The
-// side to move is indicated by the maximizing flag: true when
-// searching for White's advantage, false for Black.  This search
-// ignores repetition and fifty‑move draw rules, as it is intended
-// only for final refinements after depth‑limited search.
+// Quiescence search: captures/promotions only.
 static int quiescence(const Board& board, int alpha, int beta, bool maximizing) {
     int standPat = staticEvaluate(board);
     if (maximizing) {
-        if (standPat >= beta) {
-            return standPat;
-        }
-        if (standPat > alpha) {
-            alpha = standPat;
-        }
+        if (standPat >= beta) return standPat;
+        if (standPat > alpha) alpha = standPat;
     } else {
-        if (standPat <= alpha) {
-            return standPat;
-        }
-        if (standPat < beta) {
-            beta = standPat;
-        }
+        if (standPat <= alpha) return standPat;
+        if (standPat < beta) beta = standPat;
     }
     auto moves = generateMoves(board);
     for (const Move& m : moves) {
-        // Explore only captures and promotions in quiescence.  This
-        // reduces the branching factor and focuses on forcing
-        // sequences that materially change the evaluation.
-        if (m.captured == nikola::EMPTY && m.promotedTo == 0) {
-            continue;
-        }
+        if (m.captured == nikola::EMPTY && m.promotedTo == 0) continue;
         Board child = makeMove(board, m);
         int score = quiescence(child, alpha, beta, !maximizing);
         if (maximizing) {
-            if (score > alpha) {
-                alpha = score;
-            }
-            if (alpha >= beta) {
-                return alpha;
-            }
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) return alpha;
         } else {
-            if (score < beta) {
-                beta = score;
-            }
-            if (beta <= alpha) {
-                return beta;
-            }
+            if (score < beta) beta = score;
+            if (beta <= alpha) return beta;
         }
     }
     return maximizing ? alpha : beta;
 }
 
-// Piece material values used for move ordering.  These mirror the
-// values used in the evaluation function: pawn = 100, knight = 320,
-// bishop = 330, rook = 500, queen = 900, king = 100000.  We use
-// these values to prioritise captures and promotions during search.
+// Material values for ordering (pawn..king).
 static const int orderingMaterial[6] = {100, 320, 330, 500, 900, 100000};
 
-// Killer move heuristic: for each ply store the two moves that most
-// recently caused a beta cutoff.  Moves are promoted to the front
-// of the move ordering at the corresponding depth.  The indices
-// correspond to the ply from the root (0 at root).  We support
-// depths up to 64 plies.
-// Use thread_local storage for killer moves so that each thread
-// maintains its own history without data races.  Each thread
-// initialises its killer move table independently.  Depth up to 64 plies.
+// Killer/history/countermove heuristics (thread-local).
 thread_local static Move killerMoves[64][2];
-
-// History heuristic: a table accumulating a score for each move
-// (from square × to square).  Moves that frequently cause beta
-// cutoffs at deeper depths receive higher scores and are tried
-// earlier.  The table index is [fromSquare][toSquare] where
-// fromSquare = fromRow * 8 + fromCol and toSquare = toRow * 8 + toCol.
-// History heuristic table is also thread‑local.  Each thread
-// accumulates its own history scores for move ordering.  The
-// index [from][to] corresponds to moves from a square to a square.
 thread_local static int historyTable[64][64];
-
-// Countermove heuristic: For each previous move (from‑square × to‑square)
-// store the best reply that has previously caused a beta cutoff.  When
-// exploring moves after a given previous move, the stored countermove
-// is prioritised in move ordering.  We use thread‑local storage to
-// avoid contention between threads.
 thread_local static Move counterMoves[64][64];
 
-// Helper to obtain the material value of a piece code.  Input must
-// be non‑zero.  The absolute piece code minus one indexes into the
-// orderingMaterial array.  White and black pieces have the same
-// absolute value.
 static inline int orderingPieceValue(int8_t p) {
     int idx = std::abs(p) - 1;
     return orderingMaterial[idx];
 }
 
-// Extended minimax with alpha‑beta pruning and draw detection.  The
-// repetitions map counts occurrences of positions along the current
-// search path.  When a position occurs three times, the game is
-// drawn and zero is returned.  The half‑move clock is checked for
-// the fifty‑move rule.  Insufficient material also yields a draw.
-// Extended minimax with alpha‑beta pruning and draw detection.  The
-// repetitions map counts occurrences of positions along the current
-// search path.  When a position occurs three times, the game is
-// drawn and zero is returned.  The half‑move clock is checked for
-// the fifty‑move rule.  Insufficient material also yields a draw.
-//
-// The `prevMove` parameter points to the move that led to this
-// position.  It is used by the countermove heuristic to prioritise
-// replies that have previously caused beta cutoffs after the same
-// opponent move.  At the root of the search, prevMove should be
-// nullptr.
+// Minimax with alpha-beta + draws + heuristics.
 static int minimax(const nikola::Board& board, int depth, int ply, int alpha, int beta, bool maximizing,
                    std::unordered_map<uint64_t,int>& repetitions, const nikola::Move* prevMove) {
-    // Fifty-move rule: if 100 half moves have occurred without a
-    // capture, pawn move or promotion, return a draw score.
-    if (board.halfMoveClock >= 100) {
-        return 0;
-    }
-    // Insufficient material: immediate draw.
-    if (isInsufficientMaterial(board)) {
-        return 0;
-    }
-    // Compute the Zobrist hash once for both repetition detection and
-    // transposition table lookup.
+    // 50-move rule
+    if (board.halfMoveClock >= 100) return 0;
+    // Insufficient material
+    if (isInsufficientMaterial(board)) return 0;
+
     uint64_t h = computeZobrist(board);
-    // Threefold repetition detection.  Update count for the current
-    // position.  If this is the third occurrence, return a draw.
+
+    // Threefold repetition
     int& cnt = repetitions[h];
     cnt++;
-    if (cnt >= 3) {
-        cnt--;
-        return 0;
-    }
-    // Check the transposition table for a cached result at sufficient
-    // depth.  If found, use the stored bounds to narrow the window or
-    // return an exact evaluation.  Note: transposition table entries
-    // do not account for repetition counts or 50‑move rule, so draw
-    // detection happens before TT lookup.
-    // Lookup in the transposition table.  We copy the entry out of the table
-    // while holding the mutex so that other threads can still access the
-    // table concurrently.  After copying we release the lock and use
-    // the local copy.  This avoids holding the lock during the rest
-    // of the search.
+    if (cnt >= 3) { cnt--; return 0; }
+
+    // Transposition table lookup
     TTEntry ttEntry;
-    bool ttFound = false;
-    {
-    ttFound = tt_lookup(h, ttEntry);
-}
+    bool ttFound = tt_lookup(h, ttEntry);
     if (ttFound && ttEntry.depth >= depth) {
         if (ttEntry.flag == TT_EXACT) {
             cnt--;
@@ -551,187 +424,114 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             cnt--;
             return ttEntry.score;
         }
+    }
 
-    // Null‑move pruning.  If the side to move is not in check and
-    // sufficient depth remains, try a null move (skip the turn) to
-    // quickly detect quiet positions where the opponent cannot take
-    // advantage.  We avoid null moves in situations with very few
-    // pieces to reduce the risk of zugzwang.  A reduction R of 2 or
-    // 3 plies is applied based on remaining depth.  If the null
-    // move causes a fail‑high (maximizing) or fail‑low (minimizing)
-    // condition, the branch is pruned.
+    // Null-move pruning (outside TT scope, as intended)
     if (depth >= 2) {
-        // Only attempt a null move if the side to move is not in check.
         bool inCheck = isKingInCheck(board, board.whiteToMove);
         if (!inCheck) {
-            // Require more than three pieces on the board to avoid
-            // zugzwang in simple endgames.
             int numPieces = nikola::countPieces(board);
             if (numPieces > 3) {
-                // Determine the reduction.  Use a larger reduction for
-                // deeper nodes to make null‑move pruning more
-                // aggressive.
                 int R = (depth > 6 ? 3 : 2);
                 if (depth - 1 - R >= 0) {
                     Board nullBoard = board;
-                    // Switch side to move and clear en passant target.
                     nullBoard.whiteToMove = !board.whiteToMove;
                     nullBoard.enPassantCol = -1;
-                    // Increment halfmove clock since no capture or pawn
-                    // move occurred.
                     nullBoard.halfMoveClock = board.halfMoveClock + 1;
-                    // Copy the repetition map so the null move does not
-                    // affect other branches.  The minimax call will
-                    // increment/decrement repetition counts
-                    // independently.
+
                     std::unordered_map<uint64_t,int> repsNull = repetitions;
-                int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
-                                        !maximizing, repsNull, prevMove);
-                    // If the null move evaluation triggers a cutoff, perform a verification search
-                    // at reduced depth to reduce the risk of incorrect pruning in zugzwang.  Only
-                    // prune if both the initial null move and the verification search fail.
+                    int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
+                                            !maximizing, repsNull, prevMove);
+
                     bool prune = false;
                     if (maximizing) {
                         if (nullScore >= beta) {
-                            // Verification depth: reduce by one more ply
                             int verifyDepth = depth - 1 - R - 1;
                             if (verifyDepth < 0) verifyDepth = 0;
-                            Board verifyBoard = nullBoard;
-                            // Copy repetition map for verification search
                             std::unordered_map<uint64_t,int> repsVerify = repetitions;
-                            int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, beta - 1, beta,
-                                                     !maximizing, repsVerify, prevMove);
-                            if (verifyScore >= beta) {
-                                prune = true;
-                            }
+                            int verifyScore = minimax(nullBoard, verifyDepth, ply + 1, beta - 1, beta,
+                                                      !maximizing, repsVerify, prevMove);
+                            if (verifyScore >= beta) prune = true;
                         }
                     } else {
                         if (nullScore <= alpha) {
                             int verifyDepth = depth - 1 - R - 1;
                             if (verifyDepth < 0) verifyDepth = 0;
-                            Board verifyBoard = nullBoard;
                             std::unordered_map<uint64_t,int> repsVerify = repetitions;
-                            int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, alpha,
-                                                     alpha + 1, !maximizing, repsVerify, prevMove);
-                            if (verifyScore <= alpha) {
-                                prune = true;
-                            }
+                            int verifyScore = minimax(nullBoard, verifyDepth, ply + 1, alpha, alpha + 1,
+                                                      !maximizing, repsVerify, prevMove);
+                            if (verifyScore <= alpha) prune = true;
                         }
                     }
-                    if (prune) {
-                        cnt--;
-                        return nullScore;
-                    }
+                    if (prune) { cnt--; return nullScore; }
                 }
             }
         }
     }
-    }
-    // If depth is zero or no moves, perform static evaluation.  We do
-    // not consult the TT again here because shallow positions are
-    // inexpensive to evaluate and we still need to adjust the
-    // repetition count.
+
+    // Quiescence at depth 0
     if (depth == 0) {
-        // When search depth is exhausted, perform a quiescence search
-        // instead of a simple static evaluation.  This captures
-        // forcing sequences of captures and promotions to reduce the
-        // horizon effect.
-        int val = quiescence(board, alpha, beta, maximizing);
-        cnt--;
-        return val;
-    }
-    auto moves = generateMoves(board);
-    if (moves.empty()) {
-        // No moves available: use quiescence search for stand‑pat evaluation
         int val = quiescence(board, alpha, beta, maximizing);
         cnt--;
         return val;
     }
 
-    // Futility pruning and razoring.  At shallow depths where only
-    // a limited amount of search remains, we can sometimes prune a
-    // branch based on a quick static evaluation.  If the static
-    // evaluation is so bad that it cannot raise alpha (in the
-    // maximizing case) or so good that it cannot lower beta (in
-    // the minimizing case), we return the static score without
-    // exploring children.  A small margin accounts for the fact
-    // that captures or promotions might slightly change the score.
-    // We skip these heuristics if the side to move is in check to
-    // avoid pruning tactical positions and when depth is large.
+    auto moves = generateMoves(board);
+    if (moves.empty()) {
+        int val = quiescence(board, alpha, beta, maximizing);
+        cnt--;
+        return val;
+    }
+
+    // Futility & simple razoring
     if (depth <= 2) {
         bool inCheck = isKingInCheck(board, board.whiteToMove);
         if (!inCheck) {
             int staticScore = staticEvaluate(board);
-            // Futility margin grows with depth: deeper nodes allow a
-            // larger margin because there is more time to recover.
-            int margin = 50 * depth; // e.g. 50 for depth 1, 100 for depth 2
+            int margin = 50 * depth;
             if (maximizing) {
-                if (staticScore + margin <= alpha) {
-                    cnt--;
-                    return staticScore;
-                }
+                if (staticScore + margin <= alpha) { cnt--; return staticScore; }
             } else {
-                if (staticScore - margin >= beta) {
-                    cnt--;
-                    return staticScore;
-                }
+                if (staticScore - margin >= beta) { cnt--; return staticScore; }
             }
-            // Razoring: If the position appears hopeless at depth 2
-            // (two plies remaining), prune immediately based on the
-            // static evaluation.  Use a larger margin to account for
-            // possible tactical swings.  This is a simple form of
-            // razoring that does not perform a verification search.
             int razorMargin = 150;
             if (depth == 2) {
-                if (maximizing && staticScore + razorMargin <= alpha) {
-                    cnt--;
-                    return staticScore;
-                }
-                if (!maximizing && staticScore - razorMargin >= beta) {
-                    cnt--;
-                    return staticScore;
-                }
+                if (maximizing && staticScore + razorMargin <= alpha) { cnt--; return staticScore; }
+                if (!maximizing && staticScore - razorMargin >= beta) { cnt--; return staticScore; }
             }
         }
     }
-    // Determine principal variation (PV) move from the TT if available
-    // to improve move ordering.  This move should be searched first.
+
+    // PV move from TT (codex variant with validity check)
     Move pvMove{};
     bool hasPV = false;
-    // Retrieve the principal variation move from the transposition table.
-    TTEntry pvEntry;
-    if (tt_lookup(h, pvEntry)) {
-        pvMove = pvEntry.bestMove;
-        // Only consider PV if it has a non-zero from square (valid move).
-        if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 && pvMove.toRow == 0 && pvMove.toCol == 0)) {
-            hasPV = true;
+    {
+        TTEntry pvEntry;
+        if (tt_lookup(h, pvEntry)) {
+            pvMove = pvEntry.bestMove;
+            if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 &&
+                  pvMove.toRow == 0 && pvMove.toCol == 0)) {
+                hasPV = true;
+            }
         }
     }
-    // Assign ordering scores to moves.  Moves that capture a high
-    // valued piece or promote are ordered first.  The principal
-    // variation move receives the highest priority.
+
+    // Score moves for ordering
     std::vector<std::pair<int, Move>> scored;
     scored.reserve(moves.size());
     for (const Move& m : moves) {
         int score = 0;
-        // PV move bonus
+        // PV bonus
         if (hasPV && m.fromRow == pvMove.fromRow && m.fromCol == pvMove.fromCol &&
             m.toRow == pvMove.toRow && m.toCol == pvMove.toCol && m.promotedTo == pvMove.promotedTo) {
             score += 1000000;
         }
         // Promotion bonus
         if (m.promotedTo != 0) {
-            // Promotions are highly valuable.  Use the value of the
-            // promoted piece (minus pawn) to scale.
             int idx = std::abs(m.promotedTo) - 1;
             score += 10000 + orderingMaterial[idx];
         }
-        // Capture bonus using static exchange evaluation (SEE).  SEE
-        // estimates the net material gain of a capture.  Positive
-        // scores indicate favourable trades.  Multiply by a large
-        // constant to prioritise favourable captures ahead of other
-        // moves.  In addition to SEE we retain a MVV‑LVA like
-        // component to distinguish among equally valued exchanges.
+        // Capture bonus via SEE + MVV/LVA-ish tweak
         if (m.captured != nikola::EMPTY) {
             int seeScore = see(board, m);
             score += 1000 * seeScore;
@@ -739,9 +539,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             int attackerVal = orderingPieceValue(board.squares[m.fromRow][m.fromCol]);
             score += 10 * capturedVal - attackerVal;
         }
-        // Killer move bonus: moves that previously caused a beta cutoff
-        // at this ply are tried earlier.  First killer receives a
-        // large bonus; second killer a slightly smaller bonus.
+        // Killer moves
         if (ply < 64) {
             const Move& k0 = killerMoves[ply][0];
             if (m.fromRow == k0.fromRow && m.fromCol == k0.fromCol &&
@@ -755,65 +553,48 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 }
             }
         }
-        // History heuristic: accumulate scores based on past beta cutoffs.
+        // History heuristic
         int fromIdx = m.fromRow * 8 + m.fromCol;
         int toIdx = m.toRow * 8 + m.toCol;
         score += historyTable[fromIdx][toIdx];
 
-        // Countermove bonus: if this move is the stored best reply to the
-        // previous move, give it a bonus to prioritise it after killers.
+        // Countermove bonus
         if (prevMove != nullptr) {
             int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
             int pTo = prevMove->toRow * 8 + prevMove->toCol;
             const Move& cm = counterMoves[pFrom][pTo];
             if (m.fromRow == cm.fromRow && m.fromCol == cm.fromCol &&
-                m.toRow == cm.toRow && m.toCol == cm.toCol &&
-                m.promotedTo == cm.promotedTo) {
-                // Assign a bonus between killer moves and history.
+                m.toRow == cm.toRow && m.toCol == cm.toCol && m.promotedTo == cm.promotedTo) {
                 score += 850000;
             }
         }
         scored.emplace_back(score, m);
     }
-    // Sort moves by descending score to improve pruning.  A stable
-    // sort ensures the relative order of equally scored moves
-    // remains deterministic.
+
     std::stable_sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
         return a.first > b.first;
     });
+
     int bestVal;
     Move bestChildMove{};
-    // Save original alpha and beta to determine the TT flag later.
     int alphaOrig = alpha;
     int betaOrig = beta;
+
     if (maximizing) {
         bestVal = INT_MIN;
-        // Iterate with index to apply late move reductions (LMR).
         for (size_t idx = 0; idx < scored.size(); ++idx) {
             const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
             int nextDepth = depth - 1;
             int eval;
-            // Apply late move reductions on quiet moves.  If this is
-            // not one of the first few moves and the move is
-            // neither a capture nor a promotion, search at reduced
-            // depth.  If the reduced search fails to improve alpha
-            // we accept the reduced result; otherwise we re‑search
-            // at full depth.  The reduction value increases with
-            // depth and position in the move list.
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
                 int reduction = 1;
-                if (depth > 6 && idx >= 6) {
-                    // Apply a larger reduction deeper in the tree
-                    reduction = 2;
-                }
+                if (depth > 6 && idx >= 6) reduction = 2;
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
                 int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, false, repetitions, &m);
                 eval = evalReduced;
-                // If the reduced search suggests the move is good, re‑search
-                // at full depth to confirm.
                 if (evalReduced > alpha) {
                     eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions, &m);
                 }
@@ -826,9 +607,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             }
             if (eval > alpha) alpha = eval;
             if (beta <= alpha) {
-                // Beta cutoff: record killer move and update history.
                 if (ply < 64) {
-                    // Promote to first killer if different.
                     if (!(killerMoves[ply][0].fromRow == m.fromRow && killerMoves[ply][0].fromCol == m.fromCol &&
                           killerMoves[ply][0].toRow == m.toRow && killerMoves[ply][0].toCol == m.toCol &&
                           killerMoves[ply][0].promotedTo == m.promotedTo)) {
@@ -839,7 +618,6 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int fIdx = m.fromRow * 8 + m.fromCol;
                 int tIdx = m.toRow * 8 + m.toCol;
                 historyTable[fIdx][tIdx] += depth * depth;
-                // Record countermove: store this move as the best reply to the previous move.
                 if (prevMove != nullptr) {
                     int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
                     int pTo = prevMove->toRow * 8 + prevMove->toCol;
@@ -858,9 +636,7 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
                 int reduction = 1;
-                if (depth > 6 && idx >= 6) {
-                    reduction = 2;
-                }
+                if (depth > 6 && idx >= 6) reduction = 2;
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
                 int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, true, repetitions, &m);
@@ -877,7 +653,6 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             }
             if (eval < beta) beta = eval;
             if (beta <= alpha) {
-                // Alpha cutoff: record killer move and update history.
                 if (ply < 64) {
                     if (!(killerMoves[ply][0].fromRow == m.fromRow && killerMoves[ply][0].fromCol == m.fromCol &&
                           killerMoves[ply][0].toRow == m.toRow && killerMoves[ply][0].toCol == m.toCol &&
@@ -889,21 +664,17 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int fIdx = m.fromRow * 8 + m.fromCol;
                 int tIdx = m.toRow * 8 + m.toCol;
                 historyTable[fIdx][tIdx] += depth * depth;
-                // Record countermove for alpha cutoff as well.
                 if (prevMove != nullptr) {
                     int pFrom = prevMove->fromRow * 8 + prevMove->fromCol;
                     int pTo = prevMove->toRow * 8 + prevMove->toCol;
                     counterMoves[pFrom][pTo] = m;
                 }
-                break;
+                break; // alpha cutoff
             }
         }
     }
-    // Store the result in the transposition table.  Only store
-    // positions evaluated at this depth or deeper to avoid
-    // overwriting more accurate information.  Determine the flag
-    // based on the relation of bestVal to the original alpha/beta
-    // window.
+
+    // Store TT entry
     int flag;
     if (bestVal <= alphaOrig) {
         flag = TT_UPPERBOUND;
@@ -913,49 +684,34 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         flag = TT_EXACT;
     }
     TTEntry newEntry{depth, bestVal, flag, bestChildMove};
-    { tt_store(h, newEntry); }
-    // Restore repetition count when backtracking.
+    tt_store(h, newEntry);
+
     cnt--;
     return bestVal;
 }
 
-} // anonymous namespace
+} // end anonymous namespace
 
 // Choose the best move for the current player using minimax search to a
-// given depth.  Returns the move that yields the highest (for White)
-// or lowest (for Black) evaluation.  If there are no legal moves,
-// returns a zeroed move.
+// given depth.
 Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     tt_configure_from_env();
     Move chosenMove{};
-    // Clear the transposition table to avoid interference from
-    // previous searches.  We retain the table across iterative
-    // deepening depths to allow re‑use of work from shallower
-    // searches but clear it on each new top‑level search.
     { tt_clear(); }
-    // Reset killer moves, history heuristic and countermove tables at the start of
-    // a new search.  This ensures that ordering heuristics reflect
-    // only information gathered during the current search.
+
+    // Reset heuristics
     for (int i = 0; i < 64; ++i) {
-        for (int k = 0; k < 2; ++k) {
-            killerMoves[i][k] = Move{};
-        }
+        for (int k = 0; k < 2; ++k) killerMoves[i][k] = Move{};
         for (int j = 0; j < 64; ++j) {
             historyTable[i][j] = 0;
             counterMoves[i][j] = Move{};
         }
     }
-    // If no moves are available, return an empty move immediately.
+
     auto initialMoves = generateMoves(board);
     if (initialMoves.empty()) return chosenMove;
-    // If no explicit time limit is provided (zero or negative), derive
-    // a reasonable per‑move allocation from environment variables.  A
-    // typical strategy is to spend a small fraction of the remaining
-    // time plus half of the increment on the current move.  The
-    // environment variables `NIKOLA_REMAINING_MS` and
-    // `NIKOLA_INCREMENT_MS` can be set by the host program or GUI to
-    // provide the remaining time (in milliseconds) and per‑move
-    // increment.  If neither is set, a default of 3000 ms is used.
+
+    // Time management
     if (timeLimitMs <= 0) {
         int defaultMs = 3000;
         const char* envRem = std::getenv("NIKOLA_REMAINING_MS");
@@ -963,8 +719,6 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         int remaining = envRem ? std::atoi(envRem) : 0;
         int increment = envInc ? std::atoi(envInc) : 0;
         if (remaining > 0) {
-            // Allocate roughly one‑thirtieth of the remaining time and
-            // half of the increment.  Clamp to a minimum of 50 ms.
             int alloc = remaining / 30 + increment / 2;
             if (alloc < 50) alloc = 50;
             timeLimitMs = alloc;
@@ -972,40 +726,26 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             timeLimitMs = defaultMs;
         }
     }
-    // Track the start time when a time limit is provided.  We use
-    // steady_clock to avoid issues with system clock adjustments.
+
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
 
-    // Determine the number of search threads from the environment.  If
-    // NIKOLA_THREADS is set to a value greater than one, the root
-    // moves will be searched in parallel using that many threads.
     int numThreads = 1;
     if (const char* envThr = std::getenv("NIKOLA_THREADS")) {
         int t = std::atoi(envThr);
         if (t > 1) numThreads = t;
     }
-    // Iterative deepening: search incrementally deeper and keep track
-    // of the best move at each depth.  The principal variation
-    // information stored in the transposition table will guide move
-    // ordering in deeper searches.  If a time limit is set and
-    // exceeded, we stop searching and return the best move found
-    // thus far.
-    // Previous best score used to centre the aspiration window.  We
-    // initialise with zero at the root.  The aspiration window is
-    // centred around this score to restrict the alpha‑beta window and
-    // accelerate search.  On a fail high or fail low we research
-    // with the full window.
+
     int prevBestScore = 0;
     int aspirationWindow = 50;
+
     for (int currentDepth = 1; currentDepth <= depth; ++currentDepth) {
         Move bestMoveAtDepth{};
         int bestScoreAtDepth = board.whiteToMove ? INT_MIN : INT_MAX;
-        // Re‑generate root moves at each depth because the transposition
-        // table may have learned a new principal variation.  Use
-        // simple ordering: search the PV move first if available.
+
         auto moves = generateMoves(board);
-        // Try to move the PV move (if any) to the front of the list.
+
+        // Try to put PV first (codex variant with validity check)
         uint64_t rootHash = computeZobrist(board);
         Move pv{};
         bool pvExists = false;
@@ -1019,81 +759,49 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             }
         }
         if (pvExists) {
-            // Find pv in moves and move it to the front.
             for (size_t i = 0; i < moves.size(); ++i) {
                 const Move& m = moves[i];
                 if (m.fromRow == pv.fromRow && m.fromCol == pv.fromCol &&
                     m.toRow == pv.toRow && m.toCol == pv.toCol && m.promotedTo == pv.promotedTo) {
-                    if (i != 0) {
-                        std::swap(moves[0], moves[i]);
-                    }
+                    if (i != 0) std::swap(moves[0], moves[i]);
                     break;
                 }
             }
         }
-        // Evaluate each move at the current depth.  If multiple
-        // threads are requested, distribute the root moves across
-        // threads and search them in parallel.  Otherwise perform
-        // sequential search with an aspiration window centred on
-        // prevBestScore.  The parallel path uses full alpha‑beta
-        // bounds for simplicity.
+
         if (numThreads > 1 && moves.size() > 1) {
-            // Shared index into the moves vector.  Each thread will
-            // atomically fetch and increment this index to claim the
-            // next move to evaluate.
             std::atomic<int> nextIndex(0);
-            // Flag to indicate the time limit has been reached.  When
-            // set, threads will exit early.
             std::atomic<bool> timeUp(false);
-            // Protect updates to the best move and score found so far.
             std::mutex bestMutex;
             Move bestLocalMove{};
             int bestLocalScore = board.whiteToMove ? INT_MIN : INT_MAX;
-            // Lambda for worker threads.
+
             auto worker = [&](int tid) {
                 const char* pinEnv = std::getenv("NIKOLA_PIN_THREADS");
                 if (pinEnv && pinEnv[0] == '1') { nikola_pin_thread_to_core(tid); }
-                // Each thread resets its own killer, history and countermove tables
-                // before starting the search to avoid interference from
-                // previous searches.  The thread_local variables ensure
-                // isolation across threads.
                 for (int i = 0; i < 64; ++i) {
-                    for (int k = 0; k < 2; ++k) {
-                        killerMoves[i][k] = Move{};
-                    }
+                    for (int k = 0; k < 2; ++k) killerMoves[i][k] = Move{};
                     for (int j = 0; j < 64; ++j) {
                         historyTable[i][j] = 0;
                         counterMoves[i][j] = Move{};
                     }
                 }
-                
                 while (true) {
-                    // Check global time limit.  If expired, signal other
-                    // threads to stop and exit.
                     if (timeLimitMs > 0) {
                         auto now = clock::now();
                         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-                        if (elapsed >= timeLimitMs) {
-                            timeUp.store(true);
-                            break;
-                        }
+                        if (elapsed >= timeLimitMs) { timeUp.store(true); break; }
                     }
-                    // Fetch the next move index.
                     int idx = nextIndex.fetch_add(1);
-                    if (idx >= (int)moves.size() || timeUp.load()) {
-                        break;
-                    }
+                    if (idx >= (int)moves.size() || timeUp.load()) break;
+
                     const Move& m = moves[idx];
                     Board child = makeMove(board, m);
                     std::unordered_map<uint64_t,int> reps;
                     reps[rootHash] = 1;
-                    // Search the child position at depth‑1 using full
-                    // alpha‑beta bounds.  We do not use aspiration
-                    // windows here to avoid coordination overhead.
+
                     int score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
                                         !board.whiteToMove, reps, &m);
-                    // Update the best move/score found so far.  Use
-                    // locks to protect shared state.
                     {
                         std::lock_guard<std::mutex> guard(bestMutex);
                         if (board.whiteToMove) {
@@ -1110,40 +818,26 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                     }
                 }
             };
-            // Launch threads.  We spawn numThreads threads to
-            // evaluate the root moves.  The current thread also
-            // participates in evaluation by running the worker.
+
             std::vector<std::thread> threads;
             threads.reserve(numThreads - 1);
-            for (int t = 1; t < numThreads; ++t) {
-                threads.emplace_back(worker, t);
-            }
-            // Run worker in the current thread.
+            for (int t = 1; t < numThreads; ++t) threads.emplace_back(worker, t);
             worker(0);
-            // Join all spawned threads.
-            for (auto& th : threads) {
-                if (th.joinable()) th.join();
-            }
-            // Use the best move/score found by any thread.
+            for (auto& th : threads) { if (th.joinable()) th.join(); }
+
             bestMoveAtDepth = bestLocalMove;
             bestScoreAtDepth = bestLocalScore;
-            // If the time limit expired during evaluation, stop
-            // searching further depths.
+
             if (timeLimitMs > 0 && nextIndex.load() < (int)moves.size()) {
-                // Return the best move found so far.
                 chosenMove = bestMoveAtDepth;
                 return chosenMove;
             }
         } else {
-            // Sequential evaluation with an aspiration window centred
-            // on the previous best score.  The window helps guide
-            // alpha‑beta pruning at deeper depths.
             for (const Move& m : moves) {
                 if (timeLimitMs > 0) {
                     auto now = clock::now();
                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
                     if (elapsed >= timeLimitMs) {
-                        // Return the best move found so far at this depth.
                         chosenMove = (currentDepth == 1 ? m : chosenMove);
                         return chosenMove;
                     }
@@ -1151,8 +845,9 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                 Board child = makeMove(board, m);
                 std::unordered_map<uint64_t,int> reps;
                 reps[rootHash] = 1;
+
                 int alpha = prevBestScore - aspirationWindow;
-                int beta = prevBestScore + aspirationWindow;
+                int beta  = prevBestScore + aspirationWindow;
                 int score = minimax(child, currentDepth - 1, 1, alpha, beta,
                                     !board.whiteToMove, reps, &m);
                 if (score <= alpha || score >= beta) {
@@ -1160,33 +855,20 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                                     !board.whiteToMove, reps, &m);
                 }
                 if (board.whiteToMove) {
-                    if (score > bestScoreAtDepth) {
-                        bestScoreAtDepth = score;
-                        bestMoveAtDepth = m;
-                    }
+                    if (score > bestScoreAtDepth) { bestScoreAtDepth = score; bestMoveAtDepth = m; }
                 } else {
-                    if (score < bestScoreAtDepth) {
-                        bestScoreAtDepth = score;
-                        bestMoveAtDepth = m;
-                    }
+                    if (score < bestScoreAtDepth) { bestScoreAtDepth = score; bestMoveAtDepth = m; }
                 }
             }
         }
-        // After completing the current depth, update the chosen move.
+
         chosenMove = bestMoveAtDepth;
-        // Update the previous best score for the next iteration.  This
-        // centres the aspiration window on the most recent principal
-        // variation value.
         prevBestScore = bestScoreAtDepth;
-        // Check for time expiry after finishing the depth.  If the
-        // allowed time is exceeded, break out of the iterative
-        // deepening loop and return the best move found so far.
+
         if (timeLimitMs > 0) {
             auto now = clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-            if (elapsed >= timeLimitMs) {
-                break;
-            }
+            if (elapsed >= timeLimitMs) break;
         }
     }
     return chosenMove;

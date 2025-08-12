@@ -14,6 +14,17 @@ namespace {
 struct Shard {
     std::mutex m;
     std::unordered_map<uint64_t, TTEntry> map;
+    Shard() = default;
+    Shard(const Shard&) = delete;
+    Shard& operator=(const Shard&) = delete;
+    Shard(Shard&& other) noexcept : map(std::move(other.map)) {}
+    Shard& operator=(Shard&& other) noexcept {
+        if (this != &other) {
+            std::lock_guard<std::mutex> lock(other.m);
+            map = std::move(other.map);
+        }
+        return *this;
+    }
 };
 static std::vector<std::unique_ptr<Shard>> g_shards;
 static std::atomic<bool> g_inited{false};
