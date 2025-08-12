@@ -74,6 +74,13 @@ struct Board {
     // capture is possible following a two‑square pawn advance; -1 if
     // none.
     int8_t enPassantCol;
+
+    // Half move clock counts the number of half moves (ply) since the
+    // last capture or pawn move.  It is used to implement the
+    // fifty‑move rule: if this value reaches 100 both sides can claim
+    // a draw.  The clock is reset to zero on any capture, pawn move or
+    // promotion.
+    int halfMoveClock;
 };
 
 // Initialise a Board to the standard chess starting position.  Pawns

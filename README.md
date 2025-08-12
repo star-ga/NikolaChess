@@ -42,6 +42,12 @@ kernel, freeing the CPU to continue the search.
   check.
 * **Alpha‑beta search:** Implements a basic minimax search with
   alpha‑beta pruning on the CPU.  Depth is measured in plies.
+* **Draw detection:** The search detects draw claims by the
+  fifty‑move rule, threefold repetition and certain insufficient
+  material scenarios (K vs K, K+B vs K, K+N vs K, K+B vs K+B on
+  same‑colour squares, and K+N vs K+N).  Draw adjudication is
+  applied during the search and returns a neutral score when the
+  conditions are met.
 * **Improved evaluation with optional neural network:** Uses
   piece‑square tables derived from the PeSTO evaluation function to
   combine material and positional bonuses into a single score.
@@ -93,17 +99,21 @@ Engine selects move: b1 -> a3
 
 The current move generator enforces the rules of chess: castling,
 en passant and pawn promotions are all implemented, and moves that
-leave the moving side in check are discarded.  Draw adjudication
-(threefold repetition and fifty‑move rules) is not yet handled.
+leave the moving side in check are discarded.  The engine detects
+draw claims by the fifty‑move rule and threefold repetition and
+returns a neutral evaluation in such cases.  It also treats some
+insufficient‑material endgames as drawn.
 
 ## Limitations and future work
 
 * **Move generation completeness:** Underpromotions to queen, rook,
   bishop and knight are implemented.  Castling and en passant follow
   the official rules of chess and have been tested for common
-  scenarios.  However, the engine does not yet detect draw claims
-  such as the threefold repetition or fifty‑move rules, and it does
-  not support adjudication for insufficient material.
+  scenarios.  The engine now detects draw claims by the fifty‑move
+  rule and threefold repetition and adjudicates simple
+  insufficient‑material endgames.  More exotic drawn positions (e.g.
+  positions with two knights that cannot force checkmate) are
+  approximated but not rigorously handled.
 * **Search depth:** The built‑in minimax search depth is modest to
   keep runtime manageable.  Implementing iterative deepening,
   transposition tables, move ordering heuristics and a time

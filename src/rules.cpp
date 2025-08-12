@@ -24,6 +24,13 @@ static inline bool onBoard(int r, int c) {
 
 Board makeMove(const Board& board, const Move& m) {
     Board nb = board;
+    // Update the half-move clock.  The half-move clock counts the
+    // number of half moves (plies) since the last pawn move,
+    // capture or promotion.  It increments by one on a quiet move
+    // and resets to zero on any pawn move, capture or promotion.  We
+    // perform this update before manipulating the board so that the
+    // old board's values are visible.
+    nb.halfMoveClock = board.halfMoveClock;
     int8_t piece = nb.squares[m.fromRow][m.fromCol];
     // Reset enPassant.  It will be set again for pawn double moves.
     nb.enPassantCol = -1;
@@ -91,6 +98,19 @@ Board makeMove(const Board& board, const Move& m) {
     }
     // Toggle side to move.
     nb.whiteToMove = !board.whiteToMove;
+
+    // Update half-move clock after determining whether this move
+    // constitutes a capture, pawn move or promotion.  We use the
+    // original move fields rather than inspecting the modified board.
+    bool isPawn = (piece == WP || piece == BP);
+    bool isCapture = (m.captured != EMPTY);
+    bool isPromotion = (m.promotedTo != 0);
+    if (isPawn || isCapture || isPromotion) {
+        nb.halfMoveClock = 0;
+    } else {
+        // Increment the counter for a quiet move.
+        nb.halfMoveClock += 1;
+    }
     return nb;
 }
 

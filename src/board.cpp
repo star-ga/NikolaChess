@@ -45,6 +45,12 @@ Board initBoard() {
     b.blackCanCastleKingSide = true;
     b.blackCanCastleQueenSide = true;
     b.enPassantCol = -1;
+    // Initialise the half-move clock.  At the start of the game no
+    // moves have been made, so the counter is zero.  This field
+    // increments after non-capture, non-pawn moves and resets to
+    // zero after a pawn move, capture or promotion.  It is used
+    // to implement the fifty-move rule.
+    b.halfMoveClock = 0;
     return b;
 }
 
