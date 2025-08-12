@@ -33,9 +33,10 @@ kernel, freeing the CPU to continue the search.
   signed bytes to represent pieces; positive values are White and
   negative values Black.  The board structure is trivially copyable to
   the GPU.
-* **Pseudo‑legal move generator:** Generates pawn, knight, bishop,
-  rook, queen and king moves.  Castling, en passant and promotion are
-  not yet implemented.
+* **Legal move generator with special moves:** Generates pawn,
+  knight, bishop, rook, queen and king moves.  Castling, en passant
+  and pawn promotion to queen are supported.  Moves that leave the
+  moving side’s king in check are automatically discarded.
 * **Alpha‑beta search:** Implements a basic minimax search with
   alpha‑beta pruning on the CPU.  Depth is measured in plies.
 * **CUDA‑accelerated evaluation:** Evaluates material and simple
@@ -86,9 +87,10 @@ natural extension.
 
 ## Limitations and future work
 
-* **Legal move generation:** Castling, en passant and promotions are
-  not implemented.  Moves that leave the king in check are not
-  discarded.
+* **Move generation completeness:** Only promotions to queen are
+  supported.  Underpromotions to rook, bishop and knight could be
+  added for full compliance.  The en passant and castling rules are
+  implemented but have not been thoroughly tested in tournament play.
 * **Search depth:** The built‑in minimax search depth is modest to
   keep runtime manageable.  Implementing iterative deepening and
   transposition tables would greatly improve playing strength.

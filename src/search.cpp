@@ -19,19 +19,6 @@ namespace nikola {
 std::vector<Move> generateMoves(const Board& board);
 int evaluateBoardCPU(const Board& board);
 
-// Apply a move to a board to produce a new board state.  Captures
-// overwrite the destination square.  The side to move flag is
-// toggled.  Note that this function does not implement promotion,
-// castling or en passant.  The captured field of the move is
-// included for completeness but unused here.
-static Board applyMove(const Board& board, const Move& m) {
-    Board nb = board;
-    int8_t piece = nb.squares[m.fromRow][m.fromCol];
-    nb.squares[m.fromRow][m.fromCol] = EMPTY;
-    nb.squares[m.toRow][m.toCol] = piece;
-    nb.whiteToMove = !nb.whiteToMove;
-    return nb;
-}
 
 // Recursive minimax with alpha‑beta pruning.  Depth is counted in
 // plies (half moves).  When depth reaches zero or there are no
@@ -49,7 +36,7 @@ static int minimax(const Board& board, int depth, int alpha, int beta, bool maxi
     if (maximizing) {
         int maxEval = INT_MIN;
         for (const Move& m : moves) {
-            Board child = applyMove(board, m);
+            Board child = makeMove(board, m);
             int eval = minimax(child, depth - 1, alpha, beta, false);
             if (eval > maxEval) maxEval = eval;
             if (eval > alpha) alpha = eval;
@@ -59,7 +46,7 @@ static int minimax(const Board& board, int depth, int alpha, int beta, bool maxi
     } else {
         int minEval = INT_MAX;
         for (const Move& m : moves) {
-            Board child = applyMove(board, m);
+            Board child = makeMove(board, m);
             int eval = minimax(child, depth - 1, alpha, beta, true);
             if (eval < minEval) minEval = eval;
             if (eval < beta) beta = eval;
@@ -78,7 +65,7 @@ Move findBestMove(const Board& board, int depth) {
     int bestScore = board.whiteToMove ? INT_MIN : INT_MAX;
     auto moves = generateMoves(board);
     for (const Move& m : moves) {
-        Board child = applyMove(board, m);
+        Board child = makeMove(board, m);
         int score = minimax(child, depth - 1, INT_MIN, INT_MAX, !board.whiteToMove);
         if (board.whiteToMove) {
             if (score > bestScore) {

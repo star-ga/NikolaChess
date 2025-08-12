@@ -30,6 +30,13 @@ Board initBoard() {
         b.squares[6][c] = BP;
     }
     b.whiteToMove = true;
+
+    // At the start of the game both sides may castle on both sides.
+    b.whiteCanCastleKingSide = true;
+    b.whiteCanCastleQueenSide = true;
+    b.blackCanCastleKingSide = true;
+    b.blackCanCastleQueenSide = true;
+    b.enPassantCol = -1;
     return b;
 }
 

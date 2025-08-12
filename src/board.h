@@ -35,14 +35,17 @@ enum Piece : int8_t {
 
 // Structure representing a chess move.  The engine uses zero‑based row
 // and column indices.  The captured field stores the value of the piece
-// captured on the destination square (zero if no capture).  This
-// information is sufficient to undo moves during search.
+// captured on the destination square (zero if no capture).  The
+// promotedTo field indicates the piece code that a pawn is promoted
+// into (zero if no promotion).  This structure contains enough
+// information to undo moves during search.
 struct Move {
     int fromRow;
     int fromCol;
     int toRow;
     int toCol;
     int captured;
+    int promotedTo;
 };
 
 // Board representation.  In addition to the squares array we track
@@ -52,6 +55,17 @@ struct Move {
 struct Board {
     int8_t squares[8][8];
     bool whiteToMove;
+    // Castling rights.  true if the corresponding side can still castle on
+    // that side.  Castling rights are updated when the king or
+    // appropriate rook moves.
+    bool whiteCanCastleKingSide;
+    bool whiteCanCastleQueenSide;
+    bool blackCanCastleKingSide;
+    bool blackCanCastleQueenSide;
+    // enPassantCol stores the file (0-7) on which an en passant
+    // capture is possible following a two‑square pawn advance; -1 if
+    // none.
+    int8_t enPassantCol;
 };
 
 // Initialise a Board to the standard chess starting position.  Pawns
@@ -79,5 +93,26 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards);
 // helper is useful for verifying the correctness of the GPU evaluation
 // routine and for fallback on systems without a compatible GPU.
 int evaluateBoardCPU(const Board& board);
+
+// Return a new Board that results from applying the given move to
+// `board`.  This routine updates castling rights and en passant
+// information, handles pawn promotion and en passant capture, and
+// toggles the side to move.  It does not perform legality checks;
+// those should be done separately.
+Board makeMove(const Board& board, const Move& m);
+
+// Determine whether the square at (row, col) is attacked by the
+// specified side.  `byWhite` should be true if testing attacks by
+// White, false for attacks by Black.  This routine considers
+// pseudo‑legal moves (ignoring pins).  It is used to implement
+// legality checks for castling and to detect check conditions.
+bool isSquareAttacked(const Board& board, int row, int col, bool byWhite);
+
+// Return true if the king belonging to the specified side is in
+// check.  This routine locates the king on the board and calls
+// `isSquareAttacked` on its square.  White king is tested when
+// `white` is true, black king when false.
+bool isKingInCheck(const Board& board, bool white);
+
 
 } // namespace nikola
