@@ -35,7 +35,7 @@ namespace nikola {
 
 namespace {
 // Helper to build bitboards from Board representation.
-struct Bitboards {
+struct TBBitboards {
     uint64_t white = 0;
     uint64_t black = 0;
     uint64_t kings = 0;
@@ -46,8 +46,8 @@ struct Bitboards {
     uint64_t pawns = 0;
 };
 
-Bitboards build_bitboards(const Board& b) {
-    Bitboards bb;
+TBBitboards build_bitboards(const Board& b) {
+    TBBitboards bb;
     for (int r = 0; r < 8; ++r) {
         for (int c = 0; c < 8; ++c) {
             int8_t piece = b.squares[r][c];
@@ -109,7 +109,7 @@ unsigned ep_square(const Board& b) {
 } // namespace
 
 unsigned tbProbeWDL(const Board& b) {
-    Bitboards bb = build_bitboards(b);
+    TBBitboards bb = build_bitboards(b);
     unsigned castle = castling_mask(b);
     unsigned ep = ep_square(b);
     return ::tb_probe_wdl(bb.white, bb.black, bb.kings, bb.queens, bb.rooks,
@@ -118,7 +118,7 @@ unsigned tbProbeWDL(const Board& b) {
 }
 
 unsigned tbProbeRoot(const Board& b, unsigned* results) {
-    Bitboards bb = build_bitboards(b);
+    TBBitboards bb = build_bitboards(b);
     unsigned castle = castling_mask(b);
     unsigned ep = ep_square(b);
     return ::tb_probe_root(bb.white, bb.black, bb.kings, bb.queens, bb.rooks,

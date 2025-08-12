@@ -596,12 +596,20 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
             int nextDepth = depth - 1;
-            int extension = 0;
-            if (idx == 0 && depth >= 3) {
-                int shallow = minimax(child, depth - 2, ply + 1, alpha, beta, false, repetitions, &m);
-                if (shallow <= alpha) extension = 1;
+            if (idx == 0 && depth >= 5) {
+                auto altMoves = generateMoves(board);
+                int bestAlt = INT_MIN;
+                for (const Move& alt : altMoves) {
+                    if (alt.fromRow == m.fromRow && alt.fromCol == m.fromCol &&
+                        alt.toRow == m.toRow && alt.toCol == m.toCol && alt.promotedTo == m.promotedTo) continue;
+                    Board altChild = makeMove(board, alt);
+                    std::unordered_map<uint64_t,int> repsAlt = repetitions;
+                    int altScore = minimax(altChild, depth - 2, ply + 1, alpha, beta, false, repsAlt, &alt);
+                    if (altScore > bestAlt) bestAlt = altScore;
+                }
+                int margin = 200;
+                if (bestAlt + margin <= alpha) nextDepth++;
             }
-            nextDepth += extension;
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
@@ -648,12 +656,20 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
             int nextDepth = depth - 1;
-            int extension = 0;
-            if (idx == 0 && depth >= 3) {
-                int shallow = minimax(child, depth - 2, ply + 1, alpha, beta, true, repetitions, &m);
-                if (shallow >= beta) extension = 1;
+            if (idx == 0 && depth >= 5) {
+                auto altMoves = generateMoves(board);
+                int bestAlt = INT_MAX;
+                for (const Move& alt : altMoves) {
+                    if (alt.fromRow == m.fromRow && alt.fromCol == m.fromCol &&
+                        alt.toRow == m.toRow && alt.toCol == m.toCol && alt.promotedTo == m.promotedTo) continue;
+                    Board altChild = makeMove(board, alt);
+                    std::unordered_map<uint64_t,int> repsAlt = repetitions;
+                    int altScore = minimax(altChild, depth - 2, ply + 1, alpha, beta, true, repsAlt, &alt);
+                    if (altScore < bestAlt) bestAlt = altScore;
+                }
+                int margin = 200;
+                if (bestAlt - margin >= beta) nextDepth++;
             }
-            nextDepth += extension;
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {

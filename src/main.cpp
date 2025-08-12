@@ -18,16 +18,7 @@
 #include <exception>
 #include <cstdint>
 
-// Optional GPU stream configuration hook.
-// If your build provides a real implementation, define
-// HAVE_NIKOLA_SET_GPU_STREAMS at compile time and link the provider.
-namespace {
-#if defined(HAVE_NIKOLA_SET_GPU_STREAMS)
-void setGpuStreams(int n);            // provided elsewhere
-#else
-inline void setGpuStreams(int) {}     // no-op stub
-#endif
-}
+// GPU stream configuration is provided by the evaluation module.
 
 // Forward declaration of search entrypoint (implemented in search.cpp).
 // If you have a public header that declares this (e.g. search.h), you can
@@ -73,7 +64,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --gpu-streams must be non-negative.\n";
                 return 2;
             }
-            setGpuStreams(n);
+            nikola::setGpuStreams(n);
             // Remove the option and its value from argv/argc (compact in-place)
             for (int j = i; j + 2 <= argc; ++j) {
                 argv[j] = argv[j + 2];

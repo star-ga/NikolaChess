@@ -58,6 +58,7 @@ Board initBoard() {
     // zero after a pawn move, capture or promotion.  It is used
     // to implement the fifty-move rule.
     b.halfMoveClock = 0;
+    updateBitboards(b);
     return b;
 }
 
@@ -218,7 +219,7 @@ int evaluateBoardCPU(const Board& board) {
     initPestoTables(mgTable);
     int scoreWhite = 0;
     int scoreBlack = 0;
-    Bitboards bb = boardToBitboards(board);
+    const Bitboards &bb = board.bitboards;
     for (int p = 0; p < 6; ++p) {
         Bitboard w = bb.pieces[p];
         while (w) {
@@ -563,6 +564,7 @@ Board parseFEN(const std::string& fen) {
     }
     // Half move clock
     b.halfMoveClock = halfmove;
+    updateBitboards(b);
     return b;
 }
 
