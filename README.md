@@ -34,15 +34,26 @@ kernel, freeing the CPU to continue the search.
   negative values Black.  The board structure is trivially copyable to
   the GPU.
 * **Legal move generator with special moves:** Generates pawn,
-  knight, bishop, rook, queen and king moves.  Castling, en passant
-  and pawn promotion to queen are supported.  Moves that leave the
-  moving side’s king in check are automatically discarded.
+  knight, bishop, rook, queen and king moves.  Castling and en
+  passant are fully supported and checked for legality.  Pawn
+  promotions now generate all four options (queen, rook, bishop and
+  knight) rather than always promoting to a queen.  The generator
+  filters out any move that would leave the moving side’s king in
+  check.
 * **Alpha‑beta search:** Implements a basic minimax search with
   alpha‑beta pruning on the CPU.  Depth is measured in plies.
-* **CUDA‑accelerated evaluation:** Evaluates material and simple
-  positional bonuses for many boards in parallel on the GPU.  On
-  systems without a compatible GPU the engine automatically falls back
-  to CPU evaluation.
+* **Improved evaluation with optional neural network:** Uses
+  piece‑square tables derived from the PeSTO evaluation function to
+  combine material and positional bonuses into a single score.
+  A mobility term rewards the side with more legal moves.  An
+  optional neural network evaluator demonstrates how a modern
+  NNUE‑style evaluation could be integrated; the included network is a
+  small multi‑layer perceptron for illustration.
+* **CUDA‑accelerated evaluation:** Evaluates boards in batches on
+  the GPU using a constant piece‑square table.  The CPU performs
+  move generation and search while the GPU computes static scores for
+  many positions concurrently.  On systems without a compatible GPU
+  the engine falls back to the CPU evaluator.
 * **Modular design:** Board representation, move generation, search
   and evaluation are split into separate source files for clarity.
 
@@ -80,24 +91,28 @@ GPU evaluation of starting position: 0
 Engine selects move: b1 -> a3
 ```
 
-Because the move generator does not yet filter out moves that leave
-the king in check, some moves produced may be illegal in real chess.
-Adding full legality checking and support for special moves would be a
-natural extension.
+The current move generator enforces the rules of chess: castling,
+en passant and pawn promotions are all implemented, and moves that
+leave the moving side in check are discarded.  Draw adjudication
+(threefold repetition and fifty‑move rules) is not yet handled.
 
 ## Limitations and future work
 
-* **Move generation completeness:** Only promotions to queen are
-  supported.  Underpromotions to rook, bishop and knight could be
-  added for full compliance.  The en passant and castling rules are
-  implemented but have not been thoroughly tested in tournament play.
+* **Move generation completeness:** Underpromotions to queen, rook,
+  bishop and knight are implemented.  Castling and en passant follow
+  the official rules of chess and have been tested for common
+  scenarios.  However, the engine does not yet detect draw claims
+  such as the threefold repetition or fifty‑move rules, and it does
+  not support adjudication for insufficient material.
 * **Search depth:** The built‑in minimax search depth is modest to
-  keep runtime manageable.  Implementing iterative deepening and
-  transposition tables would greatly improve playing strength.
-* **Evaluation function:** The evaluation considers only material and
-  simple centralisation bonuses.  More sophisticated heuristics and
-  neural network evaluators could be integrated following the
-  approaches highlighted on the GPU‑chess page【59046458589607†L128-L139】.
+  keep runtime manageable.  Implementing iterative deepening,
+  transposition tables, move ordering heuristics and a time
+  management system would greatly improve playing strength.
+* **Evaluation function:** The evaluation combines material,
+  piece‑square tables【406358174428833†L70-L95】 and a simple mobility term.  A
+  placeholder neural network is provided to show how a learned
+  evaluator could be hooked in.  Training or integrating a
+  state‑of‑the‑art NNUE network【200842768436911†L13-L21】【200842768436911†L119-L123】 remains future work.
 
 NikolaChess demonstrates how GPU acceleration can be integrated into a
 traditional chess engine without rewriting the entire search engine

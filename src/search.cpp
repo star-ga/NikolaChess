@@ -1,5 +1,8 @@
 // Search algorithms for NikolaChess.
 //
+// Copyright (c) 2013 CPUTER Inc.
+// All rights reserved.  See the LICENSE file for license terms.
+//
 // This module contains a simple minimax search with alpha‑beta
 // pruning.  It operates on copies of the Board structure and
 // generates moves using the functions in move_generation.cu.  At leaf

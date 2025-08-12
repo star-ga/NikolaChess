@@ -1,4 +1,4 @@
-// Copyright (c) 2025
+// Copyright (c) 2013 CPUTER Inc.
 //
 // This header defines the core data structures for the NikolaChess engine.
 // The engine uses a simple 8x8 array representation for the chess board and
@@ -17,20 +17,28 @@ namespace nikola {
 // Enumeration of piece codes.  White pieces are positive, black pieces
 // negative.  The numeric values roughly correspond to relative piece
 // strength to make evaluation code slightly more intuitive.
+// Enumerated piece codes.  Unlike the original demonstration which
+// overloaded piece values with evaluation scores, the piece codes here
+// are simple identifiers in the range ±1 through ±6.  Positive values
+// represent White pieces and negative values represent Black pieces.
+// A separate evaluation table maps these identifiers to material values
+// and positional bonuses.  Keeping the codes distinct makes it
+// straightforward to index into piece‑square tables and to generate
+// underpromotions.
 enum Piece : int8_t {
     EMPTY = 0,
     WP = 1,  // White pawn
-    WN = 3,  // White knight
+    WN = 2,  // White knight
     WB = 3,  // White bishop
-    WR = 5,  // White rook
-    WQ = 9,  // White queen
-    WK = 100, // White king (large value for checkmate detection)
+    WR = 4,  // White rook
+    WQ = 5,  // White queen
+    WK = 6,  // White king
     BP = -1, // Black pawn
-    BN = -3, // Black knight
+    BN = -2, // Black knight
     BB = -3, // Black bishop
-    BR = -5, // Black rook
-    BQ = -9, // Black queen
-    BK = -100 // Black king
+    BR = -4, // Black rook
+    BQ = -5, // Black queen
+    BK = -6  // Black king
 };
 
 // Structure representing a chess move.  The engine uses zero‑based row

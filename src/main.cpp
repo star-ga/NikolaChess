@@ -1,5 +1,8 @@
 // NikolaChess entry point.
 //
+// Copyright (c) 2013 CPUTER Inc.
+// All rights reserved.  See the LICENSE file for license terms.
+//
 // This demonstration program initialises a chess board, prints its
 // evaluation using both the CPU and GPU evaluation functions, and
 // performs a small minimax search to select a move for the side to

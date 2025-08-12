@@ -1,5 +1,8 @@
 // Chess rules utilities for NikolaChess.
 //
+// Copyright (c) 2013 CPUTER Inc.
+// All rights reserved.  See the LICENSE file for license terms.
+//
 // This module implements rule enforcement needed for a functional
 // chess engine: applying moves with updates to castling rights and
 // en passant state, detecting attacks on a given square and

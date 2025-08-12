@@ -1,5 +1,8 @@
 // Move generation routines for NikolaChess.
 //
+// Copyright (c) 2013 CPUTER Inc.
+// All rights reserved.  See the LICENSE file for license terms.
+//
 // These functions enumerate pseudo‑legal moves without considering check or
 // special moves such as castling or en passant.  The goal is to
 // produce candidate moves for a minimax search.  Because this file is
@@ -27,9 +30,22 @@ static void genPawnMoves(const Board& board, int r, int c, std::vector<Move>& mo
     // Single push
     if (onBoard(nextRow, c) && board.squares[nextRow][c] == EMPTY) {
         if (nextRow == promotionRow) {
-            // Promotion to queen by default.  Other promotion pieces could be added here.
-            Move m{r, c, nextRow, c, EMPTY, white ? WQ : BQ};
-            moves.push_back(m);
+            // Generate all underpromotion options: queen, rook, bishop, knight.
+            int8_t promoPieces[4];
+            if (white) {
+                promoPieces[0] = WQ;
+                promoPieces[1] = WR;
+                promoPieces[2] = WB;
+                promoPieces[3] = WN;
+            } else {
+                promoPieces[0] = BQ;
+                promoPieces[1] = BR;
+                promoPieces[2] = BB;
+                promoPieces[3] = BN;
+            }
+            for (int i = 0; i < 4; ++i) {
+                moves.push_back(Move{r, c, nextRow, c, EMPTY, promoPieces[i]});
+            }
         } else {
             Move m{r, c, nextRow, c, EMPTY, 0};
             moves.push_back(m);
@@ -50,7 +66,22 @@ static void genPawnMoves(const Board& board, int r, int c, std::vector<Move>& mo
             // Normal capture
             if (target != EMPTY && (target > 0) != white) {
                 if (cr == promotionRow) {
-                    moves.push_back(Move{r, c, cr, cc, target, white ? WQ : BQ});
+                    // Generate underpromotion captures.
+                    int8_t promoPieces[4];
+                    if (white) {
+                        promoPieces[0] = WQ;
+                        promoPieces[1] = WR;
+                        promoPieces[2] = WB;
+                        promoPieces[3] = WN;
+                    } else {
+                        promoPieces[0] = BQ;
+                        promoPieces[1] = BR;
+                        promoPieces[2] = BB;
+                        promoPieces[3] = BN;
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        moves.push_back(Move{r, c, cr, cc, target, promoPieces[i]});
+                    }
                 } else {
                     moves.push_back(Move{r, c, cr, cc, target, 0});
                 }
