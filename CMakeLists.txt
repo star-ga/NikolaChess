@@ -22,6 +22,7 @@ add_executable(nikolachess
         src/gpu_eval.cpp
         src/uci.cpp
     src/micro_batcher.cpp
+    src/tablebase.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.

@@ -152,5 +152,11 @@ bool isSquareAttacked(const Board& board, int row, int col, bool byWhite);
 // `white` is true, black king when false.
 bool isKingInCheck(const Board& board, bool white);
 
+// Count the number of pieces on the board.  This is useful
+// for determining when to probe endgame tablebases.  The count
+// includes both white and black pieces and does not consider
+// side to move.
+int countPieces(const Board& board);
+
 
 } // namespace nikola

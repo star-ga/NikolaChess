@@ -23,6 +23,12 @@
 #include <cstdlib> // for getenv
 #include <vector>
 
+// Include tablebase probing functions and piece counting utility.  The
+// engine will consult endgame tablebases when the position has
+// sufficiently few pieces.  If a tablebase result is available, it
+// overrides the heuristic evaluation.
+#include "tablebase.h"
+
 // Include the micro-batcher for GPU evaluation.  The batcher
 // collects evaluation requests from multiple threads and processes
 // them in batches on the GPU.  See micro_batcher.h for details.
@@ -143,6 +149,38 @@ void setUseGpu(bool use) {
 // calls evaluateBoardsGPU.  If GPU evaluation fails or returns
 // empty, falls back to the CPU evaluator.
 static int staticEvaluate(const Board& b) {
+    // If tablebase probing is enabled and the position is small
+    // enough, query the endgame tablebase.  This takes priority
+    // over any heuristic evaluation.  A positive return value
+    // indicates a forced win for White, zero indicates a draw, and
+    // a negative value indicates a forced win for Black.  The
+    // absolute magnitude of the returned value is chosen to exceed
+    // any heuristic evaluation to ensure the search favours tablebase
+    // results.  Unknown results (return value 2) fall through to
+    // heuristic evaluation.
+    if (nikola::tablebaseAvailable()) {
+        int numPieces = nikola::countPieces(b);
+        // Lomonosov 7‑man and Syzygy 6‑man tablebases support up to
+        // seven pieces including kings.  Since we do not yet have a
+        // real probing implementation, the probeWDL function always
+        // returns unknown.  Nevertheless this logic is ready for
+        // future integration: adjust the threshold as appropriate when
+        // adding an actual tablebase engine.
+        if (numPieces <= 6) {
+            int wdl = nikola::probeWDL(b);
+            if (wdl == 1) {
+                // White can force a win.
+                return 100000;
+            } else if (wdl == -1) {
+                // Black can force a win.
+                return -100000;
+            } else if (wdl == 0) {
+                // Draw.  Use zero as the score.
+                return 0;
+            }
+            // If wdl == 2 (unknown), fall through.
+        }
+    }
     // If GPU batched evaluation is selected and a batcher exists,
     // submit the board to the batcher and wait for the result.  This
     // call may block if the batch has not yet been flushed.  Any

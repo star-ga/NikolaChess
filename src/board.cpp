@@ -677,4 +677,15 @@ Board parseFEN(const std::string& fen) {
     return b;
 }
 
+int countPieces(const Board& board) {
+    int count = 0;
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            if (board.squares[r][c] != nikola::Piece::EMPTY) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
 } // namespace nikola

@@ -21,6 +21,7 @@
 #include "uci.h"
 #include "board.h"
 #include "gpu_eval.h" // for possible future integration
+#include "tablebase.h" // for setting tablebase path
 
 #include <iostream>
 #include <sstream>
@@ -84,6 +85,11 @@ void runUciLoop() {
             // enabled the engine will batch evaluation calls to the GPU
             // instead of using the CPU.  Default is false.
             std::cout << "option name UseGPU type check default false" << std::endl;
+            // Option to specify the directory of endgame tablebases.
+            // Provide an empty value to disable probing.  A future
+            // implementation will verify that the directory contains
+            // valid Syzygy or Lomonosov files.  Default is empty.
+            std::cout << "option name TablebasePath type string default """ << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -281,6 +287,15 @@ void runUciLoop() {
                         use = (c == '1' || c == 't' || c == 'y');
                     }
                     setUseGpu(use);
+                } else if (name == "TablebasePath") {
+                    // Set the path to the directory containing endgame
+                    // tablebases.  When a non‑empty path is provided
+                    // the engine will attempt to probe positions with
+                    // few pieces against the tablebase.  The actual
+                    // probing is implemented in tablebase.cpp; this
+                    // stub will simply record that a path has been
+                    // provided.
+                    nikola::setTablebasePath(value);
                 }
                 // Other options (Hash, Threads) are currently ignored.
             }
