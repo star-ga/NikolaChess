@@ -32,6 +32,9 @@
 // Forward declaration of search function.
 namespace nikola {
 
+// Global PGN file path used when saving games.  The default can be
+// changed via the UCI option PGNFile.
+static std::string g_pgnFilePath = "game.pgn";
 // Forward declaration for runtime GPU switching.  Defined in search.cpp.
 void setUseGpu(bool use);
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
@@ -93,7 +96,12 @@ void runUciLoop() {
             // Provide an empty value to disable probing.  A future
             // implementation will verify that the directory contains
             // valid Syzygy or Lomonosov files.  Default is empty.
-            std::cout << "option name TablebasePath type string default """ << std::endl;
+            std::cout << "option name TablebasePath type string default \"\"" << std::endl;
+            // Option to set the PGN output file.  When provided via
+            // setoption name PGNFile value <path>, the engine will
+            // save completed games to the specified file.  Use the
+            // current value of g_pgnFilePath for the default.
+            std::cout << "option name PGNFile type string default \"" << g_pgnFilePath << "\"" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -301,10 +309,9 @@ void runUciLoop() {
             // Synchronous search returns immediately; nothing to stop.
             // A real implementation would signal the search thread to halt.
         } else if (cmd == "quit" || cmd == "exit") {
-            // Save the PGN to a default file before exiting.  The
-            // file name can be customised if needed; here we use
-            // "game.pgn" in the current directory.
-            savePgn("game.pgn");
+            // Save the PGN to the configured file before exiting.  The
+            // file name can be customised via the PGNFile option.
+            savePgn(g_pgnFilePath);
             break;
         } else if (cmd == "setoption") {
             // Process a UCI setoption command.  Format is:
@@ -361,6 +368,14 @@ void runUciLoop() {
                     // stub will simply record that a path has been
                     // provided.
                     nikola::setTablebasePath(value);
+                } else if (name == "PGNFile") {
+                    // Set the PGN output file.  If the provided value is
+                    // empty, retain the current file path.  This option
+                    // allows the user or GUI to specify where the game
+                    // PGN should be saved on quit.
+                    if (!value.empty()) {
+                        g_pgnFilePath = value;
+                    }
                 }
                 // Other options (Hash, Threads) are currently ignored.
             }

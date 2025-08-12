@@ -398,6 +398,60 @@ static std::unordered_map<uint64_t, TTEntry> transTable;
 // be preferable.
 static std::mutex ttMutex;
 
+// Quiescence search.  This helper evaluates only capture and
+// promotion moves to avoid the horizon effect in leaf nodes.  It
+// performs a stand‑pat evaluation and then recursively explores
+// capturing continuations while maintaining alpha‑beta bounds.  The
+// side to move is indicated by the maximizing flag: true when
+// searching for White's advantage, false for Black.  This search
+// ignores repetition and fifty‑move draw rules, as it is intended
+// only for final refinements after depth‑limited search.
+static int quiescence(const Board& board, int alpha, int beta, bool maximizing) {
+    int standPat = staticEvaluate(board);
+    if (maximizing) {
+        if (standPat >= beta) {
+            return standPat;
+        }
+        if (standPat > alpha) {
+            alpha = standPat;
+        }
+    } else {
+        if (standPat <= alpha) {
+            return standPat;
+        }
+        if (standPat < beta) {
+            beta = standPat;
+        }
+    }
+    auto moves = generateMoves(board);
+    for (const Move& m : moves) {
+        // Explore only captures and promotions in quiescence.  This
+        // reduces the branching factor and focuses on forcing
+        // sequences that materially change the evaluation.
+        if (m.captured == nikola::EMPTY && m.promotedTo == 0) {
+            continue;
+        }
+        Board child = makeMove(board, m);
+        int score = quiescence(child, alpha, beta, !maximizing);
+        if (maximizing) {
+            if (score > alpha) {
+                alpha = score;
+            }
+            if (alpha >= beta) {
+                return alpha;
+            }
+        } else {
+            if (score < beta) {
+                beta = score;
+            }
+            if (beta <= alpha) {
+                return beta;
+            }
+        }
+    }
+    return maximizing ? alpha : beta;
+}
+
 // Piece material values used for move ordering.  These mirror the
 // values used in the evaluation function: pawn = 100, knight = 320,
 // bishop = 330, rook = 500, queen = 900, king = 100000.  We use
@@ -553,13 +607,18 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     // inexpensive to evaluate and we still need to adjust the
     // repetition count.
     if (depth == 0) {
-        int val = staticEvaluate(board);
+        // When search depth is exhausted, perform a quiescence search
+        // instead of a simple static evaluation.  This captures
+        // forcing sequences of captures and promotions to reduce the
+        // horizon effect.
+        int val = quiescence(board, alpha, beta, maximizing);
         cnt--;
         return val;
     }
     auto moves = generateMoves(board);
     if (moves.empty()) {
-        int val = staticEvaluate(board);
+        // No moves available: use quiescence search for stand‑pat evaluation
+        int val = quiescence(board, alpha, beta, maximizing);
         cnt--;
         return val;
     }
