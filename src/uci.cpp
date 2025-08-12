@@ -23,6 +23,8 @@
 #include "gpu_eval.h" // for possible future integration
 #include "tablebase.h" // for setting tablebase path
 #include "pgn_logger.h" // for recording moves and saving PGN
+#include "san.h"        // for SAN conversion of moves
+#include "polyglot.h"    // for opening book support
 
 #include <iostream>
 #include <sstream>
@@ -35,6 +37,14 @@ namespace nikola {
 // Global PGN file path used when saving games.  The default can be
 // changed via the UCI option PGNFile.
 static std::string g_pgnFilePath = "game.pgn";
+
+// Global variables controlling opening book usage.  When g_useBook
+// is true and a book file has been provided via the BookFile
+// option, the engine will attempt to select a move from the
+// opening book before searching.  g_bookFilePath stores the path
+// to the Polyglot book file.  See polyglot.cpp for details.
+static bool g_useBook = false;
+static std::string g_bookFilePath;
 // Forward declaration for runtime GPU switching.  Defined in search.cpp.
 void setUseGpu(bool use);
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
@@ -81,8 +91,8 @@ void runUciLoop() {
         if (!(iss >> cmd)) continue;
         if (cmd == "uci") {
             // Report engine identification and options.
-            std::cout << "id name NikolaChess" << std::endl;
-            std::cout << "id author Unknown" << std::endl;
+            std::cout << "id name Supercomputer Chess Engine" << std::endl;
+            std::cout << "id author CPUTER Inc." << std::endl;
             // Declare minimal set of options (hash and threads).  These
             // declarations are placeholders; the current engine does
             // not honour them yet.
@@ -102,6 +112,15 @@ void runUciLoop() {
             // save completed games to the specified file.  Use the
             // current value of g_pgnFilePath for the default.
             std::cout << "option name PGNFile type string default \"" << g_pgnFilePath << "\"" << std::endl;
+            // Option to enable or disable using the opening book.
+            // When enabled the engine will attempt to select a move
+            // from the Polyglot book file specified by BookFile.
+            std::cout << "option name OwnBook type check default false" << std::endl;
+            // Option to specify a Polyglot opening book file.  Set
+            // this to the path of a .bin book file.  The engine will
+            // probe this file when OwnBook is enabled.  Default is
+            // empty (no book).
+            std::cout << "option name BookFile type string default \"\"" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -153,11 +172,11 @@ void runUciLoop() {
                             }
                             // Capture the piece currently on the destination square.
                             m.captured = board.squares[m.toRow][m.toCol];
+                            // Compute SAN before applying the move.
+                            std::string san = toSAN(board, m);
                             board = makeMove(board, m);
-                            // Record the move for PGN logging.  Use the original
-                            // move string from the UCI list (mv).  This will
-                            // preserve promotion suffixes if present.
-                            addMoveToPgn(mv);
+                            // Record the move for PGN logging using SAN.
+                            addMoveToPgn(san);
                         }
                     }
                 }
@@ -208,9 +227,11 @@ void runUciLoop() {
                                 }
                             }
                             m.captured = board.squares[m.toRow][m.toCol];
+                            // Compute SAN on the current board before applying the move.
+                            std::string san = toSAN(board, m);
                             board = makeMove(board, m);
                             // Record the move for PGN logging.
-                            addMoveToPgn(mv);
+                            addMoveToPgn(san);
                         }
                     }
                 }
@@ -273,15 +294,26 @@ void runUciLoop() {
                 // Clamp to a minimum to ensure at least a small search.
                 if (timeLimitMs < 50) timeLimitMs = 50;
             }
-            if (timeLimitMs > 0) {
-                // Use provided depth if specified; otherwise search deep and stop on time limit.
-                int searchDepth = depth > 0 ? depth : 64;
-                best = findBestMove(board, searchDepth, timeLimitMs);
-            } else if (depth > 0) {
-                best = findBestMove(board, depth, 0);
-            } else {
-                // Default search depth if no parameters given.
-                best = findBestMove(board, 4, 0);
+            // Attempt to use an opening book move if enabled and a book file is loaded.
+            bool usedBook = false;
+            if (g_useBook) {
+                auto opt = nikola::probeBook(board);
+                if (opt.has_value()) {
+                    best = opt.value();
+                    usedBook = true;
+                }
+            }
+            if (!usedBook) {
+                if (timeLimitMs > 0) {
+                    // Use provided depth if specified; otherwise search deep and stop on time limit.
+                    int searchDepth = depth > 0 ? depth : 64;
+                    best = findBestMove(board, searchDepth, timeLimitMs);
+                } else if (depth > 0) {
+                    best = findBestMove(board, depth, 0);
+                } else {
+                    // Default search depth if no parameters given.
+                    best = findBestMove(board, 4, 0);
+                }
             }
             std::string uciMove = toAlgebraic(best.fromRow, best.fromCol) + toAlgebraic(best.toRow, best.toCol);
             // Append promotion letter if needed
@@ -296,15 +328,14 @@ void runUciLoop() {
                 uciMove += promo;
             }
             std::cout << "bestmove " << uciMove << std::endl;
+            // Compute SAN for logging before applying the move.
+            std::string san = toSAN(board, best);
             // Apply the move to the current board as well; UCI engines
             // typically do not modify state on "go" alone, but it
             // simplifies testing via CLI.  Comment out if undesired.
             board = makeMove(board, best);
-            // Record the move in the PGN logger.  Use the coordinate
-            // notation returned above.  Moves from the UCI search
-            // always represent the side to move; we append them
-            // sequentially to reconstruct the game.
-            addMoveToPgn(uciMove);
+            // Record the move in the PGN logger using SAN.
+            addMoveToPgn(san);
         } else if (cmd == "stop") {
             // Synchronous search returns immediately; nothing to stop.
             // A real implementation would signal the search thread to halt.
@@ -375,6 +406,30 @@ void runUciLoop() {
                     // PGN should be saved on quit.
                     if (!value.empty()) {
                         g_pgnFilePath = value;
+                    }
+                } else if (name == "OwnBook") {
+                    // Enable or disable the opening book.  Accept
+                    // "true"/"false", "1"/"0", "yes"/"no".  When
+                    // disabling the book we do not unload the file.
+                    bool use = false;
+                    if (!value.empty()) {
+                        char c = static_cast<char>(std::tolower(static_cast<unsigned char>(value[0])));
+                        use = (c == '1' || c == 't' || c == 'y');
+                    }
+                    g_useBook = use;
+                    nikola::setUseBook(use);
+                } else if (name == "BookFile") {
+                    // Record the path to the Polyglot book file.  If
+                    // value is non‑empty, set g_bookFilePath and
+                    // attempt to load the book via polyglot.  If
+                    // value is empty, clear the book path but leave
+                    // g_useBook unchanged.
+                    if (!value.empty()) {
+                        g_bookFilePath = value;
+                        nikola::setBookFile(value);
+                    } else {
+                        g_bookFilePath.clear();
+                        nikola::setBookFile("");
                     }
                 }
                 // Other options (Hash, Threads) are currently ignored.

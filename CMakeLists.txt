@@ -24,6 +24,10 @@ add_executable(nikolachess
     src/micro_batcher.cpp
     src/tablebase.cpp
     src/pgn_logger.cpp
+    src/san.cpp
+    src/see.cpp
+    src/polyglot.cpp
+    src/distributed.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.
@@ -39,3 +43,16 @@ set_target_properties(nikolachess PROPERTIES
 target_include_directories(nikolachess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Link against standard C++ and CUDA runtime libraries implicitly.
+
+# Optional MPI support for distributed search.  Users can enable
+# NIKOLA_USE_MPI when configuring CMake to compile the distributed
+# search code.  If enabled, we locate the MPI package, define
+# NIKOLA_USE_MPI for conditional compilation and link against the
+# MPI C++ library.
+option(NIKOLA_USE_MPI "Enable MPI distributed search" OFF)
+if(NIKOLA_USE_MPI)
+    find_package(MPI REQUIRED)
+    target_compile_definitions(nikolachess PRIVATE NIKOLA_USE_MPI)
+    target_include_directories(nikolachess PRIVATE ${MPI_INCLUDE_PATH})
+    target_link_libraries(nikolachess PRIVATE MPI::MPI_CXX)
+endif()

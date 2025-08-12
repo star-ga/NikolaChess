@@ -75,12 +75,12 @@ void savePgn(const std::string& filePath) {
 #else
     localtime_r(&t, &tm);
 #endif
-    out << "[Event \"NikolaChess Game\"]\n";
+    out << "[Event \"Supercomputer Chess Engine Game\"]\n";
     out << "[Site \"Local\"]\n";
     out << "[Date \"" << std::put_time(&tm, "%Y.%m.%d") << "\"]\n";
     out << "[Round \"1\"]\n";
-    out << "[White \"Nikola\"]\n";
-    out << "[Black \"Nikola\"]\n";
+    out << "[White \"Supercomputer\"]\n";
+    out << "[Black \"Supercomputer\"]\n";
     out << "[Result \"*\"]\n\n";
     // Write moves.  Break lines every 80 characters for readability.
     std::string movesStr = formatMoves();

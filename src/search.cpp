@@ -33,6 +33,7 @@
 // collects evaluation requests from multiple threads and processes
 // them in batches on the GPU.  See micro_batcher.h for details.
 #include "micro_batcher.h"
+#include "see.h"
 
 namespace nikola {
 
@@ -581,21 +582,42 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                     // increment/decrement repetition counts
                     // independently.
                     std::unordered_map<uint64_t,int> repsNull = repetitions;
-                    int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
-                                            !maximizing, repsNull);
-                    // If the null move evaluation triggers a cutoff, prune.
+                int nullScore = minimax(nullBoard, depth - 1 - R, ply + 1, alpha, beta,
+                                        !maximizing, repsNull);
+                    // If the null move evaluation triggers a cutoff, perform a verification search
+                    // at reduced depth to reduce the risk of incorrect pruning in zugzwang.  Only
+                    // prune if both the initial null move and the verification search fail.
+                    bool prune = false;
                     if (maximizing) {
-                        // For the maximizing side, a score >= beta is a fail‑high.
                         if (nullScore >= beta) {
-                            cnt--;
-                            return nullScore;
+                            // Verification depth: reduce by one more ply
+                            int verifyDepth = depth - 1 - R - 1;
+                            if (verifyDepth < 0) verifyDepth = 0;
+                            Board verifyBoard = nullBoard;
+                            // Copy repetition map for verification search
+                            std::unordered_map<uint64_t,int> repsVerify = repetitions;
+                            int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, beta - 1, beta,
+                                                     !maximizing, repsVerify);
+                            if (verifyScore >= beta) {
+                                prune = true;
+                            }
                         }
                     } else {
-                        // For the minimizing side, a score <= alpha is a fail‑low.
                         if (nullScore <= alpha) {
-                            cnt--;
-                            return nullScore;
+                            int verifyDepth = depth - 1 - R - 1;
+                            if (verifyDepth < 0) verifyDepth = 0;
+                            Board verifyBoard = nullBoard;
+                            std::unordered_map<uint64_t,int> repsVerify = repetitions;
+                            int verifyScore = minimax(verifyBoard, verifyDepth, ply + 1, alpha,
+                                                     alpha + 1, !maximizing, repsVerify);
+                            if (verifyScore <= alpha) {
+                                prune = true;
+                            }
                         }
+                    }
+                    if (prune) {
+                        cnt--;
+                        return nullScore;
                     }
                 }
             }
@@ -704,9 +726,15 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
             int idx = std::abs(m.promotedTo) - 1;
             score += 10000 + orderingMaterial[idx];
         }
-        // Capture bonus using MVV‑LVA heuristic: prioritize captures
-        // of high valued pieces with low valued attackers.
+        // Capture bonus using static exchange evaluation (SEE).  SEE
+        // estimates the net material gain of a capture.  Positive
+        // scores indicate favourable trades.  Multiply by a large
+        // constant to prioritise favourable captures ahead of other
+        // moves.  In addition to SEE we retain a MVV‑LVA like
+        // component to distinguish among equally valued exchanges.
         if (m.captured != nikola::EMPTY) {
+            int seeScore = see(board, m);
+            score += 1000 * seeScore;
             int capturedVal = orderingPieceValue((int8_t)m.captured);
             int attackerVal = orderingPieceValue(board.squares[m.fromRow][m.fromCol]);
             score += 10 * capturedVal - attackerVal;
