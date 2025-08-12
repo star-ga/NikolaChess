@@ -1,26 +1,28 @@
 cmake_minimum_required(VERSION 3.12)
-project(NikolaChess LANGUAGES CXX CUDA)
 
-# Set C++ standard and CUDA settings.  The engine is written in modern C++
-# with separate CUDA kernels for evaluation.  Enabling separable
-# compilation instructs CMake to perform the necessary GPU linking for
-# objects compiled with nvcc.
+# Allow building without the CUDA toolkit.  When NIKOLA_USE_CUDA is
+# enabled CMake will attempt to find a CUDA compiler and the GPU
+# evaluation sources will be compiled.  Otherwise the engine builds in a
+# CPU‑only configuration which is useful for environments without CUDA
+# installed, such as continuous integration runners.
+option(NIKOLA_USE_CUDA "Build NikolaChess with CUDA support" OFF)
 
+project(NikolaChess LANGUAGES CXX)
+
+# Set C++ standard for the whole project.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add the executable target for the engine.  Source files are split
-# between C++ and CUDA.  Header only files are included automatically.
-add_executable(nikolachess
+# Core engine sources common to both CPU and GPU builds.
+set(NIKOLA_SOURCES
     src/main.cpp
     src/board.h
     src/board.cpp
-    src/move_generation.cu
-    src/evaluate.cu
+    src/move_generation.cpp
     src/search.cpp
     src/perft.cpp
-        src/gpu_eval.cpp
-        src/uci.cpp
+    src/gpu_eval.cpp
+    src/uci.cpp
     src/micro_batcher.cpp
     src/tablebase.cpp
     src/pgn_logger.cpp
@@ -28,13 +30,18 @@ add_executable(nikolachess
     src/see.cpp
     src/polyglot.cpp
     src/distributed.cpp
-)
+    src/rules.cpp)
 
-# Enable CUDA separable compilation for proper device linking.
-set_target_properties(nikolachess PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_ARCHITECTURES 70 # Target compute capability 7.0 by default
-)
+# When CUDA is requested, enable the language and add GPU evaluation
+# kernels.  The optional sources require the CUDA toolkit.
+if(NIKOLA_USE_CUDA)
+    enable_language(CUDA)
+    list(APPEND NIKOLA_SOURCES src/evaluate.cu)
+    set_source_files_properties(src/evaluate.cu PROPERTIES LANGUAGE CUDA)
+endif()
+
+# Add the executable target for the engine using the accumulated source list.
+add_executable(nikolachess ${NIKOLA_SOURCES})
 
 # Include directories so that headers in src/ can be found during
 # compilation.  Having a dedicated include directory would work as
@@ -42,7 +49,15 @@ set_target_properties(nikolachess PROPERTIES
 # this demonstration.
 target_include_directories(nikolachess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# Link against standard C++ and CUDA runtime libraries implicitly.
+# Link against standard runtime libraries implicitly.
+
+# If CUDA support is enabled, configure device linking properties for the
+# executable target after it has been created.
+if(NIKOLA_USE_CUDA)
+    set_target_properties(nikolachess PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES 70)
+endif()
 
 # Optional MPI support for distributed search.  Users can enable
 # NIKOLA_USE_MPI when configuring CMake to compile the distributed
@@ -63,5 +78,5 @@ set(SRC_HPC
   src/thread_affinity.cpp
   src/cpu_features.cpp)
 
-set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 17)
-target_sources(${PROJECT_NAME} PRIVATE ${SRC_HPC})
+set_target_properties(nikolachess PROPERTIES CXX_STANDARD 17)
+target_sources(nikolachess PRIVATE ${SRC_HPC})
