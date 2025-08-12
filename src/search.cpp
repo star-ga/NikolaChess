@@ -20,12 +20,55 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <cstdlib> // for getenv
+#include <vector>
 
 namespace nikola {
 
 // Forward declaration of move generator and evaluation functions.
 std::vector<Move> generateMoves(const Board& board);
 int evaluateBoardCPU(const Board& board);
+std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards);
+
+// Enumeration of available evaluation backends.  By default the
+// engine uses the CPU implementation (NNUE or classical).  If
+// NIKOLA_GPU environment variable is set to a non‑zero value, the
+// engine will attempt to use the GPU batched evaluation.
+enum class EvaluationBackend {
+    CPU_NNUE,
+    GPU_BATCHED
+};
+
+// Determine the evaluation backend at program start based on the
+// environment.  If NIKOLA_GPU is defined and not zero, choose
+// GPU_BATCHED; otherwise default to CPU_NNUE.
+static EvaluationBackend g_evalBackend = []() {
+    const char* env = std::getenv("NIKOLA_GPU");
+    if (env && std::atoi(env) != 0) {
+        return EvaluationBackend::GPU_BATCHED;
+    }
+    return EvaluationBackend::CPU_NNUE;
+}();
+
+// Evaluate a board position using the selected backend.  When the
+// GPU backend is selected, this function batches a single board and
+// calls evaluateBoardsGPU.  If GPU evaluation fails or returns
+// empty, falls back to the CPU evaluator.
+static int staticEvaluate(const Board& b) {
+    if (g_evalBackend == EvaluationBackend::GPU_BATCHED) {
+        try {
+            std::vector<Board> boards;
+            boards.push_back(b);
+            std::vector<int> scores = evaluateBoardsGPU(boards.data(), (int)boards.size());
+            if (!scores.empty()) {
+                return scores[0];
+            }
+        } catch (...) {
+            // Swallow exceptions and fall back to CPU path.
+        }
+    }
+    return evaluateBoardCPU(b);
+}
 
 
 // The following code extends the basic minimax implementation with
@@ -324,13 +367,13 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     // inexpensive to evaluate and we still need to adjust the
     // repetition count.
     if (depth == 0) {
-        int val = evaluateBoardCPU(board);
+        int val = staticEvaluate(board);
         cnt--;
         return val;
     }
     auto moves = generateMoves(board);
     if (moves.empty()) {
-        int val = evaluateBoardCPU(board);
+        int val = staticEvaluate(board);
         cnt--;
         return val;
     }
