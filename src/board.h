@@ -11,6 +11,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <string>
 
 namespace nikola {
 
@@ -113,6 +114,23 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards);
 // helper is useful for verifying the correctness of the GPU evaluation
 // routine and for fallback on systems without a compatible GPU.
 int evaluateBoardCPU(const Board& board);
+
+// Parse a position described in Forsyth–Edwards Notation (FEN) and
+// return the corresponding Board.  The FEN string should contain
+// piece placement, side to move, castling rights, en passant file
+// (or '-' if none), halfmove clock and fullmove number.  Only the
+// fields necessary for this engine are parsed; the fullmove number
+// is ignored.  Castling rights and the half‑move clock are stored
+// in the Board structure.  If the FEN string is malformed a
+// default starting position is returned.
+Board parseFEN(const std::string& fen);
+
+// Convert the given Board into a FEN string.  The resulting FEN
+// contains piece placement, side to move, castling rights,
+// en passant target square, the half‑move clock and a dummy
+// fullmove number of 1.  Because the Board structure does not
+// track the fullmove counter this value is fixed at 1.
+std::string boardToFEN(const Board& board);
 
 // Return a new Board that results from applying the given move to
 // `board`.  This routine updates castling rights and en passant

@@ -11,6 +11,7 @@
 #include "board.h"
 #include <iostream>
 #include <vector>
+#include <string>
 
 // Forward declaration of search function defined in search.cpp.
 namespace nikola {
@@ -49,6 +50,32 @@ int main(int argc, char* argv[]) {
             Board board = initBoard();
             uint64_t nodes = perft(board, depth);
             std::cout << "Perft(" << depth << ") = " << nodes << std::endl;
+            return 0;
+        }
+        // Parse a FEN string from the command line and print its evaluation
+        // and FEN normalised.  Usage: ./nikolachess fen "<fen>"
+        if (cmd == "fen" && argc >= 3) {
+            std::string fenArg = argv[2];
+            // If the FEN contains spaces (as it usually does), join all
+            // remaining arguments back together separated by spaces.
+            for (int i = 3; i < argc; ++i) {
+                fenArg += ' ';
+                fenArg += argv[i];
+            }
+            Board b = parseFEN(fenArg);
+            // Evaluate the parsed position on the CPU.
+            int score = evaluateBoardCPU(b);
+            std::cout << "Parsed FEN: " << fenArg << std::endl;
+            std::cout << "CPU evaluation: " << score << std::endl;
+            // Print out the normalised FEN from the Board.
+            std::string outFEN = boardToFEN(b);
+            std::cout << "Normalised FEN: " << outFEN << std::endl;
+            // Perform a quick search to suggest a move.  Use shallow depth to
+            // avoid long computation.
+            Move bm = findBestMove(b, 3, 3000);
+            std::cout << "Engine selects move: "
+                      << toAlgebraic(bm.fromRow, bm.fromCol) << " -> "
+                      << toAlgebraic(bm.toRow, bm.toCol) << std::endl;
             return 0;
         }
     }

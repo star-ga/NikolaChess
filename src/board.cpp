@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <fstream>
 #include <cstdlib>
+#include <sstream>
+#include <string>
+#include <vector>
 
 // Forward declaration of move generator.  Defined in move_generation.cu.
 namespace nikola {
@@ -493,6 +496,185 @@ int evaluateBoardCPU(const Board& board) {
         eval -= bishopPairBonus;
     }
     return eval;
+}
+
+// --- FEN utility functions ---
+
+// Convert a piece code to its corresponding FEN character.  White
+// pieces are uppercase and black pieces are lowercase.  Unknown
+// values return '?'.
+static char pieceToFenChar(int8_t p) {
+    switch (p) {
+        case WP: return 'P';
+        case WN: return 'N';
+        case WB: return 'B';
+        case WR: return 'R';
+        case WQ: return 'Q';
+        case WK: return 'K';
+        case BP: return 'p';
+        case BN: return 'n';
+        case BB: return 'b';
+        case BR: return 'r';
+        case BQ: return 'q';
+        case BK: return 'k';
+        default: return '?';
+    }
+}
+
+// Convert a Board into a FEN string.  The returned string contains
+// piece placement, side to move, castling rights, en passant file,
+// half‑move clock and a fixed full move number of 1.  Because the
+// Board structure does not store the full move number, it is set to
+// 1 by default.
+std::string boardToFEN(const Board& board) {
+    std::string fen;
+    // Piece placement: iterate ranks from 8 (board row 7) down to 1 (row 0).
+    for (int r = 7; r >= 0; --r) {
+        int empty = 0;
+        for (int c = 0; c < 8; ++c) {
+            int8_t p = board.squares[r][c];
+            if (p == EMPTY) {
+                empty++;
+            } else {
+                if (empty > 0) {
+                    fen += char('0' + empty);
+                    empty = 0;
+                }
+                fen += pieceToFenChar(p);
+            }
+        }
+        if (empty > 0) {
+            fen += char('0' + empty);
+        }
+        if (r > 0) fen += '/';
+    }
+    // Side to move
+    fen += ' ';
+    fen += (board.whiteToMove ? 'w' : 'b');
+    fen += ' ';
+    // Castling rights
+    std::string castles;
+    if (board.whiteCanCastleKingSide) castles += 'K';
+    if (board.whiteCanCastleQueenSide) castles += 'Q';
+    if (board.blackCanCastleKingSide) castles += 'k';
+    if (board.blackCanCastleQueenSide) castles += 'q';
+    if (castles.empty()) castles = "-";
+    fen += castles;
+    fen += ' ';
+    // En passant target file
+    if (board.enPassantCol >= 0 && board.enPassantCol < 8) {
+        char file = 'a' + board.enPassantCol;
+        // Determine rank: if White is to move now, then Black just
+        // performed a two‑square pawn advance and the en passant
+        // square is on rank 6; otherwise it is on rank 3.
+        char rank = (board.whiteToMove ? '6' : '3');
+        fen += file;
+        fen += rank;
+    } else {
+        fen += '-';
+    }
+    // Halfmove clock
+    fen += ' ';
+    fen += std::to_string(board.halfMoveClock);
+    // Full move number (fixed)
+    fen += " 1";
+    return fen;
+}
+
+// Parse a FEN string and return the corresponding Board.  Only the
+// fields used by the engine are parsed.  Fields that are not
+// represented in the Board structure (such as the full move number)
+// are ignored.  If parsing fails, the starting position is
+// returned.
+Board parseFEN(const std::string& fen) {
+    // Begin with an empty board and default values
+    Board b{};
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            b.squares[r][c] = EMPTY;
+        }
+    }
+    b.whiteCanCastleKingSide = false;
+    b.whiteCanCastleQueenSide = false;
+    b.blackCanCastleKingSide = false;
+    b.blackCanCastleQueenSide = false;
+    b.enPassantCol = -1;
+    b.halfMoveClock = 0;
+    // Tokenise the FEN string into its fields
+    std::istringstream iss(fen);
+    std::string placement, stm, castling, enpassant;
+    int halfmove = 0;
+    int fullmove = 1;
+    if (!(iss >> placement >> stm >> castling >> enpassant >> halfmove >> fullmove)) {
+        return initBoard();
+    }
+    // Parse piece placement
+    {
+        std::vector<std::string> ranks;
+        std::string token;
+        std::stringstream ps(placement);
+        while (std::getline(ps, token, '/')) {
+            ranks.push_back(token);
+        }
+        if (ranks.size() != 8) {
+            return initBoard();
+        }
+        for (size_t i = 0; i < 8; ++i) {
+            const std::string& rs = ranks[i];
+            int row = 7 - static_cast<int>(i);
+            int col = 0;
+            for (char ch : rs) {
+                if (col >= 8) break;
+                if (ch >= '1' && ch <= '8') {
+                    int n = ch - '0';
+                    for (int k = 0; k < n && col < 8; ++k) {
+                        b.squares[row][col++] = EMPTY;
+                    }
+                } else {
+                    int8_t piece = EMPTY;
+                    switch (ch) {
+                        case 'P': piece = WP; break;
+                        case 'N': piece = WN; break;
+                        case 'B': piece = WB; break;
+                        case 'R': piece = WR; break;
+                        case 'Q': piece = WQ; break;
+                        case 'K': piece = WK; break;
+                        case 'p': piece = BP; break;
+                        case 'n': piece = BN; break;
+                        case 'b': piece = BB; break;
+                        case 'r': piece = BR; break;
+                        case 'q': piece = BQ; break;
+                        case 'k': piece = BK; break;
+                        default: piece = EMPTY; break;
+                    }
+                    b.squares[row][col++] = piece;
+                }
+            }
+        }
+    }
+    // Side to move
+    b.whiteToMove = (stm == "w" || stm == "W");
+    // Castling rights
+    if (castling != "-") {
+        for (char ch : castling) {
+            switch (ch) {
+                case 'K': b.whiteCanCastleKingSide = true; break;
+                case 'Q': b.whiteCanCastleQueenSide = true; break;
+                case 'k': b.blackCanCastleKingSide = true; break;
+                case 'q': b.blackCanCastleQueenSide = true; break;
+            }
+        }
+    }
+    // En passant file
+    if (enpassant != "-") {
+        char file = enpassant[0];
+        if (file >= 'a' && file <= 'h') {
+            b.enPassantCol = file - 'a';
+        }
+    }
+    // Half move clock
+    b.halfMoveClock = halfmove;
+    return b;
 }
 
 } // namespace nikola
