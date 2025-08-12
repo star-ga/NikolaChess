@@ -29,6 +29,9 @@
 #include <random>
 #include <algorithm>
 #include <future>   // for std::future in staticEvaluate()
+#include <iostream>
+
+#include "pv.h"
 
 // Include tablebase probing functions and piece counting utility.  The
 // engine will consult endgame tablebases when the position has
@@ -75,6 +78,9 @@ static EvaluationBackend g_evalBackend = []() {
 // evaluation on a worker thread.  When the program exits the
 // batcher is destroyed, which signals the worker to stop.
 static MicroBatcher* g_batcher = nullptr;
+
+// UCI option: number of principal variations to display (1..8)
+int g_multiPV = 1;
 
 // Helper struct to lazily create and destroy the micro-batcher.
 // The constructor reads environment variables NIKOLA_GPU_MAX_BATCH
@@ -721,6 +727,9 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     Move chosenMove{};
     { tt_clear(); }
 
+    struct RootScore { Move move; int score; };
+    std::vector<RootScore> finalRootScores;
+
     // Reset heuristics
     for (int i = 0; i < 64; ++i) {
         for (int k = 0; k < 2; ++k) killerMoves[i][k] = Move{};
@@ -764,6 +773,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     for (int currentDepth = 1; currentDepth <= depth; ++currentDepth) {
         Move bestMoveAtDepth{};
         int bestScoreAtDepth = board.whiteToMove ? INT_MIN : INT_MAX;
+        std::vector<RootScore> rootScores;
 
         auto moves = generateMoves(board);
 
@@ -795,6 +805,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             std::atomic<int> nextIndex(0);
             std::atomic<bool> timeUp(false);
             std::mutex bestMutex;
+            std::mutex scoreMutex;
             Move bestLocalMove{};
             int bestLocalScore = board.whiteToMove ? INT_MIN : INT_MAX;
 
@@ -838,6 +849,10 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                             }
                         }
                     }
+                    if (currentDepth == depth) {
+                        std::lock_guard<std::mutex> g(scoreMutex);
+                        rootScores.push_back({m, score});
+                    }
                 }
             };
 
@@ -852,6 +867,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
 
             if (timeLimitMs > 0 && nextIndex.load() < (int)moves.size()) {
                 chosenMove = bestMoveAtDepth;
+                std::cout << "bestmove " << move_to_uci(board, chosenMove) << std::endl;
                 return chosenMove;
             }
         } else {
@@ -861,6 +877,7 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
                     if (elapsed >= timeLimitMs) {
                         chosenMove = (currentDepth == 1 ? m : chosenMove);
+                        std::cout << "bestmove " << move_to_uci(board, chosenMove) << std::endl;
                         return chosenMove;
                     }
                 }
@@ -881,6 +898,22 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                 } else {
                     if (score < bestScoreAtDepth) { bestScoreAtDepth = score; bestMoveAtDepth = m; }
                 }
+                if (currentDepth == depth) {
+                    rootScores.push_back({m, score});
+                }
+            }
+        }
+
+        if (currentDepth == depth) {
+            auto comp = board.whiteToMove ?
+                [](const RootScore& a, const RootScore& b){ return a.score > b.score; } :
+                [](const RootScore& a, const RootScore& b){ return a.score < b.score; };
+            std::sort(rootScores.begin(), rootScores.end(), comp);
+            if ((int)rootScores.size() > g_multiPV) rootScores.resize(g_multiPV);
+            finalRootScores = rootScores;
+            if (!rootScores.empty()) {
+                bestMoveAtDepth = rootScores[0].move;
+                bestScoreAtDepth = rootScores[0].score;
             }
         }
 
@@ -893,6 +926,25 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
             if (elapsed >= timeLimitMs) break;
         }
     }
+
+    if (!finalRootScores.empty()) {
+        for (size_t i = 0; i < finalRootScores.size(); ++i) {
+            const auto& rs = finalRootScores[i];
+            std::cout << "info multipv " << (i+1) << ' ';
+            if (std::abs(rs.score) > 29000) {
+                int mate_in = (30000 - std::abs(rs.score) + 1) / 2;
+                if (rs.score < 0) mate_in = -mate_in;
+                std::cout << "score mate " << mate_in << ' ';
+            } else {
+                std::cout << "score cp " << rs.score << ' ';
+            }
+            std::cout << "pv " << move_to_uci(board, rs.move) << std::endl;
+        }
+        std::cout << "bestmove " << move_to_uci(board, finalRootScores[0].move) << std::endl;
+        return finalRootScores[0].move;
+    }
+
+    std::cout << "bestmove " << move_to_uci(board, chosenMove) << std::endl;
     return chosenMove;
 }
 

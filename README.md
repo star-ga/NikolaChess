@@ -147,10 +147,17 @@ target compute capability via the `CUDA_ARCHITECTURES` property in
 
 ## Running
 
-Running the engine without arguments will initialise the standard
-starting position, print its evaluation using both CPU and GPU
-evaluators, and search to a depth of two plies (one move for each
-side) before printing the chosen move:
+The `nikolachess` executable accepts a few runtime options:
+
+* `--gpu-streams <N>` – configure how many CUDA streams the GPU evaluator
+  should use.
+* `--distributed` – launch the experimental MPI/NCCL distributed search
+  prototype.
+
+Running the engine without arguments will initialise the standard starting
+position, print its evaluation using both CPU and GPU evaluators, and search
+to a depth of two plies (one move for each side) before printing the chosen
+move:
 
 ```sh
 ./nikolachess
