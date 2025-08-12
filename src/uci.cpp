@@ -196,25 +196,69 @@ void runUciLoop() {
                 }
             }
         } else if (cmd == "go") {
-            // Parse parameters
+            // Parse parameters for the go command.  Recognised parameters:
+            //   depth <n>      – search to fixed depth n.
+            //   movetime <ms>  – search for exactly ms milliseconds.
+            //   wtime <ms>     – white's remaining time in milliseconds.
+            //   btime <ms>     – black's remaining time in milliseconds.
+            //   winc <ms>      – white's increment per move in ms.
+            //   binc <ms>      – black's increment per move in ms.
+            //   movestogo <n>  – number of moves left until the next time control.
+            //   infinite       – search indefinitely (treated as very deep).
+            // If movetime is specified it takes precedence.  Otherwise
+            // if wtime/btime are specified a simple time allocation
+            // strategy is used to derive a per‑move time limit.  If
+            // none of these parameters are provided a default depth of
+            // 4 is searched with no time limit.
             int depth = 0;
             int movetime = 0;
+            int wtime = 0, btime = 0;
+            int winc = 0, binc = 0;
+            int movestogo = 0;
             std::string param;
             while (iss >> param) {
                 if (param == "depth") {
                     iss >> depth;
                 } else if (param == "movetime") {
                     iss >> movetime;
+                } else if (param == "wtime") {
+                    iss >> wtime;
+                } else if (param == "btime") {
+                    iss >> btime;
+                } else if (param == "winc") {
+                    iss >> winc;
+                } else if (param == "binc") {
+                    iss >> binc;
+                } else if (param == "movestogo") {
+                    iss >> movestogo;
                 } else if (param == "infinite") {
                     // We'll treat 'infinite' as a very high depth.
                     depth = 64;
                 }
             }
             Move best;
-            if (depth > 0) {
+            int timeLimitMs = 0;
+            if (movetime > 0) {
+                timeLimitMs = movetime;
+            } else if (wtime > 0 || btime > 0) {
+                // Allocate time based on side to move, remaining time and increment.
+                bool whiteToMove = board.whiteToMove;
+                int remaining = whiteToMove ? wtime : btime;
+                int increment = whiteToMove ? winc : binc;
+                // If movestogo is zero, assume 30 moves left.  Otherwise use the provided number.
+                int movesLeft = movestogo > 0 ? movestogo : 30;
+                if (movesLeft <= 0) movesLeft = 30;
+                // Simple allocation: spend roughly remaining/movesLeft plus half of increment.
+                timeLimitMs = (remaining / movesLeft) + (increment / 2);
+                // Clamp to a minimum to ensure at least a small search.
+                if (timeLimitMs < 50) timeLimitMs = 50;
+            }
+            if (timeLimitMs > 0) {
+                // Use provided depth if specified; otherwise search deep and stop on time limit.
+                int searchDepth = depth > 0 ? depth : 64;
+                best = findBestMove(board, searchDepth, timeLimitMs);
+            } else if (depth > 0) {
                 best = findBestMove(board, depth, 0);
-            } else if (movetime > 0) {
-                best = findBestMove(board, 64, movetime);
             } else {
                 // Default search depth if no parameters given.
                 best = findBestMove(board, 4, 0);
