@@ -47,12 +47,27 @@ set(NIKOLA_LIB_SOURCES
   src/multipv_search.cpp
   src/uci_extensions.cpp
 )
+
 # GPU-specific sources or CPU fallbacks
 if(NIKOLA_HAS_CUDA)
-  list(APPEND NIKOLA_LIB_SOURCES src/evaluate.cu)
+  # Prefer cuda_eval.cu if present, otherwise fall back to evaluate.cu.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_eval.cu")
+    list(APPEND NIKOLA_LIB_SOURCES src/cuda_eval.cu)
+    set_source_files_properties(src/cuda_eval.cu PROPERTIES LANGUAGE CUDA)
+  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/evaluate.cu")
+    list(APPEND NIKOLA_LIB_SOURCES src/evaluate.cu)
+    set_source_files_properties(src/evaluate.cu PROPERTIES LANGUAGE CUDA)
+  endif()
+
+  # If there are additional CUDA translation units, set their language here.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/move_generation.cu")
+    list(APPEND NIKOLA_LIB_SOURCES src/move_generation.cu)
+    set_source_files_properties(src/move_generation.cu PROPERTIES LANGUAGE CUDA)
+  endif()
 else()
   list(APPEND NIKOLA_LIB_SOURCES src/evaluate_stub.cpp)
 endif()
+
 # Library and executable
 add_library(nikola_core ${NIKOLA_LIB_SOURCES})
 add_executable(nikolachess src/main.cpp)
@@ -61,13 +76,20 @@ target_link_libraries(nikolachess nikola_core)
 # Include path for headers under src/
 target_include_directories(nikola_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(nikolachess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # CUDA target properties (only if actually using CUDA)
 if(NIKOLA_HAS_CUDA)
   set_target_properties(nikola_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES 70
   )
+  # Link the CUDA runtime if available
+  if(TARGET CUDA::cudart)
+    target_link_libraries(nikola_core PRIVATE CUDA::cudart)
+  endif()
+  target_compile_definitions(nikola_core PRIVATE NIKOLA_HAS_CUDA)
 endif()
+
 # Optional MPI support for distributed search
 option(NIKOLA_USE_MPI "Enable MPI distributed search" OFF)
 if(NIKOLA_USE_MPI)
@@ -77,6 +99,21 @@ if(NIKOLA_USE_MPI)
   target_link_libraries(nikola_core PRIVATE MPI::MPI_CXX)
   target_link_libraries(nikolachess PRIVATE MPI::MPI_CXX)
 endif()
+
+# Optional NCCL support for multi-GPU communication
+option(NIKOLA_USE_NCCL "Enable NCCL multi-GPU communication" OFF)
+if(NIKOLA_USE_NCCL)
+  find_path(NCCL_INCLUDE_DIR nccl.h)
+  find_library(NCCL_LIBRARY nccl)
+  if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    target_compile_definitions(nikola_core PRIVATE NIKOLA_USE_NCCL)
+    target_include_directories(nikola_core PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(nikola_core PRIVATE ${NCCL_LIBRARY})
+  else()
+    message(WARNING "NIKOLA_USE_NCCL=ON but NCCL not found – continuing without NCCL")
+  endif()
+endif()
+
 # HPC / TT / affinity bits
 set(SRC_HPC
   src/tt_entry.h
@@ -85,17 +122,38 @@ set(SRC_HPC
   src/cpu_features.cpp
 )
 target_sources(nikola_core PRIVATE ${SRC_HPC})
-# Ensure property is set on the target (redundant but explicit)
+
+# Ensure property is set on the targets (explicit)
 set_target_properties(nikola_core PROPERTIES CXX_STANDARD 17)
 set_target_properties(nikolachess PROPERTIES CXX_STANDARD 17)
 
-# GoogleTest unit tests
-include(FetchContent)
-FetchContent_Declare(googletest URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip)
-FetchContent_MakeAvailable(googletest)
+# -------------------- Tests --------------------
 enable_testing()
-file(GLOB TEST_SOURCES tests/*_test.cpp)
-add_executable(nikola_tests ${TEST_SOURCES})
-target_link_libraries(nikola_tests nikola_core GTest::gtest_main)
-include(GoogleTest)
-gtest_discover_tests(nikola_tests)
+
+# GoogleTest unit tests (tests/*_test.cpp)
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+)
+# Make gtest available only if there are matching sources to build.
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*_test.cpp)
+if(TEST_SOURCES)
+  FetchContent_MakeAvailable(googletest)
+  add_executable(nikola_tests ${TEST_SOURCES})
+  target_link_libraries(nikola_tests nikola_core GTest::gtest_main)
+  target_include_directories(nikola_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  include(GoogleTest)
+  gtest_discover_tests(nikola_tests)
+endif()
+
+# Optional tablebase probe tests (standalone)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tbprobe_tests.cpp")
+  add_executable(tbprobe_tests
+    tests/tbprobe_tests.cpp
+    tests/fathom_stub.cpp
+    src/tbprobe.cpp
+  )
+  target_include_directories(tbprobe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME tbprobe_tests COMMAND tbprobe_tests)
+endif()
