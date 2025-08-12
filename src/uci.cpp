@@ -25,6 +25,7 @@
 #include "pgn_logger.h" // for recording moves and saving PGN
 #include "san.h"        // for SAN conversion of moves
 #include "polyglot.h"    // for opening book support
+#include "uci_extensions.h"   // v20
 
 #include <iostream>
 #include <sstream>
@@ -86,44 +87,23 @@ void runUciLoop() {
         std::string trimmed = line;
         // Remove CR if present (Windows line endings).
         if (!trimmed.empty() && trimmed.back() == '\r') trimmed.pop_back();
+
+        // Tokenise the entire command for convenience.
+        std::vector<std::string> tokens;
+        {
+            std::istringstream tss(trimmed);
+            std::string tok;
+            while (tss >> tok) tokens.push_back(tok);
+        }
+        if (tokens.empty()) continue;
+
         std::istringstream iss(trimmed);
         std::string cmd;
         if (!(iss >> cmd)) continue;
         if (cmd == "uci") {
-            // Report engine identification and options.
-            std::cout << "id name Supercomputer Chess Engine" << std::endl;
-            std::cout << "id author CPUTER Inc." << std::endl;
-            // Declare minimal set of options (hash and threads).  These
-            // declarations are placeholders; the current engine does
-            // not honour them yet.
-            std::cout << "option name Hash type spin default 16 min 1 max 1024" << std::endl;
-            std::cout << "option name Threads type spin default 1 min 1 max 32" << std::endl;
-            // Option to enable or disable GPU batched evaluation.  When
-            // enabled the engine will batch evaluation calls to the GPU
-            // instead of using the CPU.  Default is false.
-            std::cout << "option name UseGPU type check default false" << std::endl;
-            // Option to specify the directory of endgame tablebases.
-            // Provide an empty value to disable probing.  A future
-            // implementation will verify that the directory contains
-            // valid Syzygy or Lomonosov files.  Default is empty.
-            std::cout << "option name TablebasePath type string default \"\"" << std::endl;
-            // Option to set the PGN output file.  When provided via
-            // setoption name PGNFile value <path>, the engine will
-            // save completed games to the specified file.  Use the
-            // current value of g_pgnFilePath for the default.
-            std::cout << "option name PGNFile type string default \"" << g_pgnFilePath << "\"" << std::endl;
-            // Option to enable or disable using the opening book.
-            // When enabled the engine will attempt to select a move
-            // from the Polyglot book file specified by BookFile.
-            std::cout << "option name OwnBook type check default false" << std::endl;
-            // Option to specify a Polyglot opening book file.  Set
-            // this to the path of a .bin book file.  The engine will
-            // probe this file when OwnBook is enabled.  Default is
-            // empty (no book).
-            std::cout << "option name BookFile type string default \"\"" << std::endl;
-            std::cout << "uciok" << std::endl;
+            nikola::uci_print_id_and_options();
         } else if (cmd == "isready") {
-            std::cout << "readyok" << std::endl;
+            nikola::uci_isready();
         } else if (cmd == "ucinewgame") {
             // Reset to starting position and clear any game state.
             board = initBoard();
@@ -237,105 +217,7 @@ void runUciLoop() {
                 }
             }
         } else if (cmd == "go") {
-            // Parse parameters for the go command.  Recognised parameters:
-            //   depth <n>      – search to fixed depth n.
-            //   movetime <ms>  – search for exactly ms milliseconds.
-            //   wtime <ms>     – white's remaining time in milliseconds.
-            //   btime <ms>     – black's remaining time in milliseconds.
-            //   winc <ms>      – white's increment per move in ms.
-            //   binc <ms>      – black's increment per move in ms.
-            //   movestogo <n>  – number of moves left until the next time control.
-            //   infinite       – search indefinitely (treated as very deep).
-            // If movetime is specified it takes precedence.  Otherwise
-            // if wtime/btime are specified a simple time allocation
-            // strategy is used to derive a per‑move time limit.  If
-            // none of these parameters are provided a default depth of
-            // 4 is searched with no time limit.
-            int depth = 0;
-            int movetime = 0;
-            int wtime = 0, btime = 0;
-            int winc = 0, binc = 0;
-            int movestogo = 0;
-            std::string param;
-            while (iss >> param) {
-                if (param == "depth") {
-                    iss >> depth;
-                } else if (param == "movetime") {
-                    iss >> movetime;
-                } else if (param == "wtime") {
-                    iss >> wtime;
-                } else if (param == "btime") {
-                    iss >> btime;
-                } else if (param == "winc") {
-                    iss >> winc;
-                } else if (param == "binc") {
-                    iss >> binc;
-                } else if (param == "movestogo") {
-                    iss >> movestogo;
-                } else if (param == "infinite") {
-                    // We'll treat 'infinite' as a very high depth.
-                    depth = 64;
-                }
-            }
-            Move best;
-            int timeLimitMs = 0;
-            if (movetime > 0) {
-                timeLimitMs = movetime;
-            } else if (wtime > 0 || btime > 0) {
-                // Allocate time based on side to move, remaining time and increment.
-                bool whiteToMove = board.whiteToMove;
-                int remaining = whiteToMove ? wtime : btime;
-                int increment = whiteToMove ? winc : binc;
-                // If movestogo is zero, assume 30 moves left.  Otherwise use the provided number.
-                int movesLeft = movestogo > 0 ? movestogo : 30;
-                if (movesLeft <= 0) movesLeft = 30;
-                // Simple allocation: spend roughly remaining/movesLeft plus half of increment.
-                timeLimitMs = (remaining / movesLeft) + (increment / 2);
-                // Clamp to a minimum to ensure at least a small search.
-                if (timeLimitMs < 50) timeLimitMs = 50;
-            }
-            // Attempt to use an opening book move if enabled and a book file is loaded.
-            bool usedBook = false;
-            if (g_useBook) {
-                auto opt = nikola::probeBook(board);
-                if (opt.has_value()) {
-                    best = opt.value();
-                    usedBook = true;
-                }
-            }
-            if (!usedBook) {
-                if (timeLimitMs > 0) {
-                    // Use provided depth if specified; otherwise search deep and stop on time limit.
-                    int searchDepth = depth > 0 ? depth : 64;
-                    best = findBestMove(board, searchDepth, timeLimitMs);
-                } else if (depth > 0) {
-                    best = findBestMove(board, depth, 0);
-                } else {
-                    // Default search depth if no parameters given.
-                    best = findBestMove(board, 4, 0);
-                }
-            }
-            std::string uciMove = toAlgebraic(best.fromRow, best.fromCol) + toAlgebraic(best.toRow, best.toCol);
-            // Append promotion letter if needed
-            if (best.promotedTo != 0) {
-                char promo = 'q';
-                switch (best.promotedTo) {
-                    case WQ: case BQ: promo = 'q'; break;
-                    case WR: case BR: promo = 'r'; break;
-                    case WB: case BB: promo = 'b'; break;
-                    case WN: case BN: promo = 'n'; break;
-                }
-                uciMove += promo;
-            }
-            std::cout << "bestmove " << uciMove << std::endl;
-            // Compute SAN for logging before applying the move.
-            std::string san = toSAN(board, best);
-            // Apply the move to the current board as well; UCI engines
-            // typically do not modify state on "go" alone, but it
-            // simplifies testing via CLI.  Comment out if undesired.
-            board = makeMove(board, best);
-            // Record the move in the PGN logger using SAN.
-            addMoveToPgn(san);
+            nikola::uci_go(board, tokens);
         } else if (cmd == "stop") {
             // Synchronous search returns immediately; nothing to stop.
             // A real implementation would signal the search thread to halt.
@@ -345,8 +227,8 @@ void runUciLoop() {
             savePgn(g_pgnFilePath);
             break;
         } else if (cmd == "setoption") {
-            // Process a UCI setoption command.  Format is:
-            // setoption name <id> [value <x>]
+            nikola::uci_setoption(tokens);
+            // Process a UCI setoption command for existing engine options.
             std::string token;
             std::string name;
             std::string value;

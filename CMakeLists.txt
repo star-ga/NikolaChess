@@ -28,6 +28,12 @@ add_executable(nikolachess
     src/see.cpp
     src/polyglot.cpp
     src/distributed.cpp
+    # v20 additions
+    src/engine_options.cpp
+    src/time_manager.cpp
+    src/pv.cpp
+    src/multipv_search.cpp
+    src/uci_extensions.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.
