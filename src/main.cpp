@@ -18,15 +18,16 @@
 #include <exception>
 #include <cstdint>
 
-// Optional GPU stream configuration hook.  The engine exposes
+// Optional GPU stream configuration hook. The engine exposes
 // `nikola::setGpuStreams` from the evaluation module (either the real CUDA
-// implementation or a stub in CPU-only builds).  We simply forward to that
+// implementation or a stub in CPU-only builds). We simply forward to that
 // function without providing a local stub to avoid namespace ambiguity.
 
 // Forward declaration of search entrypoint (implemented in search.cpp).
-// If you have a public header that declares this (e.g. search.h), you can
-// include it instead of this forward declaration.
+// If you have a public header that declares these (e.g., search.h / eval headers),
+// include it instead of these forward declarations.
 namespace nikola {
+void setGpuStreams(int n);
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
 }
 
@@ -67,7 +68,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --gpu-streams must be non-negative.\n";
                 return 2;
             }
-            ::setGpuStreams(n);
+            nikola::setGpuStreams(n);
             // Remove the option and its value from argv/argc (compact in-place)
             for (int j = i; j + 2 <= argc; ++j) {
                 argv[j] = argv[j + 2];
@@ -147,7 +148,7 @@ int main(int argc, char* argv[]) {
     int cpuScore = evaluateBoardCPU(board);
     std::cout << "CPU evaluation of starting position: " << cpuScore << std::endl;
 
-    // Evaluate using GPU.  We wrap the single board in an array of length one.
+    // Evaluate using GPU. We wrap the single board in an array of length one.
     std::vector<Board> boards = {board};
     try {
         std::vector<int> gpuScores =
