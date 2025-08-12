@@ -14,6 +14,16 @@ static inline std::string lower(std::string s){
     return s;
 }
 
+static std::string joinTokens(std::vector<std::string>::const_iterator begin,
+                              std::vector<std::string>::const_iterator end) {
+    std::string out;
+    for (auto it = begin; it != end; ++it) {
+        if (!out.empty()) out += " ";
+        out += *it;
+    }
+    return out;
+}
+
 void set_option_from_tokens(const std::vector<std::string>& t) {
     // Expect sequence: setoption name <NAME> [value <VAL>]
     auto itn = std::find(t.begin(), t.end(), "name");
@@ -22,10 +32,10 @@ void set_option_from_tokens(const std::vector<std::string>& t) {
     std::string value;
     auto itv = std::find(t.begin(), t.end(), "value");
     if (itv != t.end()) {
-        name = lower(std::string(itn+1, itv));
-        value = std::string(itv+1, t.end());
+        name = lower(joinTokens(itn + 1, itv));
+        value = joinTokens(itv + 1, t.end());
     } else {
-        name = lower(std::string(itn+1, t.end()));
+        name = lower(joinTokens(itn + 1, t.end()));
         value = "true"; // toggles
     }
 

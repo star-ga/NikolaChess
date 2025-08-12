@@ -25,6 +25,10 @@
 #include <atomic>
 #include <cstdlib> // for getenv
 #include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <cstdint>
+#include <random>
 
 // Include tablebase probing functions and piece counting utility.  The
 // engine will consult endgame tablebases when the position has
@@ -217,10 +221,6 @@ static int staticEvaluate(const Board& b) {
 // (draw).  The half‑move clock stored in the Board tracks the
 // number of half moves since the last capture or pawn move; if this
 // reaches 100, the fifty‑move rule applies and the game is drawn.
-
-#include <unordered_map>
-#include <cstdint>
-#include <random>
 
 namespace {
 
@@ -698,15 +698,10 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     // to improve move ordering.  This move should be searched first.
     Move pvMove{};
     bool hasPV = false;
-    // Retrieve the principal variation move from the transposition table.
-    {
-        std::lock_guard<std::mutex> lock(ttMutex);
-        auto itPV = transTable.find(h);
-        if (itPV != transTable.end()) {
-            pvMove = itPV->second.bestMove;
-        }
+    TTEntry pvEntry{};
+    if (tt_lookup(h, pvEntry)) {
+        pvMove = pvEntry.bestMove;
     }
-    // Only consider PV if it has a non‑zero from square (valid move).
     if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 && pvMove.toRow == 0 && pvMove.toCol == 0)) {
         hasPV = true;
     }
@@ -922,6 +917,8 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     return bestVal;
 }
 
+} // end anonymous namespace
+
 // Choose the best move for the current player using minimax search to a
 // given depth.  Returns the move that yields the highest (for White)
 // or lowest (for Black) evaluation.  If there are no legal moves,
@@ -1010,12 +1007,9 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         uint64_t rootHash = computeZobrist(board);
         Move pv{};
         bool pvExists = false;
-        {
-            std::lock_guard<std::mutex> lock(ttMutex);
-            auto itPV = transTable.find(rootHash);
-            if (itPV != transTable.end()) {
-                pv = itPV->second.bestMove;
-            }
+        TTEntry rootEntry{};
+        if (tt_lookup(rootHash, rootEntry)) {
+            pv = rootEntry.bestMove;
         }
         if (!(pv.fromRow == 0 && pv.fromCol == 0 && pv.toRow == 0 && pv.toCol == 0)) {
             pvExists = true;
