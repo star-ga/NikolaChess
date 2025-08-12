@@ -129,24 +129,60 @@ time management.  A search depth and time limit can be specified to
 control runtime.  Evaluation includes pawn structure and bishop pair
 heuristics in addition to material and piece‑square tables.
 
+### Perft testing
+
+For validating the correctness of the move generator you can run
+a **perft** test.  This counts the number of leaf nodes reachable
+from the starting position (or any position) at a given depth.  For
+example, the number of positions at depth 1 is 20, at depth 2 is
+400, and at depth 3 is 8,902.  To run a perft test, invoke the
+engine with the `perft` subcommand followed by the depth:
+
+```sh
+./nikolachess perft 4
+Perft(4) = 197742
+```
+
+This can be compared against published perft results on the Chess
+Programming Wiki to verify that all move generation cases are
+handled correctly.
+
 ## Tuning and future directions
 
 NikolaChess implements the full rules of chess, comprehensive draw
 detection, iterative deepening with time management, transposition
-tables, sophisticated evaluation heuristics and GPU acceleration.  As
-a result there are **no missing features** needed for a functional
-chess engine.  Nevertheless, there is ample room for improvement in
-playing strength and performance.  Possible avenues include:
+tables, sophisticated evaluation heuristics and GPU acceleration.
+With the current release there are **no missing features** needed for
+practical play: the engine generates all legal moves (including
+under‑promotions), detects draws by repetition and the fifty‑move
+rule, adjudicates insufficient‑material endgames and employs
+iterative deepening with a transposition table.  Move ordering uses
+principal variation, MVV‑LVA, killer moves and a history heuristic,
+and aspiration windows centre the search window around the previous
+best score to accelerate convergence.  Time management derives
+per‑move budgets from remaining and increment times via
+environment variables, enabling the engine to adapt search length
+to different clock settings without external changes.  A neural
+network evaluator stub illustrates how a modern NNUE network can be
+used, and the engine will automatically load trained weights from
+`NNUE_WEIGHTS_FILE` when the `NIKOLA_USE_NNUE` environment variable is
+set.  These capabilities mean NikolaChess is feature complete.
 
-* **Enhanced time management:** Adapting the time allocation based on
-  remaining time in a game or in a tournament setting, with
-  techniques such as aspiration windows and dynamic depth adjustment.
-* **Advanced move ordering:** Incorporating killer move and history
-  heuristics to further improve alpha‑beta pruning efficiency.
-* **Neural network evaluation:** Training or importing a full NNUE
-  network as used in modern engines (e.g. Stockfish) would
-  significantly enhance evaluation accuracy.【200842768436911†L13-L21】【200842768436911†L119-L123】  The
-  included NNUE stub is provided as a template for such integration.
+Future improvements may still enhance playing strength.  Examples
+include:
+
+* **Sophisticated time management:** Fine‑tune the time allocation
+  strategy based on game phase or tournament formats (e.g. using
+  incremental time buffers, scaling depth dynamically or employing
+  aspiration windows more aggressively).
+* **Learning‑based move ordering:** Incorporate additional heuristics
+  such as counter‑move history and statistical move frequency to
+  refine ordering beyond killer moves and MVV‑LVA.
+* **Production NNUE networks:** Integrate fully trained networks
+  comparable to those used in state‑of‑the‑art engines like
+  Stockfish.  Users can experiment with network files by setting
+  `NIKOLA_USE_NNUE=1` and placing a compatible binary in
+  `NNUE_WEIGHTS_FILE`【200842768436911†L13-L21】【200842768436911†L119-L123】.
 
 NikolaChess demonstrates how GPU acceleration can be integrated into a
 traditional chess engine without rewriting the entire search engine

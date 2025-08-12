@@ -1,10 +1,12 @@
 // Implementation of basic board manipulation functions for NikolaChess.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for details.
 #include "board.h"
 
 #include <algorithm>
+#include <fstream>
+#include <cstdlib>
 
 // Forward declaration of move generator.  Defined in move_generation.cu.
 namespace nikola {
@@ -199,33 +201,68 @@ static int nnEvaluateBoard(const Board& board) {
     // Define dimensions.
     const int inputSize = 12 * 64;
     const int hiddenSize = 32;
-    // Static weight matrices.  These are pseudo‑random constants to
-    // illustrate the mechanism.  In practice they should be learned
-    // from data.  We initialise them on first use.
+    // Static weight matrices.  These are initialised on first use.
+    // The network has a single hidden layer of size `hiddenSize` and
+    // uses 768 binary input features (12 piece types × 64 squares).
+    // To support loading a fully‑trained NNUE network, the code will
+    // attempt to read weights from a binary file.  The file format
+    // consists of the following data in little‑endian order:
+    //   - w1 (hiddenSize × inputSize floats)
+    //   - b1 (hiddenSize floats)
+    //   - w2 (hiddenSize floats)
+    //   - b2 (single float)
+    // If the file cannot be read or does not match the expected
+    // length, we fall back to deterministic pseudo‑random weights as
+    // before.  Users can specify the weight file via the
+    // `NNUE_WEIGHTS_FILE` environment variable.  If unset, a file
+    // named `nnue_weights.bin` in the current working directory is
+    // attempted.
     static bool weightsInit = false;
-    static float w1[32][inputSize];
-    static float b1[32];
-    static float w2[32];
+    static float w1[hiddenSize][inputSize];
+    static float b1[hiddenSize];
+    static float w2[hiddenSize];
     static float b2;
     if (!weightsInit) {
-        // Initialise weights with small deterministic values based on
-        // simple pseudo‑random sequence.  Using a linear congruential
-        // generator ensures reproducibility across runs.
-        unsigned int seed = 42;
-        auto randf = [&seed]() {
-            seed = seed * 1664525u + 1013904223u;
-            return (seed & 0xFFFF) / 65535.0f - 0.5f;
-        };
-        for (int i = 0; i < hiddenSize; ++i) {
-            b1[i] = randf() * 0.1f;
-            for (int j = 0; j < inputSize; ++j) {
-                w1[i][j] = randf() * 0.01f;
+        bool loaded = false;
+        // Determine the weights file path from the environment or default.
+        const char* envPath = std::getenv("NNUE_WEIGHTS_FILE");
+        std::string path = envPath ? std::string(envPath) : std::string("nnue_weights.bin");
+        std::ifstream in(path, std::ios::binary);
+        if (in) {
+            // Compute expected size in bytes.
+            size_t expected = sizeof(w1) + sizeof(b1) + sizeof(w2) + sizeof(b2);
+            // Read file into a buffer.
+            in.seekg(0, std::ios::end);
+            size_t fileSize = (size_t)in.tellg();
+            in.seekg(0, std::ios::beg);
+            if (fileSize == expected) {
+                in.read(reinterpret_cast<char*>(w1), sizeof(w1));
+                in.read(reinterpret_cast<char*>(b1), sizeof(b1));
+                in.read(reinterpret_cast<char*>(w2), sizeof(w2));
+                in.read(reinterpret_cast<char*>(&b2), sizeof(b2));
+                if (in) {
+                    loaded = true;
+                }
             }
         }
-        for (int i = 0; i < hiddenSize; ++i) {
-            w2[i] = randf() * 0.01f;
+        if (!loaded) {
+            // Fall back to deterministic pseudo‑random weights.
+            unsigned int seed = 42;
+            auto randf = [&seed]() {
+                seed = seed * 1664525u + 1013904223u;
+                return (seed & 0xFFFF) / 65535.0f - 0.5f;
+            };
+            for (int i = 0; i < hiddenSize; ++i) {
+                b1[i] = randf() * 0.1f;
+                for (int j = 0; j < inputSize; ++j) {
+                    w1[i][j] = randf() * 0.01f;
+                }
+            }
+            for (int i = 0; i < hiddenSize; ++i) {
+                w2[i] = randf() * 0.01f;
+            }
+            b2 = randf() * 0.1f;
         }
-        b2 = randf() * 0.1f;
         weightsInit = true;
     }
     // Construct input vector.  We encode each square with a one‑hot
@@ -267,10 +304,19 @@ static int nnEvaluateBoard(const Board& board) {
 
 int evaluateBoardCPU(const Board& board) {
     // Switch between traditional heuristic evaluation and neural network
-    // evaluation.  A real engine might toggle this via a command‑line
-    // option or configuration flag.  Here we expose a compile‑time
-    // constant for simplicity.
-    constexpr bool useNeuralNet = false;
+    // evaluation.  Users can enable NNUE evaluation by setting the
+    // environment variable `NIKOLA_USE_NNUE` to "1".  When enabled,
+    // the network weights are loaded from the file specified by
+    // `NNUE_WEIGHTS_FILE` or `nnue_weights.bin` by default.  If the
+    // file cannot be loaded, deterministic pseudo‑random weights are
+    // used as a fallback.  Note that neural network evaluation is
+    // computationally more expensive than heuristic evaluation but can
+    // provide improved accuracy when trained weights are supplied.
+    bool useNeuralNet = false;
+    const char* envNN = std::getenv("NIKOLA_USE_NNUE");
+    if (envNN && envNN[0] == '1') {
+        useNeuralNet = true;
+    }
     if (useNeuralNet) {
         return nnEvaluateBoard(board);
     }

@@ -1,6 +1,6 @@
 // Move generation routines for NikolaChess.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
 // These functions enumerate pseudo‑legal moves without considering check or

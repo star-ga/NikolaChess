@@ -1,6 +1,6 @@
 // NikolaChess entry point.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
 // This demonstration program initialises a chess board, prints its
@@ -33,9 +33,28 @@ static std::string toAlgebraic(int row, int col) {
     return s;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     using namespace nikola;
-    // Initialise starting position.
+    // Command‑line interface.  If the first argument is "perft",
+    // compute and print the perft value at the specified depth.
+    // Example: `./nikolachess perft 4` will output the number of leaf
+    // nodes reachable from the starting position in four plies.
+    if (argc >= 2) {
+        std::string cmd = argv[1];
+        if (cmd == "perft") {
+            int depth = 1;
+            if (argc >= 3) {
+                depth = std::stoi(argv[2]);
+            }
+            Board board = initBoard();
+            uint64_t nodes = perft(board, depth);
+            std::cout << "Perft(" << depth << ") = " << nodes << std::endl;
+            return 0;
+        }
+    }
+    // Otherwise run the default demonstration: initialise the starting
+    // position, evaluate it using both CPU and GPU evaluators, and
+    // search for a move using iterative deepening.
     Board board = initBoard();
     // Evaluate using CPU.
     int cpuScore = evaluateBoardCPU(board);
@@ -49,9 +68,6 @@ int main() {
     } catch (std::exception& ex) {
         std::cerr << "GPU evaluation failed: " << ex.what() << std::endl;
     }
-    // Search for a move.  Depth 2 (one move for each side) keeps the
-    // runtime reasonable.  Depth can be increased on powerful GPUs and
-    // CPUs, but branching grows exponentially.
     // Search up to depth 3 or stop after 3000 milliseconds.  A deeper
     // search and longer time limit can be chosen on powerful systems.
     Move best = findBestMove(board, 3, 3000);

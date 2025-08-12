@@ -1,6 +1,6 @@
 // Search algorithms for NikolaChess.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
 // This module contains a simple minimax search with alpha‑beta
@@ -16,6 +16,10 @@
 
 #include <climits>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
 namespace nikola {
 
@@ -211,6 +215,14 @@ static const int TT_LOWERBOUND = 1;
 static const int TT_UPPERBOUND = 2;
 static std::unordered_map<uint64_t, TTEntry> transTable;
 
+// Mutex to protect access to the transposition table across
+// multiple threads.  The transposition table is shared among all
+// search threads so that work from one thread benefits others.  A
+// coarse‑grained lock is used for simplicity.  For high
+// performance engines, a finer‑grained or lock‑free table would
+// be preferable.
+static std::mutex ttMutex;
+
 // Piece material values used for move ordering.  These mirror the
 // values used in the evaluation function: pawn = 100, knight = 320,
 // bishop = 330, rook = 500, queen = 900, king = 100000.  We use
@@ -222,14 +234,20 @@ static const int orderingMaterial[6] = {100, 320, 330, 500, 900, 100000};
 // of the move ordering at the corresponding depth.  The indices
 // correspond to the ply from the root (0 at root).  We support
 // depths up to 64 plies.
-static Move killerMoves[64][2];
+// Use thread_local storage for killer moves so that each thread
+// maintains its own history without data races.  Each thread
+// initialises its killer move table independently.  Depth up to 64 plies.
+thread_local static Move killerMoves[64][2];
 
 // History heuristic: a table accumulating a score for each move
 // (from square × to square).  Moves that frequently cause beta
 // cutoffs at deeper depths receive higher scores and are tried
 // earlier.  The table index is [fromSquare][toSquare] where
 // fromSquare = fromRow * 8 + fromCol and toSquare = toRow * 8 + toCol.
-static int historyTable[64][64];
+// History heuristic table is also thread‑local.  Each thread
+// accumulates its own history scores for move ordering.  The
+// index [from][to] corresponds to moves from a square to a square.
+thread_local static int historyTable[64][64];
 
 // Helper to obtain the material value of a piece code.  Input must
 // be non‑zero.  The absolute piece code minus one indexes into the
@@ -272,20 +290,33 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     // return an exact evaluation.  Note: transposition table entries
     // do not account for repetition counts or 50‑move rule, so draw
     // detection happens before TT lookup.
-    auto ttIt = transTable.find(h);
-    if (ttIt != transTable.end() && ttIt->second.depth >= depth) {
-        const TTEntry& entry = ttIt->second;
-        if (entry.flag == TT_EXACT) {
+    // Lookup in the transposition table.  We copy the entry out of the table
+    // while holding the mutex so that other threads can still access the
+    // table concurrently.  After copying we release the lock and use
+    // the local copy.  This avoids holding the lock during the rest
+    // of the search.
+    TTEntry ttEntry;
+    bool ttFound = false;
+    {
+        std::lock_guard<std::mutex> lock(ttMutex);
+        auto it = transTable.find(h);
+        if (it != transTable.end()) {
+            ttEntry = it->second;
+            ttFound = true;
+        }
+    }
+    if (ttFound && ttEntry.depth >= depth) {
+        if (ttEntry.flag == TT_EXACT) {
             cnt--;
-            return entry.score;
-        } else if (entry.flag == TT_LOWERBOUND) {
-            if (entry.score > alpha) alpha = entry.score;
-        } else if (entry.flag == TT_UPPERBOUND) {
-            if (entry.score < beta) beta = entry.score;
+            return ttEntry.score;
+        } else if (ttEntry.flag == TT_LOWERBOUND) {
+            if (ttEntry.score > alpha) alpha = ttEntry.score;
+        } else if (ttEntry.flag == TT_UPPERBOUND) {
+            if (ttEntry.score < beta) beta = ttEntry.score;
         }
         if (alpha >= beta) {
             cnt--;
-            return entry.score;
+            return ttEntry.score;
         }
     }
     // If depth is zero or no moves, perform static evaluation.  We do
@@ -307,12 +338,17 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     // to improve move ordering.  This move should be searched first.
     Move pvMove{};
     bool hasPV = false;
-    if (ttIt != transTable.end()) {
-        pvMove = ttIt->second.bestMove;
-        // Only consider PV if it has a non‑zero from square (valid move).
-        if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 && pvMove.toRow == 0 && pvMove.toCol == 0)) {
-            hasPV = true;
+    // Retrieve the principal variation move from the transposition table.
+    {
+        std::lock_guard<std::mutex> lock(ttMutex);
+        auto itPV = transTable.find(h);
+        if (itPV != transTable.end()) {
+            pvMove = itPV->second.bestMove;
         }
+    }
+    // Only consider PV if it has a non‑zero from square (valid move).
+    if (!(pvMove.fromRow == 0 && pvMove.fromCol == 0 && pvMove.toRow == 0 && pvMove.toCol == 0)) {
+        hasPV = true;
     }
     // Assign ordering scores to moves.  Moves that capture a high
     // valued piece or promote are ordered first.  The principal
@@ -443,9 +479,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         flag = TT_EXACT;
     }
     TTEntry newEntry{depth, bestVal, flag, bestChildMove};
-    auto existing = transTable.find(h);
-    if (existing == transTable.end() || existing->second.depth < depth) {
-        transTable[h] = newEntry;
+    {
+        std::lock_guard<std::mutex> lock(ttMutex);
+        auto existing = transTable.find(h);
+        if (existing == transTable.end() || existing->second.depth < depth) {
+            transTable[h] = newEntry;
+        }
     }
     // Restore repetition count when backtracking.
     cnt--;
@@ -462,7 +501,11 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     // previous searches.  We retain the table across iterative
     // deepening depths to allow re‑use of work from shallower
     // searches but clear it on each new top‑level search.
-    transTable.clear();
+    {
+        // Clear the transposition table under lock to avoid races
+        std::lock_guard<std::mutex> lock(ttMutex);
+        transTable.clear();
+    }
     // Reset killer moves and history heuristic tables at the start of
     // a new search.  This ensures that ordering heuristics reflect
     // only information gathered during the current search.
@@ -477,10 +520,43 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
     // If no moves are available, return an empty move immediately.
     auto initialMoves = generateMoves(board);
     if (initialMoves.empty()) return chosenMove;
+    // If no explicit time limit is provided (zero or negative), derive
+    // a reasonable per‑move allocation from environment variables.  A
+    // typical strategy is to spend a small fraction of the remaining
+    // time plus half of the increment on the current move.  The
+    // environment variables `NIKOLA_REMAINING_MS` and
+    // `NIKOLA_INCREMENT_MS` can be set by the host program or GUI to
+    // provide the remaining time (in milliseconds) and per‑move
+    // increment.  If neither is set, a default of 3000 ms is used.
+    if (timeLimitMs <= 0) {
+        int defaultMs = 3000;
+        const char* envRem = std::getenv("NIKOLA_REMAINING_MS");
+        const char* envInc = std::getenv("NIKOLA_INCREMENT_MS");
+        int remaining = envRem ? std::atoi(envRem) : 0;
+        int increment = envInc ? std::atoi(envInc) : 0;
+        if (remaining > 0) {
+            // Allocate roughly one‑thirtieth of the remaining time and
+            // half of the increment.  Clamp to a minimum of 50 ms.
+            int alloc = remaining / 30 + increment / 2;
+            if (alloc < 50) alloc = 50;
+            timeLimitMs = alloc;
+        } else {
+            timeLimitMs = defaultMs;
+        }
+    }
     // Track the start time when a time limit is provided.  We use
     // steady_clock to avoid issues with system clock adjustments.
     using clock = std::chrono::steady_clock;
     auto start = clock::now();
+
+    // Determine the number of search threads from the environment.  If
+    // NIKOLA_THREADS is set to a value greater than one, the root
+    // moves will be searched in parallel using that many threads.
+    int numThreads = 1;
+    if (const char* envThr = std::getenv("NIKOLA_THREADS")) {
+        int t = std::atoi(envThr);
+        if (t > 1) numThreads = t;
+    }
     // Iterative deepening: search incrementally deeper and keep track
     // of the best move at each depth.  The principal variation
     // information stored in the transposition table will guide move
@@ -503,14 +579,17 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
         auto moves = generateMoves(board);
         // Try to move the PV move (if any) to the front of the list.
         uint64_t rootHash = computeZobrist(board);
-        auto itPV = transTable.find(rootHash);
         Move pv{};
         bool pvExists = false;
-        if (itPV != transTable.end()) {
-            pv = itPV->second.bestMove;
-            if (!(pv.fromRow == 0 && pv.fromCol == 0 && pv.toRow == 0 && pv.toCol == 0)) {
-                pvExists = true;
+        {
+            std::lock_guard<std::mutex> lock(ttMutex);
+            auto itPV = transTable.find(rootHash);
+            if (itPV != transTable.end()) {
+                pv = itPV->second.bestMove;
             }
+        }
+        if (!(pv.fromRow == 0 && pv.fromCol == 0 && pv.toRow == 0 && pv.toCol == 0)) {
+            pvExists = true;
         }
         if (pvExists) {
             // Find pv in moves and move it to the front.
@@ -525,48 +604,141 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
                 }
             }
         }
-        // Evaluate each move at the current depth.
-        for (const Move& m : moves) {
-            // Time check: if a time limit is set and exceeded, break
-            // out of the search.  We perform the check at the
-            // beginning of each iteration to ensure a responsive
-            // cutoff.
-            if (timeLimitMs > 0) {
-                auto now = clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-                if (elapsed >= timeLimitMs) {
-                    // Return the best move found so far at this depth.
-                    chosenMove = (currentDepth == 1 ? m : chosenMove);
-                    return chosenMove;
+        // Evaluate each move at the current depth.  If multiple
+        // threads are requested, distribute the root moves across
+        // threads and search them in parallel.  Otherwise perform
+        // sequential search with an aspiration window centred on
+        // prevBestScore.  The parallel path uses full alpha‑beta
+        // bounds for simplicity.
+        if (numThreads > 1 && moves.size() > 1) {
+            // Shared index into the moves vector.  Each thread will
+            // atomically fetch and increment this index to claim the
+            // next move to evaluate.
+            std::atomic<int> nextIndex(0);
+            // Flag to indicate the time limit has been reached.  When
+            // set, threads will exit early.
+            std::atomic<bool> timeUp(false);
+            // Protect updates to the best move and score found so far.
+            std::mutex bestMutex;
+            Move bestLocalMove{};
+            int bestLocalScore = board.whiteToMove ? INT_MIN : INT_MAX;
+            // Lambda for worker threads.
+            auto worker = [&]() {
+                // Each thread resets its own killer and history tables
+                // before starting the search to avoid interference from
+                // previous searches.  The thread_local variables ensure
+                // isolation across threads.
+                for (int i = 0; i < 64; ++i) {
+                    for (int k = 0; k < 2; ++k) {
+                        killerMoves[i][k] = Move{};
+                    }
+                    for (int j = 0; j < 64; ++j) {
+                        historyTable[i][j] = 0;
+                    }
                 }
-            }
-            Board child = makeMove(board, m);
-            // Initialise repetition table for this root move.  Start with
-            // the current position counted once.  The child board will
-            // update its own count when entering minimax.
-            std::unordered_map<uint64_t,int> reps;
-            reps[rootHash] = 1;
-            // Use aspiration window centred on the previous best score
-            int alpha = prevBestScore - aspirationWindow;
-            int beta = prevBestScore + aspirationWindow;
-            int score = minimax(child, currentDepth - 1, 1, alpha, beta,
-                                !board.whiteToMove, reps);
-            // If the evaluation falls outside the window, research with
-            // the full bounds.  This handles fail high or fail low
-            // conditions and ensures correctness.
-            if (score <= alpha || score >= beta) {
-                score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
-                                 !board.whiteToMove, reps);
-            }
-            if (board.whiteToMove) {
-                if (score > bestScoreAtDepth) {
-                    bestScoreAtDepth = score;
-                    bestMoveAtDepth = m;
+                
+                while (true) {
+                    // Check global time limit.  If expired, signal other
+                    // threads to stop and exit.
+                    if (timeLimitMs > 0) {
+                        auto now = clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                        if (elapsed >= timeLimitMs) {
+                            timeUp.store(true);
+                            break;
+                        }
+                    }
+                    // Fetch the next move index.
+                    int idx = nextIndex.fetch_add(1);
+                    if (idx >= (int)moves.size() || timeUp.load()) {
+                        break;
+                    }
+                    const Move& m = moves[idx];
+                    Board child = makeMove(board, m);
+                    std::unordered_map<uint64_t,int> reps;
+                    reps[rootHash] = 1;
+                    // Search the child position at depth‑1 using full
+                    // alpha‑beta bounds.  We do not use aspiration
+                    // windows here to avoid coordination overhead.
+                    int score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
+                                        !board.whiteToMove, reps);
+                    // Update the best move/score found so far.  Use
+                    // locks to protect shared state.
+                    {
+                        std::lock_guard<std::mutex> guard(bestMutex);
+                        if (board.whiteToMove) {
+                            if (score > bestLocalScore) {
+                                bestLocalScore = score;
+                                bestLocalMove = m;
+                            }
+                        } else {
+                            if (score < bestLocalScore) {
+                                bestLocalScore = score;
+                                bestLocalMove = m;
+                            }
+                        }
+                    }
                 }
-            } else {
-                if (score < bestScoreAtDepth) {
-                    bestScoreAtDepth = score;
-                    bestMoveAtDepth = m;
+            };
+            // Launch threads.  We spawn numThreads threads to
+            // evaluate the root moves.  The current thread also
+            // participates in evaluation by running the worker.
+            std::vector<std::thread> threads;
+            threads.reserve(numThreads - 1);
+            for (int t = 1; t < numThreads; ++t) {
+                threads.emplace_back(worker);
+            }
+            // Run worker in the current thread.
+            worker();
+            // Join all spawned threads.
+            for (auto& th : threads) {
+                if (th.joinable()) th.join();
+            }
+            // Use the best move/score found by any thread.
+            bestMoveAtDepth = bestLocalMove;
+            bestScoreAtDepth = bestLocalScore;
+            // If the time limit expired during evaluation, stop
+            // searching further depths.
+            if (timeLimitMs > 0 && nextIndex.load() < (int)moves.size()) {
+                // Return the best move found so far.
+                chosenMove = bestMoveAtDepth;
+                return chosenMove;
+            }
+        } else {
+            // Sequential evaluation with an aspiration window centred
+            // on the previous best score.  The window helps guide
+            // alpha‑beta pruning at deeper depths.
+            for (const Move& m : moves) {
+                if (timeLimitMs > 0) {
+                    auto now = clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                    if (elapsed >= timeLimitMs) {
+                        // Return the best move found so far at this depth.
+                        chosenMove = (currentDepth == 1 ? m : chosenMove);
+                        return chosenMove;
+                    }
+                }
+                Board child = makeMove(board, m);
+                std::unordered_map<uint64_t,int> reps;
+                reps[rootHash] = 1;
+                int alpha = prevBestScore - aspirationWindow;
+                int beta = prevBestScore + aspirationWindow;
+                int score = minimax(child, currentDepth - 1, 1, alpha, beta,
+                                    !board.whiteToMove, reps);
+                if (score <= alpha || score >= beta) {
+                    score = minimax(child, currentDepth - 1, 1, INT_MIN, INT_MAX,
+                                    !board.whiteToMove, reps);
+                }
+                if (board.whiteToMove) {
+                    if (score > bestScoreAtDepth) {
+                        bestScoreAtDepth = score;
+                        bestMoveAtDepth = m;
+                    }
+                } else {
+                    if (score < bestScoreAtDepth) {
+                        bestScoreAtDepth = score;
+                        bestMoveAtDepth = m;
+                    }
                 }
             }
         }

@@ -1,6 +1,6 @@
 // Chess rules utilities for NikolaChess.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
 // This module implements rule enforcement needed for a functional

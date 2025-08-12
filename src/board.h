@@ -1,4 +1,4 @@
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 //
 // This header defines the core data structures for the NikolaChess engine.
 // The engine uses a simple 8x8 array representation for the chess board and
@@ -95,6 +95,11 @@ Board initBoard();
 // candidate moves for a minimax search.  The implementation lives in
 // move_generation.cu.
 std::vector<Move> generateMoves(const Board& board);
+
+// Compute the perft (performance test) count for the given board.
+// Returns the number of leaf nodes reachable from the current position
+// at the specified depth.  This function is defined in perft.cpp.
+uint64_t perft(const Board& board, int depth);
 
 // Evaluate a batch of boards on the GPU.  The boards array should
 // contain nBoards consecutive Board objects.  The function returns a

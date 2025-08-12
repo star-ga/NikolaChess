@@ -1,6 +1,6 @@
 // GPU evaluation functions for NikolaChess.
 //
-// Copyright (c) 2013 CPUTER Inc.
+// Copyright (c) 2025 CPUTER Inc.
 // All rights reserved.  See the LICENSE file for license terms.
 //
 // The purpose of this module is to offload the static evaluation of

@@ -17,6 +17,7 @@ add_executable(nikolachess
     src/move_generation.cu
     src/evaluate.cu
     src/search.cpp
+    src/perft.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.
