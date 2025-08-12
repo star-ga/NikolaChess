@@ -136,7 +136,8 @@ FetchContent_Declare(
   googletest
   URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
 )
-# Make gtest available only if there are matching sources to build.
+
+# Build gtest-driven unit tests only if sources exist.
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*_test.cpp)
 if(TEST_SOURCES)
   FetchContent_MakeAvailable(googletest)
@@ -156,4 +157,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tbprobe_tests.cpp")
   )
   target_include_directories(tbprobe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME tbprobe_tests COMMAND tbprobe_tests)
+endif()
+
+# Optional Syzygy path option test (standalone)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/syzygy_path_option_test.cpp")
+  add_executable(syzygy_path_option_test
+    tests/syzygy_path_option_test.cpp
+    src/engine_options.cpp
+    src/tablebase.cpp
+  )
+  target_include_directories(syzygy_path_option_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME syzygy_path_option_test COMMAND syzygy_path_option_test)
 endif()
