@@ -6,8 +6,6 @@
 // existing CPU evaluator.
 
 #include "gpu_eval.h"
-#include "board.h"
-
 #include <future>
 #include <vector>
 
@@ -35,18 +33,6 @@ std::future<float> GpuEval::submit(const float* /*features*/, size_t /*len*/) {
 void GpuEval::flush() {
     // Nothing to flush in stub.  A real implementation would
     // trigger any pending batches to be processed.
-}
-
-// CPU fallback implementation for batched board evaluation.  The GPU kernels
-// are not available in this environment so we simply call the existing CPU
-// evaluator for each board.
-std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
-    std::vector<int> scores;
-    scores.reserve(nBoards);
-    for (int i = 0; i < nBoards; ++i) {
-        scores.push_back(evaluateBoardCPU(boards[i]));
-    }
-    return scores;
 }
 
 } // namespace nikola

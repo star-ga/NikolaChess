@@ -106,9 +106,14 @@ uint64_t perft(const Board& board, int depth);
 // contain nBoards consecutive Board objects.  The function returns a
 // vector of integer scores, one per board, where positive values
 // favour White and negative values favour Black.  The actual kernel
-// implementation resides in evaluate.cu.  Note that evaluation uses
+// implementation resides in cuda_eval.cu.  Note that evaluation uses
 // simple material and positional heuristics for demonstration purposes.
 std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards);
+
+// Configure the number of CUDA streams used by evaluateBoardsGPU for
+// overlapping data transfers with kernel execution.  Values less than one are
+// clamped to one.
+void setGpuStreams(int streams);
 
 // Compute a static evaluation of a single board on the CPU.  This
 // helper is useful for verifying the correctness of the GPU evaluation

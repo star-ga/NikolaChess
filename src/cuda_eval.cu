@@ -17,8 +17,20 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
+#include <algorithm>
 
 namespace nikola {
+
+// Number of CUDA streams to use for overlapping copy and compute.  Default is
+// one stream which mimics the previous synchronous behaviour.  The value is
+// configurable at runtime via setGpuStreams and the --gpu-streams command line
+// option.
+static int g_gpu_streams = 1;
+
+void setGpuStreams(int n) {
+    g_gpu_streams = (n > 0) ? n : 1;
+}
 
 // Host copies of mg piece tables and material values.  These mirror
 // the definitions in board.cpp and are used to initialise the
@@ -157,27 +169,41 @@ __global__ void evalKernel(const Board* boards, int* outScores, int n) {
 // kernel with enough threads, and copies back the results.
 std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
     if (nBoards <= 0) return {};
-    Board* dBoards = nullptr;
-    int* dScores = nullptr;
+    cudaError_t err;
     size_t boardsBytes = sizeof(Board) * nBoards;
     size_t scoresBytes = sizeof(int) * nBoards;
-    cudaError_t err;
+
+    // Allocate pinned host buffers to enable asynchronous copies.
+    Board* hBoardsPinned = nullptr;
+    int* hScoresPinned = nullptr;
+    err = cudaMallocHost((void**)&hBoardsPinned, boardsBytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error("cudaMallocHost for boards failed");
+    }
+    err = cudaMallocHost((void**)&hScoresPinned, scoresBytes);
+    if (err != cudaSuccess) {
+        cudaFreeHost(hBoardsPinned);
+        throw std::runtime_error("cudaMallocHost for scores failed");
+    }
+    std::memcpy(hBoardsPinned, boards, boardsBytes);
+
+    // Allocate device memory.
+    Board* dBoards = nullptr;
+    int* dScores = nullptr;
     err = cudaMalloc((void**)&dBoards, boardsBytes);
     if (err != cudaSuccess) {
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMalloc for boards failed");
     }
     err = cudaMalloc((void**)&dScores, scoresBytes);
     if (err != cudaSuccess) {
         cudaFree(dBoards);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMalloc for scores failed");
     }
-    // Copy boards to device
-    err = cudaMemcpy(dBoards, boards, boardsBytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        cudaFree(dBoards);
-        cudaFree(dScores);
-        throw std::runtime_error("cudaMemcpy to device failed");
-    }
+
     // Initialise material and piece‑square tables on the device.  We
     // compute the 12×64 mg table on the host and copy it into constant
     // memory.  The mapping is: colour 0 (White) and 1 (Black) combined
@@ -207,12 +233,16 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for material values failed");
     }
     err = cudaMemcpyToSymbol(dMgTable, hostMgTable, sizeof(int) * 12 * 64);
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for mg table failed");
     }
 
@@ -226,46 +256,89 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for passedBonusByRank failed");
     }
     err = cudaMemcpyToSymbol(dDoubledPenalty, &doubledPenaltyHost, sizeof(int));
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for doubledPenalty failed");
     }
     err = cudaMemcpyToSymbol(dIsolatedPenalty, &isolatedPenaltyHost, sizeof(int));
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for isolatedPenalty failed");
     }
     err = cudaMemcpyToSymbol(dBishopPairBonus, &bishopPairBonusHost, sizeof(int));
     if (err != cudaSuccess) {
         cudaFree(dBoards);
         cudaFree(dScores);
+        cudaFreeHost(hBoardsPinned);
+        cudaFreeHost(hScoresPinned);
         throw std::runtime_error("cudaMemcpyToSymbol for bishopPairBonus failed");
     }
-    // Launch kernel with one thread per board.
-    int blockSize = 128;
-    int numBlocks = (nBoards + blockSize - 1) / blockSize;
-    evalKernel<<<numBlocks, blockSize>>>(dBoards, dScores, nBoards);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        cudaFree(dBoards);
-        cudaFree(dScores);
-        throw std::runtime_error("Kernel launch failed");
+
+    // Create CUDA streams and launch asynchronous copies and kernels.
+    int streamCount = std::min(std::max(1, g_gpu_streams), nBoards);
+    std::vector<cudaStream_t> streams(streamCount);
+    for (int i = 0; i < streamCount; ++i) {
+        err = cudaStreamCreate(&streams[i]);
+        if (err != cudaSuccess) {
+            for (int j = 0; j < i; ++j) cudaStreamDestroy(streams[j]);
+            cudaFree(dBoards);
+            cudaFree(dScores);
+            cudaFreeHost(hBoardsPinned);
+            cudaFreeHost(hScoresPinned);
+            throw std::runtime_error("cudaStreamCreate failed");
+        }
     }
-    // Copy results back to host.
+
+    int boardsPerStream = (nBoards + streamCount - 1) / streamCount;
+    for (int s = 0; s < streamCount; ++s) {
+        int offset = s * boardsPerStream;
+        int count = std::min(boardsPerStream, nBoards - offset);
+        if (count <= 0) break;
+        size_t bBytes = sizeof(Board) * count;
+        size_t sBytes = sizeof(int) * count;
+        err = cudaMemcpyAsync(dBoards + offset, hBoardsPinned + offset, bBytes,
+                              cudaMemcpyHostToDevice, streams[s]);
+        if (err != cudaSuccess) break;
+        int blockSize = 128;
+        int numBlocks = (count + blockSize - 1) / blockSize;
+        evalKernel<<<numBlocks, blockSize, 0, streams[s]>>>(dBoards + offset,
+                                                            dScores + offset,
+                                                            count);
+        err = cudaMemcpyAsync(hScoresPinned + offset, dScores + offset, sBytes,
+                              cudaMemcpyDeviceToHost, streams[s]);
+        if (err != cudaSuccess) break;
+    }
+
+    for (int s = 0; s < streamCount; ++s) {
+        cudaError_t syncErr = cudaStreamSynchronize(streams[s]);
+        cudaStreamDestroy(streams[s]);
+        if (syncErr != cudaSuccess) {
+            cudaFree(dBoards);
+            cudaFree(dScores);
+            cudaFreeHost(hBoardsPinned);
+            cudaFreeHost(hScoresPinned);
+            throw std::runtime_error("CUDA stream execution failed");
+        }
+    }
+
     std::vector<int> scores(nBoards);
-    err = cudaMemcpy(scores.data(), dScores, scoresBytes, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        cudaFree(dBoards);
-        cudaFree(dScores);
-        throw std::runtime_error("cudaMemcpy from device failed");
-    }
+    std::memcpy(scores.data(), hScoresPinned, scoresBytes);
+
     cudaFree(dBoards);
     cudaFree(dScores);
+    cudaFreeHost(hBoardsPinned);
+    cudaFreeHost(hScoresPinned);
     return scores;
 }
 
