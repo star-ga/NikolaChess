@@ -640,10 +640,38 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
     int betaOrig = beta;
     if (maximizing) {
         bestVal = INT_MIN;
-        for (const auto& pair : scored) {
-            const Move& m = pair.second;
+        // Iterate with index to apply late move reductions (LMR).
+        for (size_t idx = 0; idx < scored.size(); ++idx) {
+            const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
-            int eval = minimax(child, depth - 1, ply + 1, alpha, beta, false, repetitions);
+            int nextDepth = depth - 1;
+            int eval;
+            // Apply late move reductions on quiet moves.  If this is
+            // not one of the first few moves and the move is
+            // neither a capture nor a promotion, search at reduced
+            // depth.  If the reduced search fails to improve alpha
+            // we accept the reduced result; otherwise we re‑search
+            // at full depth.  The reduction value increases with
+            // depth and position in the move list.
+            bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
+            if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
+                int reduction = 1;
+                if (depth > 6 && idx >= 6) {
+                    // Apply a larger reduction deeper in the tree
+                    reduction = 2;
+                }
+                int reducedDepth = nextDepth - reduction;
+                if (reducedDepth < 0) reducedDepth = 0;
+                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, false, repetitions);
+                eval = evalReduced;
+                // If the reduced search suggests the move is good, re‑search
+                // at full depth to confirm.
+                if (evalReduced > alpha) {
+                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions);
+                }
+            } else {
+                eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions);
+            }
             if (eval > bestVal) {
                 bestVal = eval;
                 bestChildMove = m;
@@ -668,10 +696,27 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
         }
     } else {
         bestVal = INT_MAX;
-        for (const auto& pair : scored) {
-            const Move& m = pair.second;
+        for (size_t idx = 0; idx < scored.size(); ++idx) {
+            const Move& m = scored[idx].second;
             Board child = makeMove(board, m);
-            int eval = minimax(child, depth - 1, ply + 1, alpha, beta, true, repetitions);
+            int nextDepth = depth - 1;
+            int eval;
+            bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
+            if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
+                int reduction = 1;
+                if (depth > 6 && idx >= 6) {
+                    reduction = 2;
+                }
+                int reducedDepth = nextDepth - reduction;
+                if (reducedDepth < 0) reducedDepth = 0;
+                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, true, repetitions);
+                eval = evalReduced;
+                if (evalReduced < beta) {
+                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions);
+                }
+            } else {
+                eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions);
+            }
             if (eval < bestVal) {
                 bestVal = eval;
                 bestChildMove = m;

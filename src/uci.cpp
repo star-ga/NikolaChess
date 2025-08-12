@@ -22,6 +22,7 @@
 #include "board.h"
 #include "gpu_eval.h" // for possible future integration
 #include "tablebase.h" // for setting tablebase path
+#include "pgn_logger.h" // for recording moves and saving PGN
 
 #include <iostream>
 #include <sstream>
@@ -63,6 +64,9 @@ static std::pair<int,int> parseCoordinate(const std::string& coord) {
 
 void runUciLoop() {
     Board board = initBoard();
+    // Reset PGN logger at the start of the UCI session.  If
+    // ucinewgame is received later, the PGN will be reset again.
+    resetPgn();
     std::string line;
     while (std::getline(std::cin, line)) {
         // Trim leading and trailing whitespace.
@@ -96,6 +100,8 @@ void runUciLoop() {
         } else if (cmd == "ucinewgame") {
             // Reset to starting position and clear any game state.
             board = initBoard();
+            // Clear the PGN move list for the new game.
+            resetPgn();
         } else if (cmd == "position") {
             std::string token;
             if (!(iss >> token)) continue;
@@ -280,10 +286,19 @@ void runUciLoop() {
             // typically do not modify state on "go" alone, but it
             // simplifies testing via CLI.  Comment out if undesired.
             board = makeMove(board, best);
+            // Record the move in the PGN logger.  Use the coordinate
+            // notation returned above.  Moves from the UCI search
+            // always represent the side to move; we append them
+            // sequentially to reconstruct the game.
+            addMoveToPgn(uciMove);
         } else if (cmd == "stop") {
             // Synchronous search returns immediately; nothing to stop.
             // A real implementation would signal the search thread to halt.
         } else if (cmd == "quit" || cmd == "exit") {
+            // Save the PGN to a default file before exiting.  The
+            // file name can be customised if needed; here we use
+            // "game.pgn" in the current directory.
+            savePgn("game.pgn");
             break;
         } else if (cmd == "setoption") {
             // Process a UCI setoption command.  Format is:

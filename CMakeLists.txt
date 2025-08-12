@@ -23,6 +23,7 @@ add_executable(nikolachess
         src/uci.cpp
     src/micro_batcher.cpp
     src/tablebase.cpp
+    src/pgn_logger.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.
