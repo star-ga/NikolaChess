@@ -18,16 +18,10 @@
 #include <exception>
 #include <cstdint>
 
-// Optional GPU stream configuration hook.
-// If your build provides a real implementation, define
-// HAVE_NIKOLA_SET_GPU_STREAMS at compile time and link the provider.
-namespace {
-#if defined(HAVE_NIKOLA_SET_GPU_STREAMS)
-void setGpuStreams(int n);            // provided elsewhere
-#else
-inline void setGpuStreams(int) {}     // no-op stub
-#endif
-}
+// Optional GPU stream configuration hook.  The engine exposes
+// `nikola::setGpuStreams` from the evaluation module (either the real CUDA
+// implementation or a stub in CPU-only builds).  We simply forward to that
+// function without providing a local stub to avoid namespace ambiguity.
 
 // Forward declaration of search entrypoint (implemented in search.cpp).
 // If you have a public header that declares this (e.g. search.h), you can
