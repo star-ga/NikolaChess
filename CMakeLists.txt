@@ -19,6 +19,7 @@ add_executable(nikolachess
     src/search.cpp
     src/perft.cpp
         src/gpu_eval.cpp
+        src/uci.cpp
 )
 
 # Enable CUDA separable compilation for proper device linking.

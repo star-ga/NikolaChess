@@ -12,6 +12,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include "uci.h"
 
 // Forward declaration of search function defined in search.cpp.
 namespace nikola {
@@ -42,6 +43,14 @@ int main(int argc, char* argv[]) {
     // nodes reachable from the starting position in four plies.
     if (argc >= 2) {
         std::string cmd = argv[1];
+        // Enter UCI protocol mode when invoked with "uci".  This
+        // bypasses the simple demonstration interface and allows the
+        // engine to be driven by GUI frontends.  Once the UCI loop
+        // returns (on "quit"), exit immediately.
+        if (cmd == "uci") {
+            runUciLoop();
+            return 0;
+        }
         if (cmd == "perft") {
             int depth = 1;
             if (argc >= 3) {
