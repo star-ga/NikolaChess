@@ -95,6 +95,49 @@ struct MicroBatcherInitializer {
 // Static instance ensures the initializer runs before main().
 static MicroBatcherInitializer g_batcherInit;
 
+// Allow runtime switching of GPU evaluation.  When called with
+// use=true the engine switches to GPU batched evaluation and
+// creates a micro-batcher if necessary.  When called with use=false
+// the engine reverts to CPU evaluation and destroys any existing
+// batcher.  This function is intended to be called from the UCI
+// command handler when processing the 'setoption' command for
+// UseGPU.
+void setUseGpu(bool use) {
+    if (use) {
+        if (g_evalBackend != EvaluationBackend::GPU_BATCHED) {
+            g_evalBackend = EvaluationBackend::GPU_BATCHED;
+            // Destroy existing batcher if present.
+            if (g_batcher) {
+                g_batcher->flush();
+                delete g_batcher;
+                g_batcher = nullptr;
+            }
+            // Create a new batcher using environment variables or
+            // defaults.  Reuse the logic from the initializer.
+            int maxBatch = 32;
+            int flushMs = 2;
+            if (const char* mb = std::getenv("NIKOLA_GPU_MAX_BATCH")) {
+                int v = std::atoi(mb);
+                if (v > 0) maxBatch = v;
+            }
+            if (const char* fm = std::getenv("NIKOLA_GPU_MICROBATCH_MS")) {
+                int v = std::atoi(fm);
+                if (v > 0) flushMs = v;
+            }
+            g_batcher = new MicroBatcher(static_cast<size_t>(maxBatch), flushMs);
+        }
+    } else {
+        if (g_evalBackend != EvaluationBackend::CPU_NNUE) {
+            g_evalBackend = EvaluationBackend::CPU_NNUE;
+            if (g_batcher) {
+                g_batcher->flush();
+                delete g_batcher;
+                g_batcher = nullptr;
+            }
+        }
+    }
+}
+
 // Evaluate a board position using the selected backend.  When the
 // GPU backend is selected, this function batches a single board and
 // calls evaluateBoardsGPU.  If GPU evaluation fails or returns

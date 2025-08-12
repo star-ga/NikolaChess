@@ -29,6 +29,9 @@
 
 // Forward declaration of search function.
 namespace nikola {
+
+// Forward declaration for runtime GPU switching.  Defined in search.cpp.
+void setUseGpu(bool use);
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
 Board makeMove(const Board& board, const Move& m);
 }
@@ -77,6 +80,10 @@ void runUciLoop() {
             // not honour them yet.
             std::cout << "option name Hash type spin default 16 min 1 max 1024" << std::endl;
             std::cout << "option name Threads type spin default 1 min 1 max 32" << std::endl;
+            // Option to enable or disable GPU batched evaluation.  When
+            // enabled the engine will batch evaluation calls to the GPU
+            // instead of using the CPU.  Default is false.
+            std::cout << "option name UseGPU type check default false" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             std::cout << "readyok" << std::endl;
@@ -228,6 +235,55 @@ void runUciLoop() {
             // A real implementation would signal the search thread to halt.
         } else if (cmd == "quit" || cmd == "exit") {
             break;
+        } else if (cmd == "setoption") {
+            // Process a UCI setoption command.  Format is:
+            // setoption name <id> [value <x>]
+            std::string token;
+            std::string name;
+            std::string value;
+            bool haveName = false;
+            bool haveValue = false;
+            while (iss >> token) {
+                if (token == "name") {
+                    // Read the rest of the tokens until 'value' or end
+                    std::ostringstream oss;
+                    std::string tmp;
+                    while (iss >> tmp && tmp != "value") {
+                        if (!name.empty()) oss << ' ';
+                        oss << tmp;
+                    }
+                    name = oss.str();
+                    haveName = true;
+                    if (tmp == "value") {
+                        // Read the value
+                        if (iss >> value) {
+                            haveValue = true;
+                        }
+                    }
+                    break;
+                }
+            }
+            // Trim whitespace from name and value.
+            auto trim = [](const std::string& s) {
+                size_t start = s.find_first_not_of(' ');
+                size_t end = s.find_last_not_of(' ');
+                if (start == std::string::npos) return std::string();
+                return s.substr(start, end - start + 1);
+            };
+            name = trim(name);
+            value = trim(value);
+            if (haveName) {
+                // Handle known options.
+                if (name == "UseGPU") {
+                    bool use = false;
+                    if (!value.empty()) {
+                        char c = static_cast<char>(std::tolower(static_cast<unsigned char>(value[0])));
+                        use = (c == '1' || c == 't' || c == 'y');
+                    }
+                    setUseGpu(use);
+                }
+                // Other options (Hash, Threads) are currently ignored.
+            }
         } else {
             // Unknown command; ignore or log.
         }
