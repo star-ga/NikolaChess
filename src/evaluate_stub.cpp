@@ -15,4 +15,7 @@ std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {
     return scores;
 }
 
+// In the CPU-only build, GPU stream configuration is ignored.
+void setGpuStreams(int) {}
+
 } // namespace nikola

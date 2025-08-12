@@ -49,12 +49,12 @@ set(NIKOLA_SOURCES
 )
 
 # GPU-specific sources or CPU fallbacks
-if(NIKOLA_HAS_CUDA)
-  list(APPEND NIKOLA_SOURCES src/evaluate.cu)
+  if(NIKOLA_HAS_CUDA)
+    list(APPEND NIKOLA_SOURCES src/cuda_eval.cu)
   # Treat CUDA files properly and enable device linking.
   set_source_files_properties(
-    src/move_generation.cu
-    src/evaluate.cu
+      src/move_generation.cu
+      src/cuda_eval.cu
     PROPERTIES LANGUAGE CUDA
   )
 else()

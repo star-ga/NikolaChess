@@ -37,6 +37,22 @@ static std::string toAlgebraic(int row, int col) {
 
 int main(int argc, char* argv[]) {
     using namespace nikola;
+    // Command-line options.  Handle global flags such as --gpu-streams before
+    // interpreting positional commands.
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--gpu-streams" && i + 1 < argc) {
+            int n = std::stoi(argv[i + 1]);
+            setGpuStreams(n);
+            // Shift remaining arguments down to remove the option.
+            for (int j = i; j + 2 <= argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            --i; // reprocess current index
+        }
+    }
+
     // Command‑line interface.  If the first argument is "perft",
     // compute and print the perft value at the specified depth.
     // Example: `./nikolachess perft 4` will output the number of leaf
