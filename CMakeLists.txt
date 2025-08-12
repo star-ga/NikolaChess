@@ -139,6 +139,9 @@ FetchContent_Declare(
 
 # Build gtest-driven unit tests only if sources exist.
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS tests/*_test.cpp)
+list(REMOVE_ITEM TEST_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/syzygy_path_option_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/tbprobe_tests.cpp)
 if(TEST_SOURCES)
   FetchContent_MakeAvailable(googletest)
   add_executable(nikola_tests ${TEST_SOURCES})

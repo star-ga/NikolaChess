@@ -25,5 +25,9 @@ Bitboards boardToBitboards(const Board &board) {
     return bb;
 }
 
+void updateBitboards(Board &board) {
+    board.bitboards = boardToBitboards(board);
+}
+
 } // namespace nikola
 

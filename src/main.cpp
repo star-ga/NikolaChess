@@ -18,18 +18,13 @@
 #include <exception>
 #include <cstdint>
 
-// Optional GPU stream configuration hook. The engine exposes
-// `nikola::setGpuStreams` from the evaluation module (either the real CUDA
-// implementation or a stub in CPU-only builds). We simply forward to that
-// function without providing a local stub to avoid namespace ambiguity.
-
-// Forward declaration of search entrypoint (implemented in search.cpp).
-// If you have a public header that declares these (e.g., search.h / eval headers),
-// include it instead of these forward declarations.
 namespace nikola {
-void setGpuStreams(int n);
+// Provided by search.cpp
 Move findBestMove(const Board& board, int depth, int timeLimitMs = 0);
-}
+
+// Provided by the GPU evaluation module (e.g., gpu_eval.cpp/.h)
+void setGpuStreams(int n);
+} // namespace nikola
 
 // Utility to convert a zero-based square coordinate into algebraic
 // notation (e.g. (0,0) -> "a1", (7,7) -> "h8").
@@ -148,7 +143,7 @@ int main(int argc, char* argv[]) {
     int cpuScore = evaluateBoardCPU(board);
     std::cout << "CPU evaluation of starting position: " << cpuScore << std::endl;
 
-    // Evaluate using GPU. We wrap the single board in an array of length one.
+    // Evaluate using GPU.  We wrap the single board in an array of length one.
     std::vector<Board> boards = {board};
     try {
         std::vector<int> gpuScores =

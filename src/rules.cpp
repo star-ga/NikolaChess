@@ -111,6 +111,7 @@ Board makeMove(const Board& board, const Move& m) {
         // Increment the counter for a quiet move.
         nb.halfMoveClock += 1;
     }
+    updateBitboards(nb);
     return nb;
 }
 

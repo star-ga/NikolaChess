@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include "bitboard.h"
 
 namespace nikola {
 
@@ -82,6 +83,10 @@ struct Board {
     // a draw.  The clock is reset to zero on any capture, pawn move or
     // promotion.
     int halfMoveClock;
+
+    // Bitboard representation kept in sync with the array above.  Most
+    // of the engine now operates on these bitboards directly for speed.
+    Bitboards bitboards;
 };
 
 // Initialise a Board to the standard chess starting position.  Pawns

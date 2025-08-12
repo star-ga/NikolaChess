@@ -25,6 +25,7 @@ struct Bitboards {
 };
 
 Bitboards boardToBitboards(const struct Board &board);
+void updateBitboards(struct Board &board);
 
 } // namespace nikola
 
