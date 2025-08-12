@@ -22,23 +22,35 @@ static int to_i(const std::vector<std::string>& t, const char* key, int def=-1){
 void uci_go(const Board& current, const std::vector<std::string>& tokens) {
     EngineOptions& o = opts();
 
-    int depth = to_i(tokens, "depth", -1);
-    int wtime = to_i(tokens, "wtime", -1);
-    int btime = to_i(tokens, "btime", -1);
-    int winc  = to_i(tokens, "winc", 0);
-    int binc  = to_i(tokens, "binc", 0);
-    int mtg   = to_i(tokens, "movestogo", 0);
+    int depth    = to_i(tokens, "depth", -1);
+    int movetime = to_i(tokens, "movetime", -1);
+    int wtime    = to_i(tokens, "wtime", -1);
+    int btime    = to_i(tokens, "btime", -1);
+    int winc     = to_i(tokens, "winc", 0);
+    int binc     = to_i(tokens, "binc", 0);
+    int mtg      = to_i(tokens, "movestogo", 0);
 
     if (o.LimitStrength) {
         int cap = 1 + o.Strength;
         if (depth < 0 || depth > cap) depth = cap;
     }
 
-    // compute budget
-    int budget = compute_time_budget(current, current.whiteToMove, wtime, btime, winc, binc, mtg, o.MoveOverhead, 0.10);
+    // Determine search time limit.  movetime takes precedence; otherwise
+    // derive a budget from the clocks.  When using clock-based limits
+    // apply a 10% safety margin and clamp to at least 50ms.
+    int timeLimitMs = -1;
+    if (movetime >= 0) {
+        timeLimitMs = movetime;
+    } else if (wtime >= 0 && btime >= 0) {
+        timeLimitMs = compute_time_budget(current, current.whiteToMove,
+                                          wtime, btime, winc, binc, mtg,
+                                          o.MoveOverhead, 0.0);
+        timeLimitMs -= timeLimitMs / 10;
+        if (timeLimitMs < 50) timeLimitMs = 50;
+    }
 
     // Run root MultiPV
-    auto results = search_multipv(current, std::max(1,o.MultiPV), depth, budget);
+    auto results = search_multipv(current, std::max(1,o.MultiPV), depth, timeLimitMs);
 
     // Emit info lines
     for (size_t i=0; i<results.size(); ++i) {
