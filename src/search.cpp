@@ -34,9 +34,9 @@
 #include "pv.h"
 
 // Include tablebase probing functions and piece counting utility.  The
-// engine will consult endgame tablebases when the position has
-// sufficiently few pieces.  If a tablebase result is available, it
-// overrides the heuristic evaluation.
+// engine will consult endgame tablebases when the position has at
+// most seven pieces.  If a tablebase result is available, it overrides
+// the heuristic evaluation.
 #include "tablebase.h"
 
 // Include the micro-batcher for GPU evaluation.  The batcher
@@ -81,6 +81,12 @@ static MicroBatcher* g_batcher = nullptr;
 
 // UCI option: number of principal variations to display (1..8)
 int g_multiPV = 1;
+
+// Maximum number of pieces for which we will probe endgame tablebases.
+// Syzygy via Fathom supports up to 7 pieces; keep a single threshold
+// so both root search and evaluation consult the tablebase under the
+// same conditions.
+constexpr int kMaxTablebasePieces = 7;
 
 // Helper struct to lazily create and destroy the micro-batcher.
 // The constructor reads environment variables NIKOLA_GPU_MAX_BATCH
@@ -163,8 +169,8 @@ void setUseGpu(bool use) {
 // calls evaluateBoardsGPU.  If GPU evaluation fails or returns
 // empty, falls back to the CPU evaluator.
 static int staticEvaluate(const Board& b) {
-    // If tablebase probing is enabled and the position is small
-    // enough, query the endgame tablebase.  This takes priority
+    // If tablebase probing is enabled and the position has at most
+    // kMaxTablebasePieces pieces, query the endgame tablebase.  This takes priority
     // over any heuristic evaluation.  A positive return value
     // indicates a forced win for White, zero indicates a draw, and
     // a negative value indicates a forced win for Black.  The
@@ -174,7 +180,7 @@ static int staticEvaluate(const Board& b) {
     // heuristic evaluation.
     if (nikola::tablebaseAvailable()) {
         int numPieces = nikola::countPieces(b);
-        if (numPieces <= 6) {
+        if (numPieces <= kMaxTablebasePieces) {
             int wdl = nikola::probeWDL(b);
             if (wdl == 1) {
                 // White can force a win.
@@ -757,6 +763,38 @@ Move findBestMove(const Board& board, int depth, int timeLimitMs) {
 
     auto initialMoves = generateMoves(board);
     if (initialMoves.empty()) return chosenMove;
+
+    // Direct root tablebase probing when available.  If the current
+    // position has at most kMaxTablebasePieces pieces, we can probe
+    // each legal move and pick the exact best result without further
+    // search.  This keeps the piece-count threshold consistent with
+    // static evaluation.
+    if (nikola::tablebaseAvailable()) {
+        int numPieces = nikola::countPieces(board);
+        if (numPieces <= kMaxTablebasePieces) {
+            Move tbMove{};
+            bool found = false;
+            int bestWdl = board.whiteToMove ? -2 : 2;
+            for (const Move& m : initialMoves) {
+                Board child = makeMove(board, m);
+                int wdl = nikola::probeWDL(child);
+                if (wdl == 2) continue; // unknown
+                if (!found || (board.whiteToMove ? wdl > bestWdl : wdl < bestWdl)) {
+                    found = true;
+                    bestWdl = wdl;
+                    tbMove = m;
+                    if ((board.whiteToMove && wdl == 1) ||
+                        (!board.whiteToMove && wdl == -1)) {
+                        break; // found decisive result
+                    }
+                }
+            }
+            if (found) {
+                std::cout << "bestmove " << move_to_uci(board, tbMove) << std::endl;
+                return tbMove;
+            }
+        }
+    }
 
     // Time management
     if (timeLimitMs <= 0) {
