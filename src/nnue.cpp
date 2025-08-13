@@ -22,17 +22,24 @@ NNUE::NNUE(int inputSize, int hidden1, int hidden2)
     b3_ = randf() * 0.1f;
 }
 
-int NNUE::evaluate(const Bitboards& bb) const {
+int NNUE::evaluate(const Bitboards& bb, bool whiteToMove) const {
     std::vector<float> h1(hidden1_, 0.0f);
+    // Precompute side-to-move feature once.
+    float stm = whiteToMove ? 1.0f : -1.0f;
     for (int h = 0; h < hidden1_; ++h) {
         float sum = b1_[h];
-        for (int i = 0; i < inputSize_; ++i) {
-            int piece = i / 64;
-            int sq = i % 64;
-            if (piece < 12 && bb_is_set(bb.pieces[piece], sq)) {
-                sum += w1_[h * inputSize_ + i];
+        // Piece/square features occupy the first 12*64 inputs.
+        for (int piece = 0; piece < 12; ++piece) {
+            Bitboard bits = bb.pieces[piece];
+            while (bits) {
+                int sq = bb_lsb(bits);
+                bb_pop_lsb(bits);
+                int idx = piece * 64 + sq;
+                sum += w1_[h * inputSize_ + idx];
             }
         }
+        // Side-to-move as final input.
+        sum += w1_[h * inputSize_ + inputSize_ - 1] * stm;
         h1[h] = sum > 0 ? sum : 0.0f;
     }
     std::vector<float> h2(hidden2_, 0.0f);
@@ -107,7 +114,7 @@ void NNUE::train(const std::vector<std::vector<float>>& inputs,
 int nnueEvaluate(const Board& board) {
     static NNUE net; // default network
     Bitboards bb = boardToBitboards(board);
-    return net.evaluate(bb);
+    return net.evaluate(bb, board.whiteToMove);
 }
 
 void nnueTrainBoards(const std::vector<Board>& boards, const std::vector<int>& targets,
@@ -119,7 +126,7 @@ void nnueTrainBoards(const std::vector<Board>& boards, const std::vector<int>& t
     t.reserve(boards.size());
     for (size_t i = 0; i < boards.size(); ++i) {
         Bitboards bb = boardToBitboards(boards[i]);
-        std::vector<float> in(12 * 64, 0.0f);
+        std::vector<float> in(12 * 64 + 1, 0.0f);
         for (int piece = 0; piece < 12; ++piece) {
             Bitboard b = bb.pieces[piece];
             while (b) {
@@ -129,6 +136,7 @@ void nnueTrainBoards(const std::vector<Board>& boards, const std::vector<int>& t
                 if (feature < (int)in.size()) in[feature] = 1.0f;
             }
         }
+        in.back() = boards[i].whiteToMove ? 1.0f : -1.0f;
         inputs.push_back(std::move(in));
         t.push_back(targets[i] / 100.0f);
     }

@@ -251,7 +251,8 @@ void dispatchLoop() {
                         bb_set(bb.pieces[piece], sq);
                 }
             }
-            float score = static_cast<float>(gNet.evaluate(bb));
+            bool white = t.features.size() > 12 * 64 && t.features[12 * 64] > 0.0f;
+            float score = static_cast<float>(gNet.evaluate(bb, white));
             t.promise.set_value(score);
         }
         {

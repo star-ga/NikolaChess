@@ -10,9 +10,10 @@ namespace nikola {
 static int g_streams = 1;
 static std::once_flag initFlag;
 
-// Convert a Board into a 12*64 feature vector used by the NNUE evaluator.
+// Convert a Board into a 12*64+1 feature vector used by the NNUE evaluator.
+// The final element encodes the side to move (white=+1, black=-1).
 static void boardToFeatures(const Board& b, std::vector<float>& out) {
-    out.assign(12 * 64, 0.0f);
+    out.assign(12 * 64 + 1, 0.0f);
     Bitboards bb = boardToBitboards(b);
     for (int piece = 0; piece < 12; ++piece) {
         Bitboard bits = bb.pieces[piece];
@@ -22,6 +23,7 @@ static void boardToFeatures(const Board& b, std::vector<float>& out) {
             out[piece * 64 + sq] = 1.0f;
         }
     }
+    out.back() = b.whiteToMove ? 1.0f : -1.0f;
 }
 
 std::vector<int> evaluateBoardsGPU(const Board* boards, int nBoards) {

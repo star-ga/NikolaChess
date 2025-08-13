@@ -1,8 +1,8 @@
 #include "polyglot.h"
 #include "board.h"
 #include <cassert>
-#include <fstream>
 #include <iostream>
+#include <cstdio>
 
 int main() {
     using namespace nikola;
@@ -13,10 +13,14 @@ int main() {
     addBookEntry(b, m, 10, 0);
     bool ok = saveBook("test.book");
     assert(ok);
-    std::ifstream f("test.book", std::ios::binary);
-    assert(f);
-    f.seekg(0, std::ios::end);
-    assert(f.tellg() > 0);
+    // Enable the book and ensure probing returns the stored move.
+    setUseBook(true);
+    setBookFile("test.book");
+    auto res = probeBook(b);
+    assert(res.has_value());
+    assert(res->fromRow == m.fromRow && res->fromCol == m.fromCol &&
+           res->toRow == m.toRow && res->toCol == m.toCol);
+    std::remove("test.book");
     std::cout << "bookgen tests passed\n";
     return 0;
 }
