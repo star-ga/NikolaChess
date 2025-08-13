@@ -622,6 +622,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int margin = 200;
                 if (bestAlt + margin <= alpha) nextDepth++;
             }
+            bool pvs = idx > 0;
+            int searchAlpha = alpha;
+            int searchBeta = beta;
+            if (pvs) {
+                searchBeta = alpha + 1;
+            }
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
@@ -629,12 +635,15 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 if (depth > 6 && idx >= 6) reduction = 2;
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
-                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, false, repetitions, &m);
+                int evalReduced = minimax(child, reducedDepth, ply + 1, searchAlpha, searchBeta, false, repetitions, &m);
                 eval = evalReduced;
-                if (evalReduced > alpha) {
-                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions, &m);
+                if (evalReduced > searchAlpha) {
+                    eval = minimax(child, nextDepth, ply + 1, searchAlpha, searchBeta, false, repetitions, &m);
                 }
             } else {
+                eval = minimax(child, nextDepth, ply + 1, searchAlpha, searchBeta, false, repetitions, &m);
+            }
+            if (pvs && eval > alpha && eval < beta) {
                 eval = minimax(child, nextDepth, ply + 1, alpha, beta, false, repetitions, &m);
             }
             if (eval > bestVal) {
@@ -682,6 +691,12 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 int margin = 200;
                 if (bestAlt - margin >= beta) nextDepth++;
             }
+            bool pvs = idx > 0;
+            int searchAlpha = alpha;
+            int searchBeta = beta;
+            if (pvs) {
+                searchAlpha = beta - 1;
+            }
             int eval;
             bool isQuiet = (m.captured == nikola::EMPTY && m.promotedTo == 0);
             if (nextDepth > 0 && isQuiet && idx >= 3 && depth >= 3) {
@@ -689,12 +704,15 @@ static int minimax(const nikola::Board& board, int depth, int ply, int alpha, in
                 if (depth > 6 && idx >= 6) reduction = 2;
                 int reducedDepth = nextDepth - reduction;
                 if (reducedDepth < 0) reducedDepth = 0;
-                int evalReduced = minimax(child, reducedDepth, ply + 1, alpha, beta, true, repetitions, &m);
+                int evalReduced = minimax(child, reducedDepth, ply + 1, searchAlpha, searchBeta, true, repetitions, &m);
                 eval = evalReduced;
-                if (evalReduced < beta) {
-                    eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions, &m);
+                if (evalReduced < searchBeta) {
+                    eval = minimax(child, nextDepth, ply + 1, searchAlpha, searchBeta, true, repetitions, &m);
                 }
             } else {
+                eval = minimax(child, nextDepth, ply + 1, searchAlpha, searchBeta, true, repetitions, &m);
+            }
+            if (pvs && eval > alpha && eval < beta) {
                 eval = minimax(child, nextDepth, ply + 1, alpha, beta, true, repetitions, &m);
             }
             if (eval < bestVal) {
