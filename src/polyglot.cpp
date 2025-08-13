@@ -13,6 +13,7 @@
 #include <string>
 #include <random>
 #include <mutex>
+#include <algorithm>
 
 namespace {
 
@@ -236,7 +237,18 @@ void addBookEntry(const Board& board, const Move& move,
                   uint16_t weight, uint16_t learn) {
     std::lock_guard<std::mutex> lock(g_bookMutex);
     uint64_t key = polyglotKey(board);
-    g_book[key].push_back(BookEntry{move, weight, learn});
+    auto& vec = g_book[key];
+    for (auto& e : vec) {
+        if (e.move.fromRow == move.fromRow && e.move.fromCol == move.fromCol &&
+            e.move.toRow == move.toRow && e.move.toCol == move.toCol &&
+            e.move.promotedTo == move.promotedTo) {
+            // Merge duplicate entry by accumulating weight and learn values.
+            e.weight = static_cast<uint16_t>(std::min<int>(65535, e.weight + weight));
+            e.learn  = static_cast<uint16_t>(std::min<int>(65535, e.learn + learn));
+            return;
+        }
+    }
+    vec.push_back(BookEntry{move, weight, learn});
 }
 
 bool saveBook(const std::string& path) {
