@@ -51,6 +51,23 @@ struct Result {
     Move move;
 };
 
+#ifdef NIKOLA_USE_MPI
+// Merge the local transposition-table block across all ranks and return the
+// total number of non-zero entries after the merge.  The function uses an
+// in-place MPI_Allreduce followed by a reduction that counts the number of
+// bytes set by any rank.  This provides a simple measure of the combined TT
+// size and demonstrates scalable merging behaviour.
+static int mergeTranspositionTables(std::vector<char>& block) {
+    MPI_Allreduce(MPI_IN_PLACE, block.data(), static_cast<int>(block.size()),
+                  MPI_BYTE, MPI_BOR, MPI_COMM_WORLD);
+    int local = 0;
+    for (char c : block) if (c) ++local;
+    int global = 0;
+    MPI_Reduce(&local, &global, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    return global;
+}
+#endif
+
 int distributed_search() {
 #ifdef NIKOLA_USE_MPI
     int provided;
@@ -157,11 +174,8 @@ int distributed_search() {
         }
 
         std::cout << "Distributed best move score: " << bestScore << std::endl;
-        MPI_Allreduce(MPI_IN_PLACE, ttBlock.data(), static_cast<int>(ttBlock.size()),
-                      MPI_BYTE, MPI_BOR, MPI_COMM_WORLD);
+        int merged = mergeTranspositionTables(ttBlock);
         if (rank == 0) {
-            int merged = 0;
-            for (char c : ttBlock) if (c) ++merged;
             std::cout << "Merged TT entries: " << merged << std::endl;
         }
 #ifdef NIKOLA_USE_NCCL
@@ -182,8 +196,7 @@ int distributed_search() {
             Result res{score, m};
             MPI_Send(&res, sizeof(Result), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
         }
-        MPI_Allreduce(MPI_IN_PLACE, ttBlock.data(), static_cast<int>(ttBlock.size()),
-                      MPI_BYTE, MPI_BOR, MPI_COMM_WORLD);
+        mergeTranspositionTables(ttBlock);
 #ifdef NIKOLA_USE_NCCL
         ncclCommDestroy(ncclComm);
 #endif

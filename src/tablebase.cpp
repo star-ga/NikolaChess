@@ -13,6 +13,7 @@
 #include "board.h"
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 // Fathom tablebase library entry point.  Returns non-zero on success.
 extern "C" int tb_init(const char* path);
@@ -29,6 +30,9 @@ static std::string g_tbPath;
 static bool g_tbAvailable = false;
 static int g_tbPathUpdates = 0;
 static std::mutex g_tbMutex;
+static std::mutex g_cacheMutex;
+static std::unordered_map<std::string, int> g_wdlCache;
+static std::unordered_map<std::string, int> g_dtzCache;
 
 void setTablebasePath(const std::string& path) {
     std::lock_guard<std::mutex> lock(g_tbMutex);
@@ -38,6 +42,11 @@ void setTablebasePath(const std::string& path) {
         g_tbAvailable = tb_init(path.c_str()) != 0;
     }
     ++g_tbPathUpdates;
+    {
+        std::lock_guard<std::mutex> cacheLock(g_cacheMutex);
+        g_wdlCache.clear();
+        g_dtzCache.clear();
+    }
 }
 
 bool tablebaseAvailable() {
@@ -63,13 +72,25 @@ int probeWDL(const Board& board) {
     if (nikola::countPieces(board) > 7) {
         return 2;
     }
-    unsigned res = tbProbeWDL(board);
-    switch (res) {
-        case 4: return 1;   // win
-        case 2: return 0;   // draw
-        case 0: return -1;  // loss
-        default: return 2;  // unknown
+    std::string key = boardToFEN(board);
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_wdlCache.find(key);
+        if (it != g_wdlCache.end()) return it->second;
     }
+    unsigned res = tbProbeWDL(board);
+    int val;
+    switch (res) {
+        case 4: val = 1; break;   // win
+        case 2: val = 0; break;   // draw
+        case 0: val = -1; break;  // loss
+        default: val = 2; break;  // unknown
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        g_wdlCache[key] = val;
+    }
+    return val;
 }
 
 int probeDTZ(const Board& board) {
@@ -79,7 +100,18 @@ int probeDTZ(const Board& board) {
     if (nikola::countPieces(board) > 7) {
         return 0;
     }
-    return tbProbeDTZ(board);
+    std::string key = boardToFEN(board);
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        auto it = g_dtzCache.find(key);
+        if (it != g_dtzCache.end()) return it->second;
+    }
+    int val = tbProbeDTZ(board);
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        g_dtzCache[key] = val;
+    }
+    return val;
 }
 
 } // namespace nikola
