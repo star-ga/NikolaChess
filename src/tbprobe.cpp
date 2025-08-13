@@ -31,6 +31,20 @@ extern "C" unsigned tb_probe_root(
     bool turn,
     unsigned* results);
 
+extern "C" int tb_probe_dtz(
+    uint64_t white,
+    uint64_t black,
+    uint64_t kings,
+    uint64_t queens,
+    uint64_t rooks,
+    uint64_t bishops,
+    uint64_t knights,
+    uint64_t pawns,
+    unsigned rule50,
+    unsigned castling,
+    unsigned ep,
+    bool turn);
+
 namespace nikola {
 
 namespace {
@@ -96,6 +110,15 @@ unsigned tbProbeRoot(const Board& b, unsigned* results) {
     return ::tb_probe_root(bb.white, bb.black, bb.kings, bb.queens, bb.rooks,
                            bb.bishops, bb.knights, bb.pawns, b.halfMoveClock,
                            castle, ep, b.whiteToMove, results);
+}
+
+int tbProbeDTZ(const Board& b) {
+    TBBitboards bb = build_bitboards(b);
+    unsigned castle = castling_mask(b);
+    unsigned ep = ep_square(b);
+    return ::tb_probe_dtz(bb.white, bb.black, bb.kings, bb.queens, bb.rooks,
+                          bb.bishops, bb.knights, bb.pawns, b.halfMoveClock,
+                          castle, ep, b.whiteToMove);
 }
 
 } // namespace nikola

@@ -183,6 +183,27 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/tbprobe_tests.cpp")
   add_test(NAME tbprobe_tests COMMAND tbprobe_tests)
 endif()
 
+# Optional DTZ probe tests
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dtzprobe_tests.cpp")
+  add_executable(dtzprobe_tests
+    tests/dtzprobe_tests.cpp
+    tests/fathom_stub.cpp
+    src/tbprobe.cpp
+  )
+  target_include_directories(dtzprobe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME dtzprobe_tests COMMAND dtzprobe_tests)
+endif()
+
+# Opening book generation tests
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/bookgen_tests.cpp")
+  add_executable(bookgen_tests
+    tests/bookgen_tests.cpp
+  )
+  target_link_libraries(bookgen_tests nikola_core)
+  target_include_directories(bookgen_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME bookgen_tests COMMAND bookgen_tests)
+endif()
+
 # Optional Syzygy path option test (standalone)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/syzygy_path_option_test.cpp")
   add_executable(syzygy_path_option_test tests/syzygy_path_option_test.cpp)

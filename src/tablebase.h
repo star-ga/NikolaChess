@@ -44,4 +44,11 @@ bool tablebaseAvailable();
 // stalemate and illegal positions.  For now it always returns 2.
 int probeWDL(const Board& board);
 
+// Probe the tablebase for the given board and return the DTZ
+// (distance to zeroing move / conversion) value.  Positive values
+// indicate the side to move can force progress in that many plies;
+// negative values indicate forced mate for the opponent.  A return
+// value of 0 means draw or tablebase unavailable.
+int probeDTZ(const Board& board);
+
 } // namespace nikola

@@ -20,3 +20,9 @@ extern "C" unsigned tb_probe_root(
     return 2; // unknown
 }
 
+extern "C" int tb_probe_dtz(
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, unsigned, unsigned, unsigned, bool) {
+    return 0; // unknown
+}
+
