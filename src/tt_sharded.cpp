@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <thread>
 
 namespace {
 // Each shard holds a mutex and an unordered_map.  The struct itself is not
@@ -31,7 +32,10 @@ static std::atomic<bool> g_inited{false};
 
 static void ensure_init() {
     if (g_inited.load(std::memory_order_acquire)) return;
-    g_shards.resize(64);
+    std::size_t shards = 64;
+    unsigned hc = std::thread::hardware_concurrency();
+    if (hc > 0 && hc * 2 > shards) shards = hc * 2;
+    g_shards.resize(shards);
     for (auto& p : g_shards) p = std::make_unique<Shard>();
     g_inited.store(true, std::memory_order_release);
 }
