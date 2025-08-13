@@ -4,9 +4,9 @@
 
 TEST(NNUELargeNetTest, EvaluateStartPos) {
     nikola::Board b = nikola::initBoard();
-    // Construct a larger network than default
-    nikola::NNUE net(12*64, 512, 64);
-    int score = net.evaluate(b.bitboards);
+    // Construct a larger network than default, accounting for side-to-move feature.
+    nikola::NNUE net(12*64 + 1, 512, 64);
+    int score = net.evaluate(b.bitboards, b.whiteToMove);
     // Score should be finite
     EXPECT_GT(score, -100000);
     EXPECT_LT(score, 100000);

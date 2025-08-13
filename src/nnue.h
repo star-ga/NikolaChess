@@ -7,8 +7,11 @@ namespace nikola {
 
 class NNUE {
 public:
-    NNUE(int inputSize = 12*64, int hidden1 = 256, int hidden2 = 32);
-    int evaluate(const Bitboards& bb) const;
+    // Include an extra input feature for side to move.
+    // Positive value represents white to move, negative black to move.
+    NNUE(int inputSize = 12*64 + 1, int hidden1 = 256, int hidden2 = 32);
+    // Evaluate the given bitboards with the supplied side to move flag.
+    int evaluate(const Bitboards& bb, bool whiteToMove) const;
     void train(const std::vector<std::vector<float>>& inputs,
                const std::vector<float>& targets,
                int epochs, float lr);
