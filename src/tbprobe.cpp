@@ -48,46 +48,18 @@ struct TBBitboards {
 
 TBBitboards build_bitboards(const Board& b) {
     TBBitboards bb;
-    for (int r = 0; r < 8; ++r) {
-        for (int c = 0; c < 8; ++c) {
-            int8_t piece = b.squares[r][c];
-            if (piece == Piece::EMPTY)
-                continue;
-            uint64_t sq = 1ULL << (r * 8 + c);
-            if (piece > 0)
-                bb.white |= sq;
-            else
-                bb.black |= sq;
-            switch (piece) {
-                case Piece::WP:
-                case Piece::BP:
-                    bb.pawns |= sq;
-                    break;
-                case Piece::WN:
-                case Piece::BN:
-                    bb.knights |= sq;
-                    break;
-                case Piece::WB:
-                case Piece::BB:
-                    bb.bishops |= sq;
-                    break;
-                case Piece::WR:
-                case Piece::BR:
-                    bb.rooks |= sq;
-                    break;
-                case Piece::WQ:
-                case Piece::BQ:
-                    bb.queens |= sq;
-                    break;
-                case Piece::WK:
-                case Piece::BK:
-                    bb.kings |= sq;
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
+    const Bitboards& src = b.bitboards;
+
+    bb.white = src.whiteMask;
+    bb.black = src.blackMask;
+
+    bb.kings   = src.pieces[5] | src.pieces[11];
+    bb.queens  = src.pieces[4] | src.pieces[10];
+    bb.rooks   = src.pieces[3] | src.pieces[9];
+    bb.bishops = src.pieces[2] | src.pieces[8];
+    bb.knights = src.pieces[1] | src.pieces[7];
+    bb.pawns   = src.pieces[0] | src.pieces[6];
+
     return bb;
 }
 
