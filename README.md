@@ -15,7 +15,11 @@ An experimental, research-friendly chess engine with:
 
 ## Build
 
-You need a C++17 compiler and CMake ≥ 3.12.
+You need a C++17 compiler and CMake ≥ 3.12. After cloning, ensure submodules are initialized:
+
+```sh
+git submodule update --init --recursive
+```
 
 **CPU-only:**
 ```sh

@@ -10,6 +10,11 @@ project(NikolaChess LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Ensure Fathom submodule is initialized
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/fathom/src/tbprobe.c")
+  message(FATAL_ERROR "Missing src/fathom/src/tbprobe.c. Please run 'git submodule update --init --recursive'.")
+endif()
+
 # Try to detect CUDA toolkit if the user asked for CUDA.
 set(NIKOLA_HAS_CUDA FALSE)
 if(NIKOLA_USE_CUDA)
