@@ -180,13 +180,8 @@ endif()
 
 # Optional Syzygy path option test (standalone)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/syzygy_path_option_test.cpp")
-  add_executable(syzygy_path_option_test
-    tests/syzygy_path_option_test.cpp
-    src/engine_options.cpp
-    src/tablebase.cpp
-    src/tbprobe.cpp
-    src/fathom_bridge.cpp
-  )
+  add_executable(syzygy_path_option_test tests/syzygy_path_option_test.cpp)
+  target_link_libraries(syzygy_path_option_test nikola_core)
   target_include_directories(syzygy_path_option_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME syzygy_path_option_test COMMAND syzygy_path_option_test)
 endif()

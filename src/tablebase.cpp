@@ -10,6 +10,7 @@
 // position contains a small number of pieces.
 
 #include "tablebase.h"
+#include "board.h"
 #include <mutex>
 #include <string>
 
@@ -27,14 +28,6 @@ static std::string g_tbPath;
 static bool g_tbAvailable = false;
 static int g_tbPathUpdates = 0;
 static std::mutex g_tbMutex;
-
-static int countPiecesLocal(const Board& b) {
-    int count = 0;
-    for (int r = 0; r < 8; ++r)
-        for (int c = 0; c < 8; ++c)
-            if (b.squares[r][c] != EMPTY) ++count;
-    return count;
-}
 
 void setTablebasePath(const std::string& path) {
     std::lock_guard<std::mutex> lock(g_tbMutex);
@@ -66,7 +59,7 @@ int probeWDL(const Board& board) {
         return 2;
     }
     // For now we rely on Fathom which supports up to 7 pieces.
-    if (countPiecesLocal(board) > 7) {
+    if (nikola::countPieces(board) > 7) {
         return 2;
     }
     unsigned res = tbProbeWDL(board);
