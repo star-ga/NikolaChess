@@ -49,3 +49,25 @@ extern "C" unsigned tb_probe_root(
         return 0; // TB_LOSS
     return 2;     // TB_DRAW
 }
+
+extern "C" int tb_probe_dtz(
+    uint64_t white,
+    uint64_t black,
+    uint64_t kings,
+    uint64_t queens,
+    uint64_t rooks,
+    uint64_t bishops,
+    uint64_t knights,
+    uint64_t pawns,
+    unsigned rule50,
+    unsigned castling,
+    unsigned ep,
+    bool turn) {
+    last_castling = castling;
+    last_ep = ep;
+    if (castling)
+        return 5;
+    if (ep)
+        return -5;
+    return 0;
+}

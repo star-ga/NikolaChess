@@ -38,4 +38,15 @@ void setBookFile(const std::string& path);
 // result as a recommended move and skip searching.
 std::optional<Move> probeBook(const Board& board);
 
+// Add an entry to the in-memory opening book.  The entry is keyed by the
+// current board's Polyglot hash and associates a move with a weight and
+// optional learn value.  This is useful for constructing books from PGN
+// data at runtime.
+void addBookEntry(const Board& board, const Move& move,
+                  uint16_t weight = 1, uint16_t learn = 0);
+
+// Write the currently populated in-memory book to the given path in
+// standard Polyglot format.  Returns true on success.
+bool saveBook(const std::string& path);
+
 } // namespace nikola

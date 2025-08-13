@@ -85,26 +85,39 @@ std::mutex mtx;
 std::condition_variable cv;
 bool stopWorkers = false;
 NNUE gNet; // default network instance
+size_t g_maxBatch = 1;
+size_t inFlight = 0;
 
 void workerLoop() {
     while (true) {
-        Task t;
+        std::vector<Task> batch;
         {
             std::unique_lock<std::mutex> lock(mtx);
             cv.wait(lock, [] { return stopWorkers || !tasks.empty(); });
             if (stopWorkers && tasks.empty()) return;
-            t = std::move(tasks.front());
-            tasks.pop();
-        }
-        Bitboards bb{};
-        for (int piece = 0; piece < 12; ++piece) {
-            for (int sq = 0; sq < 64; ++sq) {
-                if (t.features[piece * 64 + sq] > 0.5f)
-                    bb_set(bb.pieces[piece], sq);
+            size_t n = std::min(g_maxBatch, tasks.size());
+            inFlight += n;
+            for (size_t i = 0; i < n; ++i) {
+                batch.push_back(std::move(tasks.front()));
+                tasks.pop();
             }
         }
-        float score = static_cast<float>(gNet.evaluate(bb));
-        t.promise.set_value(score);
+        for (auto& t : batch) {
+            Bitboards bb{};
+            for (int piece = 0; piece < 12; ++piece) {
+                for (int sq = 0; sq < 64; ++sq) {
+                    if (t.features[piece * 64 + sq] > 0.5f)
+                        bb_set(bb.pieces[piece], sq);
+                }
+            }
+            float score = static_cast<float>(gNet.evaluate(bb));
+            t.promise.set_value(score);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            inFlight -= batch.size();
+            if (tasks.empty() && inFlight == 0) cv.notify_all();
+        }
     }
 }
 
@@ -127,13 +140,14 @@ struct Shutdown { ~Shutdown() { shutdown(); } } shutdownGuard;
 void GpuEval::init(const std::string& /*model_path*/,
                    const std::string& /*precision*/,
                    int /*device_id*/,
-                   size_t /*max_batch*/,
+                   size_t max_batch,
                    int streams) {
     shutdown();
     {
         std::lock_guard<std::mutex> lock(mtx);
         stopWorkers = false;
     }
+    g_maxBatch = std::max<size_t>(1, max_batch);
     for (int i = 0; i < streams; ++i) {
         workers.emplace_back(workerLoop);
     }
@@ -153,7 +167,7 @@ std::future<float> GpuEval::submit(const float* features, size_t len) {
 
 void GpuEval::flush() {
     std::unique_lock<std::mutex> lock(mtx);
-    cv.wait(lock, [] { return tasks.empty(); });
+    cv.wait(lock, [] { return tasks.empty() && inFlight == 0; });
 }
 
 } // namespace nikola

@@ -232,4 +232,39 @@ std::optional<Move> probeBook(const Board& board) {
     return vec[0].move;
 }
 
+void addBookEntry(const Board& board, const Move& move,
+                  uint16_t weight, uint16_t learn) {
+    std::lock_guard<std::mutex> lock(g_bookMutex);
+    uint64_t key = polyglotKey(board);
+    g_book[key].push_back(BookEntry{move, weight, learn});
+}
+
+bool saveBook(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_bookMutex);
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    for (const auto& kv : g_book) {
+        uint64_t key = kv.first;
+        for (const auto& e : kv.second) {
+            uint16_t from = static_cast<uint16_t>(e.move.fromRow * 8 + e.move.fromCol);
+            uint16_t to   = static_cast<uint16_t>(e.move.toRow * 8 + e.move.toCol);
+            uint16_t prom = 0;
+            switch (e.move.promotedTo) {
+                case WN: case BN: prom = 1; break;
+                case WB: case BB: prom = 2; break;
+                case WR: case BR: prom = 3; break;
+                case WQ: case BQ: prom = 4; break;
+                default: prom = 0; break;
+            }
+            uint16_t moveCode = static_cast<uint16_t>((from << 6) | to | (prom << 12));
+            uint32_t learn = e.learn;
+            f.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            f.write(reinterpret_cast<const char*>(&moveCode), sizeof(moveCode));
+            f.write(reinterpret_cast<const char*>(&e.weight), sizeof(e.weight));
+            f.write(reinterpret_cast<const char*>(&learn), sizeof(learn));
+        }
+    }
+    return true;
+}
+
 } // namespace nikola

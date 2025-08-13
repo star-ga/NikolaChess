@@ -90,6 +90,8 @@ int distributed_search() {
     std::vector<char> ttBlock(1024);
     MPI_Bcast(ttBlock.data(), static_cast<int>(ttBlock.size()), MPI_BYTE, 0,
               MPI_COMM_WORLD);
+    if (rank < static_cast<int>(ttBlock.size()))
+        ttBlock[rank] = 1;
 
 #ifdef NIKOLA_USE_NCCL
     // Mirror the block to GPUs as an example of NCCL usage.  The block is
@@ -155,7 +157,13 @@ int distributed_search() {
         }
 
         std::cout << "Distributed best move score: " << bestScore << std::endl;
-
+        MPI_Allreduce(MPI_IN_PLACE, ttBlock.data(), static_cast<int>(ttBlock.size()),
+                      MPI_BYTE, MPI_BOR, MPI_COMM_WORLD);
+        if (rank == 0) {
+            int merged = 0;
+            for (char c : ttBlock) if (c) ++merged;
+            std::cout << "Merged TT entries: " << merged << std::endl;
+        }
 #ifdef NIKOLA_USE_NCCL
         ncclCommDestroy(ncclComm);
 #endif
@@ -174,7 +182,8 @@ int distributed_search() {
             Result res{score, m};
             MPI_Send(&res, sizeof(Result), MPI_BYTE, 0, 1, MPI_COMM_WORLD);
         }
-
+        MPI_Allreduce(MPI_IN_PLACE, ttBlock.data(), static_cast<int>(ttBlock.size()),
+                      MPI_BYTE, MPI_BOR, MPI_COMM_WORLD);
 #ifdef NIKOLA_USE_NCCL
         ncclCommDestroy(ncclComm);
 #endif

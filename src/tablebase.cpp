@@ -19,6 +19,7 @@ extern "C" int tb_init(const char* path);
 
 // Probe wrapper implemented in tbprobe.cpp.
 namespace nikola { unsigned tbProbeWDL(const Board& b); }
+namespace nikola { int tbProbeDTZ(const Board& b); }
 
 namespace nikola {
 
@@ -69,6 +70,16 @@ int probeWDL(const Board& board) {
         case 0: return -1;  // loss
         default: return 2;  // unknown
     }
+}
+
+int probeDTZ(const Board& board) {
+    if (!tablebaseAvailable()) {
+        return 0;
+    }
+    if (nikola::countPieces(board) > 7) {
+        return 0;
+    }
+    return tbProbeDTZ(board);
 }
 
 } // namespace nikola

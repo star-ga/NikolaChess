@@ -7,7 +7,7 @@ An experimental, research-friendly chess engine with:
 - Alpha-beta search with common heuristics (iterative deepening, transposition table, move ordering, etc.)
 - Experimental distributed search prototype (MPI, optional NCCL) with
   local work-stealing fallback
-- PGN logging, Polyglot opening book and Syzygy tablebase support
+- PGN logging, Polyglot opening book with generation utilities, and Syzygy WDL/DTZ tablebase support
 
 > Status: GPU evaluation now runs through an asynchronous NNUE pipeline and
 > tablebases probe via the Fathom backend.  Distributed search features a
@@ -76,6 +76,6 @@ Engine supports TT sharding and CPU affinity controls; `TT_SHARDS` defaults to 6
 
 ## Roadmap (short)
 
-* Expand TensorRT backend and batching heuristics for the NNUE evaluator.
-* Add DTZ tablebase probing and richer book generation tools.
-* Extend distributed search to cluster environments with true TT merging.
+* Implement full TensorRT engine integration and advanced batching heuristics.
+* Enhance DTZ tablebase probing and opening book generators.
+* Further scale distributed search and transposition table merging.
