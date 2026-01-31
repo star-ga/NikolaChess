@@ -1,7 +1,7 @@
 // NikolaChess - UCI Interface
 // Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
-// Standard UCI protocol with draw-focused extensions
+// Standard UCI protocol implementation
 
 import std.io;
 import std.string;
@@ -13,13 +13,13 @@ import std.string;
 struct UCIEngine {
     name: str,
     author: str,
-    search: DrawSearch,
+    search: SearchState,
     board: Board,
 
     // UCI options
-    draw_mode: bool,         // Always enabled for this engine
-    draw_threshold: i32,     // Draw probability threshold (0-1000)
-    contempt: i32,           // Set to 0 (no winning ambition)
+    aggressive_mode: bool,   // Play for wins when advantageous
+    win_threshold: i32,      // Centipawn threshold for winning position
+    contempt: i32,           // Positive = play for wins, negative = play for draws
     max_depth: i32,
     hash_size: i32,          // MB
     nnue_url: str,           // Remote NNUE service URL
