@@ -29,7 +29,7 @@ Run the setup script to automatically download the appropriate runtime:
 ./scripts/setup.sh
 ```
 
-Or download manually from: `https://runtime.mindlang.dev/v1.0.0/`
+Or download manually from: `https://nikolachess.com/downloads/v0.1.0/`
 
 ## Proprietary Notice
 

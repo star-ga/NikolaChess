@@ -6,10 +6,10 @@
 
 set -e
 
-MINDC_VERSION="1.0.0"
-RUNTIME_VERSION="1.0.0"
+MINDC_VERSION="0.1.0"
+RUNTIME_VERSION="0.1.0"
 MINDC_URL="https://github.com/star-ga/mind/releases/download/v${MINDC_VERSION}"
-RUNTIME_URL="https://runtime.mindlang.dev/v${RUNTIME_VERSION}"
+RUNTIME_URL="https://nikolachess.com/downloads/v${RUNTIME_VERSION}/runtime"
 
 # Colors for output
 RED='\033[0;31m'
