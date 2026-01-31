@@ -242,7 +242,7 @@ fn wdl_is_draw(wdl: u8) -> bool {
 }
 
 // ============================================================================
-// DRAW-SEEKING SEARCH WITH WDL PRUNING
+// WDL SEARCH WITH PRUNING
 // ============================================================================
 
 fn wdl_search(
@@ -294,8 +294,8 @@ fn wdl_search(
         }
     }
 
-    // Order moves for draw-seeking
-    let ordered_moves = order_moves_for_draw(moves, board, probe.best_move, history);
+    // Order moves for best-first search
+    let ordered_moves = order_moves_wdl(moves, board, probe.best_move, history);
 
     let mut best_wdl = WDL_NOT_WINNING;  // FIX: Made mutable - Assume worst until proven otherwise
     let mut best_move = ordered_moves[0];  // FIX: Made mutable
@@ -397,10 +397,10 @@ fn can_force_repetition(board: Board, m: Move, history: &[u64]) -> bool {
 }
 
 // ============================================================================
-// MOVE ORDERING FOR DRAW-SEEKING
+// MOVE ORDERING FOR WDL SEARCH
 // ============================================================================
 
-fn order_moves_for_draw(moves: Vec<Move>, board: Board, tt_move: Move, history: &[u64]) -> Vec<Move> {
+fn order_moves_wdl(moves: Vec<Move>, board: Board, tt_move: Move, history: &[u64]) -> Vec<Move> {
     let mut scored: Vec<(Move, i32)> = Vec.new();
 
     for m in moves.iter() {
@@ -411,9 +411,9 @@ fn order_moves_for_draw(moves: Vec<Move>, board: Board, tt_move: Move, history: 
             score = 10000;
         }
 
-        // Repetition moves are GOLD for draw-seeking
-        if can_force_repetition(board, *m, history) {
-            score += 9000;
+        // Tactical moves get priority
+        if is_capture(*m) || gives_check(*m, board) {
+            score += 5000;
         }
 
         // Captures toward simplification

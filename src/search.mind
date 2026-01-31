@@ -204,11 +204,7 @@ fn tt_store(tt: &mut TranspositionTable, hash: u64, depth: i32, score: f32, best
 }
 
 // ============================================================================
-// DRAW-FIRST SEARCH ENGINE
-// ============================================================================
-
-// ============================================================================
-// DRAW-FIRST SEARCH ENGINE
+// SEARCH ENGINE
 // Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
@@ -674,7 +670,7 @@ fn negamax(
         }
     }
 
-    // Order moves for draw-seeking
+    // Order moves for best-first search
     order_moves(&mut moves, board, &s.tt, hash, tt_move);
 
     // ========================================
@@ -784,7 +780,7 @@ fn negamax(
 
         moves_searched += 1;
 
-        // We want HIGH draw scores (draws are good!)
+        // Update best score
         if needs_full_search && result.score > best_score {
             best_score = result.score;
             best_move = *m;
@@ -1091,7 +1087,6 @@ fn move_to_uci(m: Move) -> str {
 
 fn aspiration_search(s: &mut SearchState, board: Board, depth: i32, prev_score: f32) -> SearchResult {
     // Start with narrow window around previous score
-    // For draw-seeking: window around 0.5 (draw probability)
     let mut delta: f32 = 0.05;  // FIX: Made mutable
     let mut alpha = max_f32(0.0, prev_score - delta);
     let mut beta = min_f32(1.0, prev_score + delta);
