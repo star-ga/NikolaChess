@@ -37,7 +37,7 @@ fn init_lmr_table() -> [[i32; 64]; 64] {
 
     for depth in 1..64 {
         for move_num in 1..64 {
-            // Logarithmic reduction formula (Stockfish-style)
+            // Logarithmic reduction formula
             let reduction = (0.77 + math.ln(depth as f32) * math.ln(move_num as f32) / 2.36) as i32;
             table[depth][move_num] = reduction.min(LMR_MAX_REDUCTION);
         }

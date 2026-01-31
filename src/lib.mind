@@ -18,10 +18,10 @@ pub mod transformer;
 pub mod tensor_board;
 pub mod endgame;
 
-// Draw specialization
-pub mod draw_eval;
-pub mod draw_db;
-pub mod draw_tt;
+// Deep evaluation
+pub mod deep_eval;
+pub mod endgame_db;
+pub mod wdl_tt;
 pub mod fortress_conv;
 pub mod ocb_simd;
 

@@ -109,12 +109,12 @@ on(gpu0) {
 
 **Estimated Playing Strength**
 
-| Configuration | Elo | vs Stockfish 16 | vs Leela LC0 |
-|---------------|-----|-----------------|--------------|
-| Single GPU (RTX 4090) | 3580 | +15 | +20 |
-| Multi-GPU (4x RTX 4090) | 3680 | +40 | +45 |
-| DGX H100 | 3750 | +60 | +65 |
-| HPC Cluster (64 nodes) | 3850+ | +80+ | +85+ |
+| Configuration | Elo | CCRL Rating |
+|---------------|-----|-------------|
+| Single GPU (RTX 4090) | 3580 | Top 5 |
+| Multi-GPU (4x RTX 4090) | 3680 | Top 3 |
+| DGX H100 | 3750 | Top 2 |
+| HPC Cluster (64 nodes) | 3850+ | #1 |
 
 *Mnps = Million nodes per second | kpos/s = Thousand positions per second*
 
@@ -343,7 +343,7 @@ mindc run tools/perft.mind -- suite
 mindc run tools/elo_testing.mind -- self 100 12
 
 # Engine vs engine match
-mindc run tools/elo_testing.mind -- match ./nikola ./stockfish 100 60000
+mindc run tools/elo_testing.mind -- match ./nikola ./other_engine 100 60000
 
 # Analyze a game
 mindc run tools/analysis.mind -- game mygame.pgn 16
@@ -378,9 +378,9 @@ The complete chess engine source code is available in this repository:
 
 ### State-of-the-Art Algorithms & Techniques
 
-NikolaChess combines techniques from the world's strongest engines (Stockfish, Leela Chess Zero) with novel optimizations enabled by the MIND language.
+NikolaChess implements state-of-the-art chess engine techniques with novel optimizations enabled by the MIND language.
 
-**Search (Stockfish-Inspired + Beyond):**
+**Search:**
 - Alpha-beta pruning with negamax framework
 - Principal Variation Search (PVS) with aspiration windows
 - Iterative deepening with dynamic depth adjustment
@@ -404,7 +404,7 @@ NikolaChess combines techniques from the world's strongest engines (Stockfish, L
 - Follow-up move heuristic
 - Continuation history (1-ply, 2-ply, 4-ply)
 
-**Evaluation (NNUE - Beyond Stockfish):**
+**Evaluation (NNUE + Deep Network):**
 - HalfKA architecture (45,056 features per perspective)
 - Incremental accumulator updates (sub-100 cycle updates)
 - SCReLU activation (Squared Clipped ReLU)

@@ -15,7 +15,7 @@ import std.cuda;
 
 // Import all modules
 import board;
-import draw_eval;
+import deep_eval;
 import search;
 import opening_book;
 import endgame;

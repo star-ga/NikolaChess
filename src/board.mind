@@ -91,7 +91,7 @@ struct Board {
     // Pre-computed hash for transposition table
     hash: u64,
 
-    // Position history for repetition detection (critical for draw-seeking!)
+    // Position history for repetition detection
     history: Vec<u64>,
 }
 
@@ -358,7 +358,7 @@ fn to_tensor_batch(boards: Vec<Board>) -> tensor<f32, (B, 12, 8, 8)> {
 }
 
 // ============================================================================
-// DRAW DETECTION (Critical for draw-seeking engine!)
+// DRAW DETECTION
 // ============================================================================
 
 // Check if position can claim draw

@@ -1,82 +1,85 @@
-// NikolaChess - Draw Evaluation Neural Network
+// NikolaChess - Deep Neural Network Evaluation
 // Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
-// GPU-accelerated draw probability estimation
-// Uses MIND's CUDA backend for RTX acceleration
+// Deep residual network for GPU-accelerated position evaluation
+// Complements HalfKA NNUE for hybrid CPU+GPU search
 
 import std.tensor;
 import std.nn;
 import std.cuda;
 
 // ============================================================================
-// DRAW FEATURES
+// NETWORK CONFIGURATION
 // ============================================================================
 
-// Extra features beyond board position
-// These are critical for draw probability estimation
-struct DrawFeatures {
-    // Material features
-    material_balance: f32,       // Normalized to [-1, 1]
-    piece_count: f32,            // Total pieces normalized
-    pawn_count: f32,             // Fewer pawns = more drawish
+// Deep network architecture options
+const FILTERS: usize = 384;           // Channel width
+const RESIDUAL_BLOCKS: usize = 20;    // Network depth (20 residual blocks)
+const SE_RATIO: usize = 8;            // Squeeze-Excitation ratio
+const INPUT_PLANES: usize = 112;      // Input feature planes
 
-    // Structural features (9/10 importance)
-    same_colored_bishops: f32,   // 0 = OCB (drawish!), 1 = same color
-    opposite_colored_bishops: f32, // 1 = OCB (very drawish!)
-    blocked_pawns: f32,          // Blocked = fortress potential
-    pawn_symmetry: f32,          // Symmetric = drawish
+// Input planes breakdown (112 total):
+// - 12 planes x 8 history = 96 (piece positions for last 8 moves)
+// - 1 plane: side to move
+// - 4 planes: castling rights (KQkq)
+// - 1 plane: no-progress count (50-move rule)
+// - 8 planes: move count encoding
+// - 2 planes: all ones / all zeros
 
-    // King safety features (7/10 importance)
-    castling_rights: f32,        // More rights = more stable
-    king_distance: f32,          // Closer kings = endgame territory
-    king_safety_balance: f32,    // Equal safety = drawish
+// ============================================================================
+// SQUEEZE-EXCITATION BLOCK
+// ============================================================================
 
-    // Dynamic features (8/10 importance)
-    halfmove_clock: f32,         // Higher = closer to 50-move draw
-    repetition_risk: f32,        // Higher = more repetition potential
-    check_frequency: f32,        // More checks = perpetual potential
-
-    // Endgame features
-    fortress_score: f32,         // Detected fortress patterns
-    rook_endgame: f32,           // Rook endgames often draw
-    pawn_endgame: f32,           // Pure pawn endgames
-    tb_distance: f32,            // Distance to tablebase territory
-
-    // Position quality (8/10 importance)
-    perpetual_score: f32,        // Likelihood of perpetual check
-    center_control: f32,         // Balanced = more drawish
-    passed_pawns_diff: f32,      // Equal passed pawns = drawish
-    space_balance: f32,          // Equal space = drawish
+struct SEBlock {
+    fc1: nn.Linear[f32, (FILTERS, FILTERS / SE_RATIO)],
+    fc2: nn.Linear[f32, (FILTERS / SE_RATIO, FILTERS * 2)],
 }
 
-const NUM_FEATURES: i32 = 20;
-
 // ============================================================================
-// NEURAL NETWORK ARCHITECTURE
-// CNN + Residual Blocks + Value Head
+// RESIDUAL BLOCK WITH SE
 // ============================================================================
 
-struct DrawNetwork {
-    // Convolutional layers for board pattern recognition
-    // Input: 12x8x8 (piece planes) + 4x8x8 (meta planes) = 16x8x8
-    conv_input: nn.Conv2d[f32, (16, 256), (3, 3)],
-    bn_input: nn.BatchNorm2d[f32, 256],
+struct ResBlock {
+    conv1: nn.Conv2d[f32, (FILTERS, FILTERS), (3, 3)],
+    bn1: nn.BatchNorm2d[f32, FILTERS],
+    conv2: nn.Conv2d[f32, (FILTERS, FILTERS), (3, 3)],
+    bn2: nn.BatchNorm2d[f32, FILTERS],
+    se: SEBlock,
+}
 
-    // Residual blocks
-    res_blocks: [ResBlock; 8],
+// ============================================================================
+// DEEP NEURAL NETWORK
+// ============================================================================
 
-    // Feature integration layer
-    feature_fc: nn.Linear[f32, (NUM_FEATURES, 64)],
+struct DeepNetwork {
+    // Input convolution
+    input_conv: nn.Conv2d[f32, (INPUT_PLANES, FILTERS), (3, 3)],
+    input_bn: nn.BatchNorm2d[f32, FILTERS],
 
-    // Value head for draw probability
-    value_conv: nn.Conv2d[f32, (256, 32), (1, 1)],
+    // Residual tower (20 blocks)
+    res_tower: [ResBlock; RESIDUAL_BLOCKS],
+
+    // Policy head (move probabilities)
+    policy_conv1: nn.Conv2d[f32, (FILTERS, FILTERS), (1, 1)],
+    policy_bn: nn.BatchNorm2d[f32, FILTERS],
+    policy_conv2: nn.Conv2d[f32, (FILTERS, 80), (1, 1)],  // 80 = move encoding
+    policy_fc: nn.Linear[f32, (80 * 64, 1858)],           // 1858 possible moves
+
+    // Value head (position evaluation)
+    value_conv: nn.Conv2d[f32, (FILTERS, 32), (1, 1)],
     value_bn: nn.BatchNorm2d[f32, 32],
-    value_fc1: nn.Linear[f32, (32 * 8 * 8 + 64, 256)],  // +64 for features
-    value_fc2: nn.Linear[f32, (256, 1)],
+    value_fc1: nn.Linear[f32, (32 * 64, 128)],
+    value_fc2: nn.Linear[f32, (128, 3)],  // WDL output (win/draw/loss)
 
-    // Policy head for move selection (draw-oriented)
-    policy_conv: nn.Conv2d[f32, (256, 73), (1, 1)],  // 73 = move encoding
+    // Moves Left Head (game length prediction)
+    mlh_conv: nn.Conv2d[f32, (FILTERS, 8), (1, 1)],
+    mlh_bn: nn.BatchNorm2d[f32, 8],
+    mlh_fc1: nn.Linear[f32, (8 * 64, 128)],
+    mlh_fc2: nn.Linear[f32, (128, 1)],
 }
+
+// Legacy alias for compatibility
+type DrawNetwork = DeepNetwork;
 
 struct ResBlock {
     conv1: nn.Conv2d[f32, (256, 256), (3, 3)],
