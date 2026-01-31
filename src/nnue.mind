@@ -207,7 +207,7 @@ fn wdl_to_cp(win: i32, draw: i32, loss: i32) -> i32 {
     (expected * 400) / 1000
 }
 
-// Load weights from .nknn file
+// Load weights from .nknn file with v1/v2 version selector
 pub fn load_weights(path: &str) -> Result<NNUEWeights, Error> {
     let file = std::fs::read(path)?;
     let mut cursor = 0;
@@ -219,21 +219,126 @@ pub fn load_weights(path: &str) -> Result<NNUEWeights, Error> {
     }
 
     let version = read_u32(&file, &mut cursor);
-    if version != 2 {
-        return Err(Error::UnsupportedVersion);
-    }
 
-    // Read weights
+    // Version selector - automatically detect and load appropriate format
+    match version {
+        1 => load_weights_v1(&file, &mut cursor),
+        2 => load_weights_v2(&file, &mut cursor),
+        _ => Err(Error::UnsupportedVersion(version)),
+    }
+}
+
+// v1 format: HalfKP, 40960 features, 256 L1, single hidden layer
+fn load_weights_v1(file: &[u8], cursor: &mut usize) -> Result<NNUEWeights, Error> {
+    println!("Loading NNUE v1 format (HalfKP, legacy)");
+
+    // v1 header: architecture (16 bytes), feature_size, l1_size
+    let _arch = read_bytes(file, cursor, 16);
+    let feature_size = read_u32(file, cursor) as usize;  // 40960
+    let l1_size = read_u32(file, cursor) as usize;       // 256
+
+    // Read v1 weights and convert to v2 structure
+    let ft_weights_v1: tensor<i16, (40960, 256)> = read_tensor(file, cursor);
+    let ft_biases_v1: tensor<i16, (256,)> = read_tensor(file, cursor);
+    let l1_weights_v1: tensor<i8, (512, 32)> = read_tensor(file, cursor);
+    let l1_biases_v1: tensor<i32, (32,)> = read_tensor(file, cursor);
+    let output_weights_v1: tensor<i8, (32, 1)> = read_tensor(file, cursor);
+    let output_bias_v1: i32 = read_i32(file, cursor);
+
+    // Convert to v2 structure with padding/expansion
     let weights = NNUEWeights {
-        ft_weights: read_tensor(&file, &mut cursor),
-        ft_biases: read_tensor(&file, &mut cursor),
-        l1_weights: read_tensor(&file, &mut cursor),
-        l1_biases: read_tensor(&file, &mut cursor),
-        l2_weights: read_tensor(&file, &mut cursor),
-        l2_biases: read_tensor(&file, &mut cursor),
-        output_weights: read_tensor(&file, &mut cursor),
-        output_biases: read_tensor(&file, &mut cursor),
+        ft_weights: expand_ft_weights(ft_weights_v1),      // 40960x256 -> 40960x1024
+        ft_biases: expand_ft_biases(ft_biases_v1),         // 256 -> 1024
+        l1_weights: convert_l1_weights(l1_weights_v1),     // 512x32 -> 2048x16
+        l1_biases: convert_l1_biases(l1_biases_v1),        // 32 -> 16
+        l2_weights: identity_l2(),                          // Identity for missing layer
+        l2_biases: tensor::zeros(),
+        output_weights: expand_output(output_weights_v1),   // 32x1 -> 32x3 (WDL)
+        output_biases: tensor::from_array([output_bias_v1, 0, 0]),
     };
 
     Ok(weights)
+}
+
+// v2 format: HalfKA, 45056 features, 1024 L1, two hidden layers, WDL head
+fn load_weights_v2(file: &[u8], cursor: &mut usize) -> Result<NNUEWeights, Error> {
+    println!("Loading NNUE v2 format (HalfKA, current)");
+
+    // v2 header: architecture, sizes, quantization, flags
+    let _arch = read_bytes(file, cursor, 16);
+    let _feature_size = read_u32(file, cursor);  // 45056
+    let _l1_size = read_u32(file, cursor);       // 1024
+    let _l2_size = read_u32(file, cursor);       // 16
+    let _l3_size = read_u32(file, cursor);       // 32
+    let _quant = read_bytes(file, cursor, 8);
+    let _flags = read_u32(file, cursor);
+    let _reserved = read_bytes(file, cursor, 12);
+
+    // Read v2 weights directly
+    let weights = NNUEWeights {
+        ft_weights: read_tensor(file, cursor),
+        ft_biases: read_tensor(file, cursor),
+        l1_weights: read_tensor(file, cursor),
+        l1_biases: read_tensor(file, cursor),
+        l2_weights: read_tensor(file, cursor),
+        l2_biases: read_tensor(file, cursor),
+        output_weights: read_tensor(file, cursor),
+        output_biases: read_tensor(file, cursor),
+    };
+
+    Ok(weights)
+}
+
+// Helper functions for v1 -> v2 conversion
+fn expand_ft_weights(v1: tensor<i16, (40960, 256)>) -> tensor<i16, (HALF_DIMS, L1_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..40960 {
+        for j in 0..256 {
+            out[i][j] = v1[i][j];
+        }
+    }
+    out
+}
+
+fn expand_ft_biases(v1: tensor<i16, (256,)>) -> tensor<i16, (L1_SIZE,)> {
+    let mut out = tensor::zeros();
+    for i in 0..256 {
+        out[i] = v1[i];
+    }
+    out
+}
+
+fn convert_l1_weights(v1: tensor<i8, (512, 32)>) -> tensor<i8, (L1_SIZE * 2, L2_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..512 {
+        for j in 0..16.min(32) {
+            out[i][j] = v1[i][j];
+        }
+    }
+    out
+}
+
+fn convert_l1_biases(v1: tensor<i32, (32,)>) -> tensor<i32, (L2_SIZE,)> {
+    let mut out = tensor::zeros();
+    for i in 0..16 {
+        out[i] = v1[i];
+    }
+    out
+}
+
+fn identity_l2() -> tensor<i8, (L2_SIZE, L3_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..L2_SIZE.min(L3_SIZE) {
+        out[i][i] = 64;  // Identity with scale
+    }
+    out
+}
+
+fn expand_output(v1: tensor<i8, (32, 1)>) -> tensor<i8, (L3_SIZE, 3)> {
+    let mut out = tensor::zeros();
+    for i in 0..32 {
+        out[i][0] = v1[i][0];  // Win channel
+        out[i][2] = -v1[i][0]; // Loss channel (negated)
+    }
+    out
 }
