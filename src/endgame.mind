@@ -1,0 +1,555 @@
+// NikolaChess - Endgame Handling
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// Tablebase integration + Fortress detection
+
+import std.tensor;
+import std.io;
+import std.cuda;
+
+// ============================================================================
+// TABLEBASE RESULT
+// ============================================================================
+
+struct TablebaseResult {
+    wdl: i32,           // Win/Draw/Loss: 2=win, 1=cursed win, 0=draw, -1=blessed loss, -2=loss
+    dtz: i32,           // Distance to zeroing (captures/pawn moves)
+    best_move: Move,
+}
+
+fn is_draw(result: &TablebaseResult) -> bool {
+    return result.wdl == 0;
+}
+
+fn is_winning(result: &TablebaseResult) -> bool {
+    return result.wdl > 0;
+}
+
+fn is_losing(result: &TablebaseResult) -> bool {
+    return result.wdl < 0;
+}
+
+// ============================================================================
+// SYZYGY TABLEBASE (7-piece)
+// ============================================================================
+
+struct Tablebase {
+    path: str,
+    max_pieces: i32,
+    loaded: bool,
+    // In practice, this would use FFI to call Syzygy C library
+}
+
+fn create_tablebase(path: str) -> Tablebase {
+    return Tablebase {
+        path: path,
+        max_pieces: 7,  // 7-man Syzygy
+        loaded: false,
+    };
+}
+
+fn tb_init(tb: &mut Tablebase) -> bool {
+    // Initialize Syzygy tablebase
+    // This would call external C library via FFI
+    if io.exists(tb.path) {
+        tb.loaded = true;
+        print("Tablebase loaded from:", tb.path);
+        return true;
+    }
+    return false;
+}
+
+fn tb_probe(tb: &Tablebase, board: Board) -> Option<TablebaseResult> {
+    if !tb.loaded {
+        return None;
+    }
+
+    // Count pieces
+    let piece_count = popcount(board.occupancy[0] | board.occupancy[1]);
+
+    if piece_count > tb.max_pieces {
+        return None;
+    }
+
+    // Probe tablebase (this would call external library)
+    // For now, simulate with known endgames
+    if let Some(result) = probe_known_endgame(board) {
+        return Some(result);
+    }
+
+    // Actual Syzygy probe would go here
+    // return syzygy_probe_wdl(board);
+    return None;
+}
+
+// ============================================================================
+// KNOWN ENDGAME PATTERNS
+// ============================================================================
+
+fn probe_known_endgame(board: Board) -> Option<TablebaseResult> {
+    let white_pieces = board.occupancy[0];
+    let black_pieces = board.occupancy[1];
+    let white_count = popcount(white_pieces);
+    let black_count = popcount(black_pieces);
+    let total = white_count + black_count;
+
+    // K vs K - always draw
+    if white_count == 1 && black_count == 1 {
+        return Some(TablebaseResult {
+            wdl: 0,
+            dtz: 0,
+            best_move: MOVE_NULL,
+        });
+    }
+
+    // K+minor vs K - always draw
+    if total == 3 {
+        if is_kn_vs_k(board) || is_kb_vs_k(board) {
+            return Some(TablebaseResult {
+                wdl: 0,
+                dtz: 0,
+                best_move: MOVE_NULL,
+            });
+        }
+    }
+
+    // K+N+N vs K - cannot force mate
+    if is_knn_vs_k(board) {
+        return Some(TablebaseResult {
+            wdl: 0,
+            dtz: 0,
+            best_move: MOVE_NULL,
+        });
+    }
+
+    // K+B vs K+B (opposite colored) - always draw
+    if is_kb_vs_kb_opposite(board) {
+        return Some(TablebaseResult {
+            wdl: 0,
+            dtz: 0,
+            best_move: MOVE_NULL,
+        });
+    }
+
+    // K+R vs K+R - NOT always a draw! Depends on position.
+    // Do not return forced draw here; let search evaluate normally.
+    // (Removed: was incorrectly returning draw for all KR vs KR positions)
+
+    // K+P vs K - depends on position (simplified)
+    if let Some(result) = probe_kp_vs_k(board) {
+        return Some(result);
+    }
+
+    return None;
+}
+
+fn is_kn_vs_k(board: Board) -> bool {
+    let wn = popcount(board.pieces[KNIGHT + WHITE]);
+    let bn = popcount(board.pieces[KNIGHT + BLACK]);
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    return (w_total == 2 && wn == 1 && b_total == 1) ||
+           (b_total == 2 && bn == 1 && w_total == 1);
+}
+
+fn is_kb_vs_k(board: Board) -> bool {
+    let wb = popcount(board.pieces[BISHOP + WHITE]);
+    let bb = popcount(board.pieces[BISHOP + BLACK]);
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    return (w_total == 2 && wb == 1 && b_total == 1) ||
+           (b_total == 2 && bb == 1 && w_total == 1);
+}
+
+fn is_knn_vs_k(board: Board) -> bool {
+    let wn = popcount(board.pieces[KNIGHT + WHITE]);
+    let bn = popcount(board.pieces[KNIGHT + BLACK]);
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    return (w_total == 3 && wn == 2 && b_total == 1) ||
+           (b_total == 3 && bn == 2 && w_total == 1);
+}
+
+fn is_kb_vs_kb_opposite(board: Board) -> bool {
+    let wb = board.pieces[BISHOP + WHITE];
+    let bb = board.pieces[BISHOP + BLACK];
+
+    if popcount(wb) != 1 || popcount(bb) != 1 {
+        return false;
+    }
+
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    if w_total != 2 || b_total != 2 {
+        return false;
+    }
+
+    // Check opposite colors
+    let wb_sq = trailing_zeros(wb);
+    let bb_sq = trailing_zeros(bb);
+    let wb_color = (wb_sq / 8 + wb_sq % 8) % 2;
+    let bb_color = (bb_sq / 8 + bb_sq % 8) % 2;
+
+    return wb_color != bb_color;
+}
+
+fn is_kr_vs_kr(board: Board) -> bool {
+    let wr = popcount(board.pieces[ROOK + WHITE]);
+    let br = popcount(board.pieces[ROOK + BLACK]);
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    return w_total == 2 && wr == 1 && b_total == 2 && br == 1;
+}
+
+fn probe_kp_vs_k(board: Board) -> Option<TablebaseResult> {
+    let wp = popcount(board.pieces[PAWN + WHITE]);
+    let bp = popcount(board.pieces[PAWN + BLACK]);
+    let w_total = popcount(board.occupancy[0]);
+    let b_total = popcount(board.occupancy[1]);
+
+    // K+P vs K
+    if w_total == 2 && wp == 1 && b_total == 1 {
+        // Check for draw with wrong rook pawn
+        if is_wrong_rook_pawn(board, WHITE) {
+            return Some(TablebaseResult {
+                wdl: 0,
+                dtz: 0,
+                best_move: MOVE_NULL,
+            });
+        }
+    }
+
+    if b_total == 2 && bp == 1 && w_total == 1 {
+        if is_wrong_rook_pawn(board, BLACK / 6) {
+            return Some(TablebaseResult {
+                wdl: 0,
+                dtz: 0,
+                best_move: MOVE_NULL,
+            });
+        }
+    }
+
+    return None;
+}
+
+fn is_wrong_rook_pawn(board: Board, color: i32) -> bool {
+    // Check if rook pawn with wrong colored bishop
+    // (This would need bishop presence check in extended endgames)
+    let pawns = if color == WHITE { board.pieces[PAWN] } else { board.pieces[PAWN + BLACK] };
+
+    // Check if pawn is on a-file or h-file
+    let a_file = 0x0101010101010101;
+    let h_file = 0x8080808080808080;
+
+    return (pawns & a_file) != 0 || (pawns & h_file) != 0;
+}
+
+// ============================================================================
+// FORTRESS DETECTION
+// ============================================================================
+
+struct FortressDetector {
+    // Known fortress patterns
+    patterns: Vec<FortressPattern>,
+}
+
+struct FortressPattern {
+    name: str,
+    detector: fn(Board) -> bool,
+    draw_prob: f32,
+}
+
+fn create_fortress_detector() -> FortressDetector {
+    let patterns = Vec.new();
+
+    // Add known fortress patterns
+    patterns.push(FortressPattern {
+        name: "philidor",
+        detector: detect_philidor,
+        draw_prob: 1.0,
+    });
+
+    patterns.push(FortressPattern {
+        name: "bishop_wrong_pawn",
+        detector: detect_bishop_wrong_pawn,
+        draw_prob: 1.0,
+    });
+
+    patterns.push(FortressPattern {
+        name: "blocked_pawns",
+        detector: detect_blocked_pawn_fortress,
+        draw_prob: 0.95,
+    });
+
+    patterns.push(FortressPattern {
+        name: "queen_fortress",
+        detector: detect_queen_fortress,
+        draw_prob: 0.90,
+    });
+
+    return FortressDetector { patterns: patterns };
+}
+
+fn detect_fortress(detector: &FortressDetector, board: Board) -> Option<f32> {
+    for pattern in detector.patterns.iter() {
+        if (pattern.detector)(board) {
+            return Some(pattern.draw_prob);
+        }
+    }
+    return None;
+}
+
+// ============================================================================
+// FORTRESS PATTERN DETECTORS
+// ============================================================================
+
+// Philidor position: R+P vs R
+fn detect_philidor(board: Board) -> bool {
+    let wr = popcount(board.pieces[ROOK + WHITE]);
+    let br = popcount(board.pieces[ROOK + BLACK]);
+    let wp = popcount(board.pieces[PAWN + WHITE]);
+    let bp = popcount(board.pieces[PAWN + BLACK]);
+
+    if !((wr == 1 && wp == 1 && br == 1 && bp == 0) ||
+         (br == 1 && bp == 1 && wr == 1 && wp == 0)) {
+        return false;
+    }
+
+    // Check if defending rook is on 3rd/6th rank (Philidor position)
+    let defending_rook = if wp == 1 { board.pieces[ROOK + BLACK] } else { board.pieces[ROOK + WHITE] };
+    let rook_sq = trailing_zeros(defending_rook);
+    let rook_rank = rook_sq / 8;
+
+    // Philidor: rook on 3rd rank for black, 6th rank for white
+    if wp == 1 && rook_rank == 5 {  // Black rook on 6th
+        return true;
+    }
+    if bp == 1 && rook_rank == 2 {  // White rook on 3rd
+        return true;
+    }
+
+    return false;
+}
+
+// Bishop + wrong rook pawn
+fn detect_bishop_wrong_pawn(board: Board) -> bool {
+    let wb = popcount(board.pieces[BISHOP + WHITE]);
+    let bb = popcount(board.pieces[BISHOP + BLACK]);
+    let wp = popcount(board.pieces[PAWN + WHITE]);
+    let bp = popcount(board.pieces[PAWN + BLACK]);
+
+    // K+B+P vs K with rook pawn
+    if wb == 1 && wp >= 1 && bb == 0 && bp == 0 {
+        let bishop = board.pieces[BISHOP + WHITE];
+        let pawns = board.pieces[PAWN + WHITE];
+
+        // Check if all pawns are rook pawns
+        let a_file = 0x0101010101010101;
+        let h_file = 0x8080808080808080;
+
+        if (pawns & ~(a_file | h_file)) == 0 {
+            // All pawns on a/h file
+            let bishop_sq = trailing_zeros(bishop);
+            let bishop_color = (bishop_sq / 8 + bishop_sq % 8) % 2;
+
+            // Check if bishop is wrong color for promotion square
+            let is_a_pawn = (pawns & a_file) != 0;
+            let is_h_pawn = (pawns & h_file) != 0;
+
+            // a8 is dark (0), h8 is light (1)
+            if is_a_pawn && bishop_color == 1 {  // Light bishop, a-pawn
+                return true;
+            }
+            if is_h_pawn && bishop_color == 0 {  // Dark bishop, h-pawn
+                return true;
+            }
+        }
+    }
+
+    // Mirror for black
+    if bb == 1 && bp >= 1 && wb == 0 && wp == 0 {
+        let bishop = board.pieces[BISHOP + BLACK];
+        let pawns = board.pieces[PAWN + BLACK];
+
+        let a_file = 0x0101010101010101;
+        let h_file = 0x8080808080808080;
+
+        if (pawns & ~(a_file | h_file)) == 0 {
+            let bishop_sq = trailing_zeros(bishop);
+            let bishop_color = (bishop_sq / 8 + bishop_sq % 8) % 2;
+
+            let is_a_pawn = (pawns & a_file) != 0;
+            let is_h_pawn = (pawns & h_file) != 0;
+
+            // a1 is light (1), h1 is dark (0)
+            if is_a_pawn && bishop_color == 0 {
+                return true;
+            }
+            if is_h_pawn && bishop_color == 1 {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// Blocked pawn fortress
+fn detect_blocked_pawn_fortress(board: Board) -> bool {
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    // Count directly blocked pawns
+    let blocked_white = popcount(wp & (bp >> 8));
+    let blocked_black = popcount(bp & (wp << 8));
+    let total_blocked = blocked_white + blocked_black;
+
+    // If most pawns are blocked, likely fortress
+    let total_pawns = popcount(wp) + popcount(bp);
+    if total_pawns >= 4 && total_blocked >= total_pawns - 2 {
+        return true;
+    }
+
+    return false;
+}
+
+// Queen vs piece fortress
+fn detect_queen_fortress(board: Board) -> bool {
+    let wq = popcount(board.pieces[QUEEN + WHITE]);
+    let bq = popcount(board.pieces[QUEEN + BLACK]);
+
+    // Q vs R+B or Q vs R+N
+    if wq == 1 && bq == 0 {
+        let br = popcount(board.pieces[ROOK + BLACK]);
+        let bb = popcount(board.pieces[BISHOP + BLACK]);
+        let bn = popcount(board.pieces[KNIGHT + BLACK]);
+
+        if br == 1 && (bb == 1 || bn == 1) {
+            // Check if defending king is safe
+            let bk = trailing_zeros(board.pieces[KING + BLACK]);
+            let bk_rank = bk / 8;
+            let bk_file = bk % 8;
+
+            // King in corner with pieces nearby = fortress
+            if (bk_rank == 0 || bk_rank == 7) && (bk_file == 0 || bk_file == 7) {
+                return true;
+            }
+        }
+    }
+
+    // Mirror for black queen
+    if bq == 1 && wq == 0 {
+        let wr = popcount(board.pieces[ROOK + WHITE]);
+        let wb = popcount(board.pieces[BISHOP + WHITE]);
+        let wn = popcount(board.pieces[KNIGHT + WHITE]);
+
+        if wr == 1 && (wb == 1 || wn == 1) {
+            let wk = trailing_zeros(board.pieces[KING + WHITE]);
+            let wk_rank = wk / 8;
+            let wk_file = wk % 8;
+
+            if (wk_rank == 0 || wk_rank == 7) && (wk_file == 0 || wk_file == 7) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// SIMPLIFICATION STRATEGY
+// Always simplify when draw probability > 0.8
+// ============================================================================
+
+fn should_simplify(board: Board, draw_prob: f32) -> bool {
+    // Always prefer simplification when:
+    // 1. We have high draw probability (> 0.8)
+    // 2. Material advantage is small (< 1 pawn)
+    // 3. We're heading toward tablebase territory
+
+    if draw_prob > 0.8 {
+        return true;
+    }
+
+    let balance = abs(material_balance(board));
+    if balance <= 100 {  // <= 1 pawn
+        return true;
+    }
+
+    // Check if close to tablebase
+    let piece_count = popcount(board.occupancy[0] | board.occupancy[1]);
+    if piece_count <= 8 {  // 1 trade away from 7-man
+        return true;
+    }
+
+    return false;
+}
+
+fn find_simplifying_move(board: Board, moves: &Vec<Move>) -> Option<Move> {
+    // Find best simplifying capture
+    let mut best_trade = None;  // FIX: Made mutable
+    let mut best_value = 0;  // FIX: Made mutable
+
+    for m in moves.iter() {
+        if !is_capture(*m) {
+            continue;
+        }
+
+        let capture_value = piece_value(move_capture(*m));
+        let moved_value = piece_value(move_piece(*m) % 6);
+
+        // Equal or favorable trade
+        if capture_value >= moved_value {
+            let trade_value = capture_value + moved_value;
+            if trade_value > best_value {
+                best_value = trade_value;
+                best_trade = Some(*m);
+            }
+        }
+    }
+
+    return best_trade;
+}
+
+// ============================================================================
+// ENDGAME EVALUATION ADJUSTMENTS
+// ============================================================================
+
+fn adjust_eval_for_endgame(board: Board, base_eval: f32) -> f32 {
+    let mut adjusted = base_eval;  // FIX: Made mutable
+
+    // Bonus for opposite-colored bishops
+    if detect_opposite_colored_bishops(board) {
+        adjusted = adjusted * 0.5 + 0.5;  // Shift toward draw
+    }
+
+    // Bonus for rook endgames (often drawn)
+    if is_rook_endgame(board) > 0.5 {
+        adjusted = adjusted * 0.7 + 0.3;
+    }
+
+    // Bonus for fortress patterns
+    if detect_blocked_pawn_fortress(board) {
+        adjusted = adjusted * 0.6 + 0.4;
+    }
+
+    // Penalty for passed pawns (can lead to decisive games)
+    let passed_diff = count_passed_pawns_diff(board);
+    if passed_diff > 0 {
+        adjusted = adjusted * (1.0 - passed_diff * 0.05);
+    }
+
+    return clamp(adjusted, 0.0, 1.0);
+}
+
+fn clamp(x: f32, min_val: f32, max_val: f32) -> f32 {
+    if x < min_val { return min_val; }
+    if x > max_val { return max_val; }
+    return x;
+}

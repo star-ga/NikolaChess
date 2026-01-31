@@ -1,0 +1,239 @@
+// NNUE Neural Network Evaluation - Pure Mind Implementation
+// GPU-accelerated via MIND Runtime
+
+use std::simd;
+use runtime::tensor;
+use runtime::cuda;
+
+// HalfKA feature dimensions
+const HALF_DIMS: usize = 40960;  // 64 * 640 (king square * piece features)
+const L1_SIZE: usize = 1024;
+const L2_SIZE: usize = 16;
+const L3_SIZE: usize = 32;
+
+// Network weights structure
+struct NNUEWeights {
+    // Feature transformer
+    ft_weights: tensor<i16, (HALF_DIMS, L1_SIZE)>,
+    ft_biases: tensor<i16, (L1_SIZE,)>,
+
+    // Hidden layers
+    l1_weights: tensor<i8, (L1_SIZE * 2, L2_SIZE)>,
+    l1_biases: tensor<i32, (L2_SIZE,)>,
+
+    l2_weights: tensor<i8, (L2_SIZE, L3_SIZE)>,
+    l2_biases: tensor<i32, (L3_SIZE,)>,
+
+    // Output layer with WDL head
+    output_weights: tensor<i8, (L3_SIZE, 3)>,
+    output_biases: tensor<i32, (3,)>,
+}
+
+// Accumulator for incremental updates
+struct Accumulator {
+    white: tensor<i16, (L1_SIZE,)>,
+    black: tensor<i16, (L1_SIZE,)>,
+    computed: bool,
+}
+
+impl Accumulator {
+    fn new() -> Self {
+        Accumulator {
+            white: tensor::zeros(),
+            black: tensor::zeros(),
+            computed: false,
+        }
+    }
+
+    fn refresh(&mut self, weights: &NNUEWeights, features: &[u16]) {
+        // Reset to biases
+        self.white = weights.ft_biases.clone();
+        self.black = weights.ft_biases.clone();
+
+        // Add active features using SIMD
+        simd::parallel_for(features) |idx| {
+            let white_idx = idx as usize;
+            let black_idx = flip_feature(idx) as usize;
+
+            self.white += weights.ft_weights[white_idx];
+            self.black += weights.ft_weights[black_idx];
+        }
+
+        self.computed = true;
+    }
+
+    fn update_add(&mut self, weights: &NNUEWeights, feature: u16) {
+        let white_idx = feature as usize;
+        let black_idx = flip_feature(feature) as usize;
+
+        self.white += weights.ft_weights[white_idx];
+        self.black += weights.ft_weights[black_idx];
+    }
+
+    fn update_sub(&mut self, weights: &NNUEWeights, feature: u16) {
+        let white_idx = feature as usize;
+        let black_idx = flip_feature(feature) as usize;
+
+        self.white -= weights.ft_weights[white_idx];
+        self.black -= weights.ft_weights[black_idx];
+    }
+}
+
+// SCReLU activation (Squared Clipped ReLU)
+#[inline]
+fn screlu(x: i16) -> i32 {
+    let clipped = x.clamp(0, 127) as i32;
+    clipped * clipped
+}
+
+// Forward pass through the network
+fn forward(acc: &Accumulator, weights: &NNUEWeights, stm: Color) -> i32 {
+    // Get perspectives based on side to move
+    let (us, them) = if stm == Color::White {
+        (&acc.white, &acc.black)
+    } else {
+        (&acc.black, &acc.white)
+    };
+
+    // L1: Apply SCReLU and concatenate perspectives
+    let mut l1_out: tensor<i32, (L1_SIZE * 2,)> = tensor::zeros();
+
+    simd::parallel_for(0..L1_SIZE) |i| {
+        l1_out[i] = screlu(us[i]);
+        l1_out[i + L1_SIZE] = screlu(them[i]);
+    }
+
+    // L2: Matrix multiply + bias
+    let l2_input = tensor::matmul(l1_out, weights.l1_weights);
+    let mut l2_out: tensor<i32, (L2_SIZE,)> = tensor::zeros();
+
+    simd::parallel_for(0..L2_SIZE) |i| {
+        let val = (l2_input[i] + weights.l1_biases[i]) >> 6;
+        l2_out[i] = screlu(val.clamp(-32768, 32767) as i16);
+    }
+
+    // L3: Matrix multiply + bias
+    let l3_input = tensor::matmul(l2_out, weights.l2_weights);
+    let mut l3_out: tensor<i32, (L3_SIZE,)> = tensor::zeros();
+
+    simd::parallel_for(0..L3_SIZE) |i| {
+        let val = (l3_input[i] + weights.l2_biases[i]) >> 6;
+        l3_out[i] = screlu(val.clamp(-32768, 32767) as i16);
+    }
+
+    // Output: WDL head
+    let output = tensor::matmul(l3_out, weights.output_weights);
+    let win = output[0] + weights.output_biases[0];
+    let draw = output[1] + weights.output_biases[1];
+    let loss = output[2] + weights.output_biases[2];
+
+    // Convert WDL to centipawns
+    wdl_to_cp(win, draw, loss)
+}
+
+// GPU batch evaluation
+fn batch_eval(
+    positions: &[Board],
+    weights: &NNUEWeights,
+    results: &mut [i32]
+) {
+    on(cuda::gpu0) {
+        parallel for i in 0..positions.len() {
+            let board = &positions[i];
+            let features = extract_features(board);
+
+            let mut acc = Accumulator::new();
+            acc.refresh(weights, &features);
+
+            results[i] = forward(&acc, weights, board.side_to_move());
+        }
+    }
+}
+
+// Feature extraction helpers
+fn extract_features(board: &Board) -> Vec<u16> {
+    let mut features = Vec::with_capacity(32);
+    let white_king = board.king_square(Color::White);
+    let black_king = board.king_square(Color::Black);
+
+    for sq in 0..64 {
+        if let Some(piece) = board.piece_on(sq) {
+            let white_feature = halfka_index(white_king, sq, piece);
+            let black_feature = halfka_index(black_king.flip(), sq.flip(), piece.flip());
+            features.push(white_feature);
+            features.push(black_feature);
+        }
+    }
+
+    features
+}
+
+fn halfka_index(king_sq: Square, piece_sq: Square, piece: Piece) -> u16 {
+    let piece_type = piece.piece_type() as u16;
+    let color = piece.color() as u16;
+    let piece_idx = piece_type * 2 + color;
+
+    (king_sq as u16) * 640 + (piece_sq as u16) * 10 + piece_idx
+}
+
+fn flip_feature(feature: u16) -> u16 {
+    // Flip perspective for black
+    let king_sq = feature / 640;
+    let rest = feature % 640;
+    let piece_sq = rest / 10;
+    let piece_idx = rest % 10;
+
+    // Flip squares vertically
+    let flipped_king = king_sq ^ 56;
+    let flipped_piece = piece_sq ^ 56;
+    // Flip piece color
+    let flipped_idx = piece_idx ^ 1;
+
+    flipped_king * 640 + flipped_piece * 10 + flipped_idx
+}
+
+fn wdl_to_cp(win: i32, draw: i32, loss: i32) -> i32 {
+    // Softmax normalization
+    let total = win + draw + loss;
+    if total == 0 {
+        return 0;
+    }
+
+    let win_prob = (win * 1000) / total;
+    let loss_prob = (loss * 1000) / total;
+
+    // Convert to centipawns using logistic curve
+    let expected = win_prob - loss_prob;
+    (expected * 400) / 1000
+}
+
+// Load weights from .nknn file
+pub fn load_weights(path: &str) -> Result<NNUEWeights, Error> {
+    let file = std::fs::read(path)?;
+    let mut cursor = 0;
+
+    // Parse header
+    let magic = read_u32(&file, &mut cursor);
+    if magic != 0x4E4B4E4E {  // "NKNN"
+        return Err(Error::InvalidFormat);
+    }
+
+    let version = read_u32(&file, &mut cursor);
+    if version != 2 {
+        return Err(Error::UnsupportedVersion);
+    }
+
+    // Read weights
+    let weights = NNUEWeights {
+        ft_weights: read_tensor(&file, &mut cursor),
+        ft_biases: read_tensor(&file, &mut cursor),
+        l1_weights: read_tensor(&file, &mut cursor),
+        l1_biases: read_tensor(&file, &mut cursor),
+        l2_weights: read_tensor(&file, &mut cursor),
+        l2_biases: read_tensor(&file, &mut cursor),
+        output_weights: read_tensor(&file, &mut cursor),
+        output_biases: read_tensor(&file, &mut cursor),
+    };
+
+    Ok(weights)
+}

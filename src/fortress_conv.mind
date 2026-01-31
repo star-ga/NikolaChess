@@ -1,0 +1,436 @@
+// NikolaChess - Tensor-Based Fortress Convolution
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// Parallel bitwise convolution for draw pattern detection
+
+import std.tensor;
+import std.cuda;
+import std.bit;
+import board;
+
+// ============================================================================
+// FORTRESS PATTERN CONSTANTS
+// ============================================================================
+
+const NUM_PATTERNS: i32 = 1024;        // Known fortress patterns
+const BATCH_SIZE: i32 = 65536;         // Parallel positions
+const SCORE_CERTAIN_DRAW: f32 = 1.0;   // Proven fortress = draw
+const SCORE_LIKELY_DRAW: f32 = 0.95;   // Strong fortress pattern
+const SCORE_POSSIBLE_DRAW: f32 = 0.75; // Weak fortress indication
+
+// ============================================================================
+// FORTRESS PATTERN TYPES
+// ============================================================================
+
+const FORTRESS_PHILIDOR: u8 = 1;       // R+P vs R (Philidor position)
+const FORTRESS_LUCENA_BLOCK: u8 = 2;   // Defending against Lucena
+const FORTRESS_WRONG_BISHOP: u8 = 3;   // B+P wrong color bishop
+const FORTRESS_OCB_BLOCKED: u8 = 4;    // Opposite bishops + blocked pawns
+const FORTRESS_KPK_DRAWN: u8 = 5;      // K+P vs K in drawn zone
+const FORTRESS_QUEEN_BLOCK: u8 = 6;    // Q vs pieces blockade
+const FORTRESS_ROOK_BLOCK: u8 = 7;     // Rook blockade pattern
+const FORTRESS_PAWN_WALL: u8 = 8;      // Interlocked pawn wall
+const FORTRESS_CORNER_TRAP: u8 = 9;    // King corner defense
+const FORTRESS_MATERIAL_DRAW: u8 = 10; // Insufficient material
+
+// ============================================================================
+// FORTRESS PATTERN DATABASE
+// ============================================================================
+
+// Each pattern is a tuple: (white_mask, black_mask, required_pieces, type, certainty)
+struct FortressPattern {
+    white_required: tensor<u64, (6,)>,  // Which white pieces must be present
+    black_required: tensor<u64, (6,)>,  // Which black pieces must be present
+    white_forbidden: tensor<u64, (6,)>, // White pieces that break fortress
+    black_forbidden: tensor<u64, (6,)>, // Black pieces that break fortress
+    zone_mask: u64,                      // Board zone where pattern applies
+    pattern_type: u8,
+    certainty: f32,
+}
+
+struct FortressDatabase {
+    patterns: tensor<FortressPattern, (NUM_PATTERNS,)>,
+    num_active: i32,
+}
+
+fn create_fortress_db() -> FortressDatabase {
+    let mut db = FortressDatabase {
+        patterns: tensor.zeros[FortressPattern, (NUM_PATTERNS,)],
+        num_active: 0,
+    };
+
+    // Initialize with known fortress patterns
+    add_philidor_patterns(&mut db);
+    add_wrong_bishop_patterns(&mut db);
+    add_ocb_patterns(&mut db);
+    add_kpk_patterns(&mut db);
+    add_blockade_patterns(&mut db);
+
+    return db;
+}
+
+// ============================================================================
+// PATTERN INITIALIZATION - Fortress Library
+// ============================================================================
+
+fn add_philidor_patterns(db: &mut FortressDatabase) {
+    // Philidor Position: R+P vs R where defending king is in front of pawn
+    // Key squares for 6th rank defense
+
+    for pawn_file in 0..8 {
+        // Pattern: White pawn on file, black king in front, black rook on 6th
+        let mut pattern = FortressPattern {
+            white_required: tensor.zeros[u64, (6,)],
+            black_required: tensor.zeros[u64, (6,)],
+            white_forbidden: tensor.zeros[u64, (6,)],
+            black_forbidden: tensor.zeros[u64, (6,)],
+            zone_mask: 0xFFFFFFFFFFFFFFFF,
+            pattern_type: FORTRESS_PHILIDOR,
+            certainty: SCORE_CERTAIN_DRAW,
+        };
+
+        // White has pawn on 5th rank
+        pattern.white_required[PAWN] = file_mask(pawn_file) & rank_mask(4);
+
+        // White has rook anywhere
+        pattern.white_required[ROOK] = 0xFFFFFFFFFFFFFFFF;
+
+        // Black king must be in front of pawn (6th-8th rank on same file)
+        pattern.black_required[KING] = file_mask(pawn_file) & (rank_mask(5) | rank_mask(6) | rank_mask(7));
+
+        // Black rook on 6th rank (cutting off white king)
+        pattern.black_required[ROOK] = rank_mask(5);
+
+        db.patterns[db.num_active] = pattern;
+        db.num_active += 1;
+    }
+}
+
+fn add_wrong_bishop_patterns(db: &mut FortressDatabase) {
+    // Wrong rook pawn: B+P on a/h file, bishop doesn't control promo square
+
+    // A-file patterns (a8 is dark square)
+    let mut pattern = FortressPattern {
+        white_required: tensor.zeros[u64, (6,)],
+        black_required: tensor.zeros[u64, (6,)],
+        white_forbidden: tensor.zeros[u64, (6,)],
+        black_forbidden: tensor.zeros[u64, (6,)],
+        zone_mask: 0xFFFFFFFFFFFFFFFF,
+        pattern_type: FORTRESS_WRONG_BISHOP,
+        certainty: SCORE_CERTAIN_DRAW,
+    };
+
+    // White pawn on a-file
+    pattern.white_required[PAWN] = FILE_A;
+
+    // White bishop on light squares only (can't control a8)
+    pattern.white_required[BISHOP] = LIGHT_SQUARES;
+
+    // Black king near a8 corner (bits 56,57,48,49)
+    pattern.black_required[KING] = 0x0303000000000000;  // a8, b8, a7, b7 area
+
+    // White forbidden: no other pawns
+    pattern.white_forbidden[PAWN] = ~FILE_A;
+
+    db.patterns[db.num_active] = pattern;
+    db.num_active += 1;
+
+    // H-file patterns (h8 is light square)
+    let mut pattern_h = FortressPattern {
+        white_required: tensor.zeros[u64, (6,)],
+        black_required: tensor.zeros[u64, (6,)],
+        white_forbidden: tensor.zeros[u64, (6,)],
+        black_forbidden: tensor.zeros[u64, (6,)],
+        zone_mask: 0xFFFFFFFFFFFFFFFF,
+        pattern_type: FORTRESS_WRONG_BISHOP,
+        certainty: SCORE_CERTAIN_DRAW,
+    };
+
+    pattern_h.white_required[PAWN] = FILE_H;
+    pattern_h.white_required[BISHOP] = DARK_SQUARES;  // Can't control h8 (light)
+    pattern_h.black_required[KING] = 0xC0C0000000000000;  // h8, g8, h7, g7 area (bits 63,62,55,54)
+    pattern_h.white_forbidden[PAWN] = ~FILE_H;
+
+    db.patterns[db.num_active] = pattern_h;
+    db.num_active += 1;
+}
+
+fn add_ocb_patterns(db: &mut FortressDatabase) {
+    // Opposite-colored bishops with blocked pawns
+
+    let mut pattern = FortressPattern {
+        white_required: tensor.zeros[u64, (6,)],
+        black_required: tensor.zeros[u64, (6,)],
+        white_forbidden: tensor.zeros[u64, (6,)],
+        black_forbidden: tensor.zeros[u64, (6,)],
+        zone_mask: 0xFFFFFFFFFFFFFFFF,
+        pattern_type: FORTRESS_OCB_BLOCKED,
+        certainty: SCORE_LIKELY_DRAW,
+    };
+
+    // White bishop on light, black on dark (or vice versa)
+    pattern.white_required[BISHOP] = LIGHT_SQUARES;
+    pattern.black_required[BISHOP] = DARK_SQUARES;
+
+    // No queens
+    pattern.white_forbidden[QUEEN] = 0xFFFFFFFFFFFFFFFF;
+    pattern.black_forbidden[QUEEN] = 0xFFFFFFFFFFFFFFFF;
+
+    // No rooks
+    pattern.white_forbidden[ROOK] = 0xFFFFFFFFFFFFFFFF;
+    pattern.black_forbidden[ROOK] = 0xFFFFFFFFFFFFFFFF;
+
+    db.patterns[db.num_active] = pattern;
+    db.num_active += 1;
+
+    // Swap colors for dark/light
+    let mut pattern2 = pattern;
+    pattern2.white_required[BISHOP] = DARK_SQUARES;
+    pattern2.black_required[BISHOP] = LIGHT_SQUARES;
+
+    db.patterns[db.num_active] = pattern2;
+    db.num_active += 1;
+}
+
+fn add_kpk_patterns(db: &mut FortressDatabase) {
+    // K+P vs K drawn positions (defending king controls queening square)
+
+    for file in 0..8 {
+        let mut pattern = FortressPattern {
+            white_required: tensor.zeros[u64, (6,)],
+            black_required: tensor.zeros[u64, (6,)],
+            white_forbidden: tensor.zeros[u64, (6,)],
+            black_forbidden: tensor.zeros[u64, (6,)],
+            zone_mask: 0xFFFFFFFFFFFFFFFF,
+            pattern_type: FORTRESS_KPK_DRAWN,
+            certainty: SCORE_CERTAIN_DRAW,
+        };
+
+        // Single white pawn
+        pattern.white_required[PAWN] = file_mask(file);
+
+        // Black king in front of pawn on promotion rank
+        pattern.black_required[KING] = file_mask(file) & (rank_mask(6) | rank_mask(7));
+
+        // No other white pieces except king
+        pattern.white_forbidden[KNIGHT] = 0xFFFFFFFFFFFFFFFF;
+        pattern.white_forbidden[BISHOP] = 0xFFFFFFFFFFFFFFFF;
+        pattern.white_forbidden[ROOK] = 0xFFFFFFFFFFFFFFFF;
+        pattern.white_forbidden[QUEEN] = 0xFFFFFFFFFFFFFFFF;
+
+        db.patterns[db.num_active] = pattern;
+        db.num_active += 1;
+    }
+}
+
+fn add_blockade_patterns(db: &mut FortressDatabase) {
+    // Pawn blockade patterns (pawns facing each other)
+
+    let mut pattern = FortressPattern {
+        white_required: tensor.zeros[u64, (6,)],
+        black_required: tensor.zeros[u64, (6,)],
+        white_forbidden: tensor.zeros[u64, (6,)],
+        black_forbidden: tensor.zeros[u64, (6,)],
+        zone_mask: 0xFFFFFFFFFFFFFFFF,
+        pattern_type: FORTRESS_PAWN_WALL,
+        certainty: SCORE_POSSIBLE_DRAW,
+    };
+
+    // Central pawn wall
+    pattern.white_required[PAWN] = RANK_4 & (FILE_C | FILE_D | FILE_E | FILE_F);
+    pattern.black_required[PAWN] = RANK_5 & (FILE_C | FILE_D | FILE_E | FILE_F);
+
+    db.patterns[db.num_active] = pattern;
+    db.num_active += 1;
+}
+
+// ============================================================================
+// GPU KERNEL: PARALLEL FORTRESS SCAN
+// ============================================================================
+
+@cuda_kernel
+fn scan_fortresses_kernel(
+    board_pieces: tensor<u64, (BATCH_SIZE, 12)>,
+    patterns: tensor<FortressPattern, (NUM_PATTERNS,)>,
+    num_patterns: i32,
+    results: &mut tensor<f32, (BATCH_SIZE,)>,
+    pattern_types: &mut tensor<u8, (BATCH_SIZE,)>
+) {
+    let tid = cuda.thread_idx() + cuda.block_idx() * cuda.block_dim();
+    if tid >= BATCH_SIZE { return; }
+
+    let mut best_certainty = 0.0f32;  // FIX: Made mutable
+    let mut best_type = 0u8;  // FIX: Made mutable
+
+    // Check all fortress patterns
+    for p in 0..num_patterns {
+        let pattern = patterns[p];
+        let mut matches = true;  // FIX: Made mutable
+
+        // Check required white pieces
+        for piece in 0..6 {
+            let required = pattern.white_required[piece];
+            if required != 0 {
+                let actual = board_pieces[tid, piece];
+                if (actual & required) == 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if !matches { continue; }
+
+        // Check required black pieces
+        for piece in 0..6 {
+            let required = pattern.black_required[piece];
+            if required != 0 {
+                let actual = board_pieces[tid, piece + 6];
+                if (actual & required) == 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if !matches { continue; }
+
+        // Check forbidden white pieces
+        for piece in 0..6 {
+            let forbidden = pattern.white_forbidden[piece];
+            if forbidden != 0 {
+                let actual = board_pieces[tid, piece];
+                if (actual & forbidden) != 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if !matches { continue; }
+
+        // Check forbidden black pieces
+        for piece in 0..6 {
+            let forbidden = pattern.black_forbidden[piece];
+            if forbidden != 0 {
+                let actual = board_pieces[tid, piece + 6];
+                if (actual & forbidden) != 0 {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if matches && pattern.certainty > best_certainty {
+            best_certainty = pattern.certainty;
+            best_type = pattern.pattern_type;
+        }
+    }
+
+    results[tid] = best_certainty;
+    pattern_types[tid] = best_type;
+}
+
+// ============================================================================
+// HIGH-LEVEL API
+// ============================================================================
+
+fn detect_fortress_batch(
+    boards: &[Board],
+    db: &FortressDatabase
+) -> Vec<(f32, u8)> {
+    let n = boards.len();
+    let mut results: Vec<(f32, u8)> = Vec.with_capacity(n);
+
+    // Pack boards into tensor
+    let mut board_pieces = tensor.zeros[u64, (BATCH_SIZE, 12)];
+    for (i, board) in boards.iter().enumerate() {
+        if i >= BATCH_SIZE { break; }
+        for p in 0..12 {
+            board_pieces[i, p] = board.pieces[p];
+        }
+    }
+
+    // Allocate result tensors
+    let mut certainties = tensor.zeros[f32, (BATCH_SIZE,)];
+    let mut types = tensor.zeros[u8, (BATCH_SIZE,)];
+
+    // Launch GPU kernel
+    on(gpu0) {
+        let blocks = (BATCH_SIZE + 255) / 256;
+        scan_fortresses_kernel<<<blocks, 256>>>(
+            board_pieces,
+            db.patterns,
+            db.num_active,
+            &mut certainties,
+            &mut types
+        );
+    }
+
+    // Collect results
+    for i in 0..n {
+        results.push((certainties[i], types[i]));
+    }
+
+    return results;
+}
+
+fn detect_fortress_single(board: Board, db: &FortressDatabase) -> (f32, u8) {
+    let boards = vec![board];
+    let results = detect_fortress_batch(&boards, db);
+    return results[0];
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+const FILE_A: u64 = 0x0101010101010101;
+const FILE_H: u64 = 0x8080808080808080;
+const RANK_1: u64 = 0x00000000000000FF;
+const RANK_4: u64 = 0x00000000FF000000;
+const RANK_5: u64 = 0x000000FF00000000;
+const RANK_8: u64 = 0xFF00000000000000;
+// Square colors: a1 (sq 0) is DARK, h1 (sq 7) is LIGHT
+// Bit pattern: dark squares have (rank+file) % 2 == 0
+const DARK_SQUARES: u64 = 0xAA55AA55AA55AA55;   // a1, c1, e1, g1, b2, d2, ...
+const LIGHT_SQUARES: u64 = 0x55AA55AA55AA55AA;  // b1, d1, f1, h1, a2, c2, ...
+
+const FILE_C: u64 = 0x0404040404040404;
+const FILE_D: u64 = 0x0808080808080808;
+const FILE_E: u64 = 0x1010101010101010;
+const FILE_F: u64 = 0x2020202020202020;
+
+fn file_mask(file: i32) -> u64 {
+    return FILE_A << file;
+}
+
+fn rank_mask(rank: i32) -> u64 {
+    return RANK_1 << (rank * 8);
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn fortress_db_stats(db: &FortressDatabase) {
+    println!("=== Fortress Pattern Database ===");
+    println!("Active patterns: {}", db.num_active);
+    println!("Maximum patterns: {}", NUM_PATTERNS);
+
+    // Count by type
+    let mut counts = [0; 11];
+    for i in 0..db.num_active {
+        let t = db.patterns[i].pattern_type as i32;
+        if t < 11 {
+            counts[t] += 1;
+        }
+    }
+
+    println!("Pattern distribution:");
+    println!("  Philidor: {}", counts[FORTRESS_PHILIDOR as i32]);
+    println!("  Wrong Bishop: {}", counts[FORTRESS_WRONG_BISHOP as i32]);
+    println!("  OCB Blocked: {}", counts[FORTRESS_OCB_BLOCKED as i32]);
+    println!("  KPK Drawn: {}", counts[FORTRESS_KPK_DRAWN as i32]);
+    println!("  Pawn Wall: {}", counts[FORTRESS_PAWN_WALL as i32]);
+}

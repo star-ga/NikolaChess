@@ -1,0 +1,36 @@
+# Build outputs
+target/
+*.exe
+*.dll
+*.so
+
+# Data files (large)
+*.bin
+*.csv
+
+# Test files
+test_*.txt
+test_*.bin
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Scripts (local)
+*.ps1
+
+# IDE
+.vscode/
+.idea/
+
+# Large data (local only)
+syzygy6/
+data/games/
+
+# Training artifacts
+checkpoints/
+models/
+runs/
+data/shards/
+*.nknn

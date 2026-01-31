@@ -1,0 +1,424 @@
+// NikolaChess - HalfKA Feature Extraction
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// HalfKA = Half-King + Activity (upgrade from HalfKP)
+// Adds piece activity features for better positional understanding
+// Expected ELO gain: +30-40
+
+import std.tensor;
+import std.cuda;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// HalfKA feature dimensions
+const HALFKA_SIZE: usize = 40960;           // 64 * 10 * 64 (king_sq * piece_type * piece_sq)
+const ACTIVITY_SIZE: usize = 1024;          // Additional activity features
+const TOTAL_FEATURES: usize = HALFKA_SIZE + ACTIVITY_SIZE;
+const MAX_ACTIVE: usize = 32;               // Max active pieces
+
+// Piece types (0-5 for each color)
+const PAWN: i32 = 0;
+const KNIGHT: i32 = 1;
+const BISHOP: i32 = 2;
+const ROOK: i32 = 3;
+const QUEEN: i32 = 4;
+const KING: i32 = 5;
+
+// ============================================================================
+// HALFKA ACCUMULATOR
+// ============================================================================
+
+struct HalfKAAccumulator {
+    white: Tensor[f32, (256,)],   // White perspective accumulator
+    black: Tensor[f32, (256,)],   // Black perspective accumulator
+    computed: bool,               // Whether accumulator is valid
+}
+
+fn create_accumulator() -> HalfKAAccumulator {
+    return HalfKAAccumulator {
+        white: tensor.zeros((256,)),
+        black: tensor.zeros((256,)),
+        computed: false,
+    };
+}
+
+// ============================================================================
+// FEATURE EXTRACTION
+// ============================================================================
+
+// Extract HalfKA feature indices for a position
+fn extract_halfka_indices(board: Board) -> (Vec<u16>, Vec<u16>) {
+    let mut white_features: Vec<u16> = Vec.new();
+    let mut black_features: Vec<u16> = Vec.new();
+
+    // Find king squares
+    let white_king_sq = find_king_square(board, true);
+    let black_king_sq = find_king_square(board, false);
+
+    // For each piece on the board
+    for sq in 0..64 {
+        let piece = board.pieces[sq];
+        if piece == 0 {
+            continue;  // Empty square
+        }
+
+        let piece_type = (piece - 1) % 6;  // 0-5
+        let is_white = piece <= 6;
+
+        // Skip kings (they're implicit in the feature encoding)
+        if piece_type == KING {
+            continue;
+        }
+
+        // White perspective: relative to white king
+        let white_idx = compute_halfka_index(white_king_sq, piece_type, sq, is_white);
+        white_features.push(white_idx as u16);
+
+        // Black perspective: mirror for black king
+        let mirrored_sq = mirror_square(sq);
+        let mirrored_king = mirror_square(black_king_sq);
+        let black_idx = compute_halfka_index(mirrored_king, piece_type, mirrored_sq, !is_white);
+        black_features.push(black_idx as u16);
+    }
+
+    // Add activity features
+    add_activity_features(&mut white_features, board, true);
+    add_activity_features(&mut black_features, board, false);
+
+    return (white_features, black_features);
+}
+
+// Compute HalfKA feature index
+fn compute_halfka_index(king_sq: i32, piece_type: i32, piece_sq: i32, is_friendly: bool) -> i32 {
+    // Index layout: king_sq * 640 + piece_type * 64 + piece_sq
+    // For enemy pieces, add 320 (5 piece types * 64 squares)
+    let piece_offset = if is_friendly { 0 } else { 320 };
+    return king_sq * 640 + piece_type * 64 + piece_sq + piece_offset;
+}
+
+// Mirror square for black perspective
+fn mirror_square(sq: i32) -> i32 {
+    let file = sq % 8;
+    let rank = sq / 8;
+    return file + (7 - rank) * 8;
+}
+
+// Find king square for given color
+fn find_king_square(board: Board, is_white: bool) -> i32 {
+    let king_piece = if is_white { 6 } else { 12 };  // White King = 6, Black King = 12
+    for sq in 0..64 {
+        if board.pieces[sq] == king_piece {
+            return sq;
+        }
+    }
+    return 0;  // Shouldn't happen in valid position
+}
+
+// ============================================================================
+// ACTIVITY FEATURES (The "A" in HalfKA)
+// ============================================================================
+
+fn add_activity_features(features: &mut Vec<u16>, board: Board, white_perspective: bool) {
+    // Activity features capture:
+    // 1. Piece mobility (squares attacked)
+    // 2. King safety (attacks near king)
+    // 3. Center control
+    // 4. Pawn structure activity
+
+    let base_idx = HALFKA_SIZE as u16;
+
+    // Mobility features (simplified)
+    let mobility = compute_mobility(board, white_perspective);
+    if mobility > 20 {
+        features.push(base_idx + 0);  // High mobility
+    } else if mobility < 10 {
+        features.push(base_idx + 1);  // Low mobility
+    }
+
+    // Center control
+    let center_control = compute_center_control(board, white_perspective);
+    if center_control >= 3 {
+        features.push(base_idx + 2);  // Strong center
+    }
+
+    // King safety
+    let king_safety = compute_king_safety(board, white_perspective);
+    if king_safety < 3 {
+        features.push(base_idx + 3);  // King exposed
+    } else if king_safety > 6 {
+        features.push(base_idx + 4);  // King safe
+    }
+
+    // Pawn structure
+    let pawn_activity = compute_pawn_activity(board, white_perspective);
+    features.push(base_idx + 5 + (pawn_activity.clamp(0, 7) as u16));
+}
+
+fn compute_mobility(board: Board, white_perspective: bool) -> i32 {
+    // Count squares attacked by friendly pieces
+    let mut count = 0;
+    for sq in 0..64 {
+        let piece = board.pieces[sq];
+        if piece == 0 {
+            continue;
+        }
+        let is_white = piece <= 6;
+        if is_white == white_perspective {
+            count += piece_mobility(board, sq, piece);
+        }
+    }
+    return count;
+}
+
+fn piece_mobility(board: Board, sq: i32, piece: i32) -> i32 {
+    let piece_type = (piece - 1) % 6;
+    match piece_type {
+        KNIGHT => return 8,   // Knights always attack up to 8 squares
+        BISHOP => return count_bishop_mobility(board, sq),
+        ROOK => return count_rook_mobility(board, sq),
+        QUEEN => return count_bishop_mobility(board, sq) + count_rook_mobility(board, sq),
+        _ => return 0,
+    }
+}
+
+fn count_bishop_mobility(board: Board, sq: i32) -> i32 {
+    // Simplified: count diagonal squares until blocked
+    let mut count = 0;
+    let directions = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+    for (df, dr) in directions {
+        let file = sq % 8;
+        let rank = sq / 8;
+        let mut f = file + df;
+        let mut r = rank + dr;
+        while f >= 0 && f < 8 && r >= 0 && r < 8 {
+            count += 1;
+            if board.pieces[(r * 8 + f) as usize] != 0 {
+                break;
+            }
+            f += df;
+            r += dr;
+        }
+    }
+    return count;
+}
+
+fn count_rook_mobility(board: Board, sq: i32) -> i32 {
+    let mut count = 0;
+    let directions = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    for (df, dr) in directions {
+        let file = sq % 8;
+        let rank = sq / 8;
+        let mut f = file + df;
+        let mut r = rank + dr;
+        while f >= 0 && f < 8 && r >= 0 && r < 8 {
+            count += 1;
+            if board.pieces[(r * 8 + f) as usize] != 0 {
+                break;
+            }
+            f += df;
+            r += dr;
+        }
+    }
+    return count;
+}
+
+fn compute_center_control(board: Board, white_perspective: bool) -> i32 {
+    // Count attacks on central squares (d4, d5, e4, e5)
+    let center_squares = [27, 28, 35, 36];  // d4, e4, d5, e5
+    let mut control = 0;
+    for sq in center_squares {
+        if is_attacked(board, sq, white_perspective) {
+            control += 1;
+        }
+    }
+    return control;
+}
+
+fn compute_king_safety(board: Board, white_perspective: bool) -> i32 {
+    // Count friendly pawns near king
+    let king_sq = find_king_square(board, white_perspective);
+    let king_file = king_sq % 8;
+    let king_rank = king_sq / 8;
+
+    let mut safety = 0;
+    let pawn_piece = if white_perspective { 1 } else { 7 };  // White pawn = 1, Black pawn = 7
+
+    // Check squares in front of king
+    for df in -1..=1 {
+        let f = king_file + df;
+        if f < 0 || f >= 8 {
+            continue;
+        }
+
+        let shield_rank = if white_perspective { king_rank + 1 } else { king_rank - 1 };
+        if shield_rank >= 0 && shield_rank < 8 {
+            let sq = shield_rank * 8 + f;
+            if board.pieces[sq as usize] == pawn_piece {
+                safety += 1;
+            }
+        }
+    }
+
+    return safety;
+}
+
+fn compute_pawn_activity(board: Board, white_perspective: bool) -> i32 {
+    // Count advanced pawns (past 4th rank for white, before 5th for black)
+    let mut activity = 0;
+    let pawn_piece = if white_perspective { 1 } else { 7 };
+
+    for sq in 0..64 {
+        if board.pieces[sq] == pawn_piece {
+            let rank = sq / 8;
+            if white_perspective && rank >= 4 {
+                activity += 1;
+            } else if !white_perspective && rank <= 3 {
+                activity += 1;
+            }
+        }
+    }
+
+    return activity;
+}
+
+fn is_attacked(board: Board, sq: i32, by_white: bool) -> bool {
+    // Simplified attack detection
+    // TODO: Full attack detection
+    return false;
+}
+
+// ============================================================================
+// INCREMENTAL UPDATE
+// ============================================================================
+
+// Update accumulator incrementally after a move
+fn update_accumulator(
+    acc: &mut HalfKAAccumulator,
+    old_board: Board,
+    new_board: Board,
+    m: Move,
+    weights: &HalfKAWeights
+) {
+    // Compute delta features
+    let (old_white, old_black) = extract_halfka_indices(old_board);
+    let (new_white, new_black) = extract_halfka_indices(new_board);
+
+    // Remove old features, add new features
+    for idx in old_white {
+        if !new_white.contains(&idx) {
+            subtract_feature(&mut acc.white, weights, idx as usize);
+        }
+    }
+    for idx in new_white {
+        if !old_white.contains(&idx) {
+            add_feature(&mut acc.white, weights, idx as usize);
+        }
+    }
+
+    // Same for black perspective
+    for idx in old_black {
+        if !new_black.contains(&idx) {
+            subtract_feature(&mut acc.black, weights, idx as usize);
+        }
+    }
+    for idx in new_black {
+        if !old_black.contains(&idx) {
+            add_feature(&mut acc.black, weights, idx as usize);
+        }
+    }
+
+    acc.computed = true;
+}
+
+fn add_feature(acc: &mut Tensor[f32, (256,)], weights: &HalfKAWeights, idx: usize) {
+    for i in 0..256 {
+        acc[i] += weights.w1[idx * 256 + i];
+    }
+}
+
+fn subtract_feature(acc: &mut Tensor[f32, (256,)], weights: &HalfKAWeights, idx: usize) {
+    for i in 0..256 {
+        acc[i] -= weights.w1[idx * 256 + i];
+    }
+}
+
+// ============================================================================
+// WEIGHTS
+// ============================================================================
+
+struct HalfKAWeights {
+    w1: Vec<f32>,   // [TOTAL_FEATURES, 256] - First layer
+    b1: Vec<f32>,   // [256] - First layer bias
+    w2: Vec<f32>,   // [256, 32] - Second layer
+    b2: Vec<f32>,   // [32]
+    w3: Vec<f32>,   // [32, 1] - Output layer
+    b3: f32,        // Output bias
+}
+
+fn create_weights() -> HalfKAWeights {
+    // Initialize with Xavier/He initialization
+    let scale1 = (2.0 / TOTAL_FEATURES as f32).sqrt();
+    let scale2 = (2.0 / 256.0).sqrt();
+    let scale3 = (2.0 / 32.0).sqrt();
+
+    return HalfKAWeights {
+        w1: random_vec(TOTAL_FEATURES * 256, scale1),
+        b1: vec![0.0; 256],
+        w2: random_vec(256 * 32, scale2),
+        b2: vec![0.0; 32],
+        w3: random_vec(32, scale3),
+        b3: 0.0,
+    };
+}
+
+fn random_vec(size: usize, scale: f32) -> Vec<f32> {
+    let mut v = Vec.with_capacity(size);
+    for _ in 0..size {
+        v.push((rand.random() - 0.5) * 2.0 * scale);
+    }
+    return v;
+}
+
+// ============================================================================
+// EVALUATION
+// ============================================================================
+
+// Evaluate position using HalfKA accumulator
+fn evaluate_halfka(acc: &HalfKAAccumulator, weights: &HalfKAWeights, side_to_move: bool) -> i32 {
+    // Select perspective based on side to move
+    let perspective = if side_to_move { &acc.white } else { &acc.black };
+
+    // Apply clipped ReLU
+    let mut h1 = [0.0f32; 256];
+    for i in 0..256 {
+        h1[i] = clamp(perspective[i] + weights.b1[i], 0.0, 1.0);
+    }
+
+    // Second layer
+    let mut h2 = [0.0f32; 32];
+    for i in 0..32 {
+        let mut sum = weights.b2[i];
+        for j in 0..256 {
+            sum += h1[j] * weights.w2[j * 32 + i];
+        }
+        h2[i] = clamp(sum, 0.0, 1.0);
+    }
+
+    // Output layer
+    let mut output = weights.b3;
+    for i in 0..32 {
+        output += h2[i] * weights.w3[i];
+    }
+
+    // Scale to centipawns
+    return (output * 100.0) as i32;
+}
+
+fn clamp(x: f32, min: f32, max: f32) -> f32 {
+    if x < min { return min; }
+    if x > max { return max; }
+    return x;
+}

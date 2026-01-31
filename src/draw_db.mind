@@ -1,0 +1,892 @@
+// NikolaChess - Fast Draw Database
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// GPU-accelerated position database for draw lookups
+// Extends beyond 7-man tablebases to store known draw positions
+
+import std.io;
+import std.mem;
+import std.cuda;
+import std.hash;
+
+// ============================================================================
+// DATABASE CONSTANTS
+// ============================================================================
+
+const DB_VERSION: u32 = 1;
+const DB_MAGIC: u64 = 0x4E494B4F44524157;  // "NIKODRAW"
+const BUCKET_SIZE: i32 = 8;                 // Entries per bucket
+const DEFAULT_DB_SIZE: i64 = 1 << 28;       // 256M entries (~4GB)
+const GPU_BATCH_SIZE: i32 = 65536;          // Parallel GPU lookups
+
+// Draw certainty levels
+const DRAW_PROVEN: u8 = 255;      // Mathematically proven draw
+const DRAW_TABLEBASE: u8 = 250;   // From Syzygy tablebase
+const DRAW_SELFPLAY: u8 = 200;    // From self-play (high confidence)
+const DRAW_ANALYSIS: u8 = 150;    // From deep analysis
+const DRAW_HEURISTIC: u8 = 100;   // From heuristic evaluation
+
+// ============================================================================
+// DATABASE ENTRY
+// ============================================================================
+
+struct DrawEntry {
+    hash: u64,              // Zobrist hash of position
+    draw_certainty: u8,     // How certain is this a draw? (0-255)
+    depth_searched: u8,     // Depth at which draw was confirmed
+    pieces_count: u8,       // Number of pieces on board
+    flags: u8,              // Additional flags
+    best_draw_move: u32,    // Best move to maintain draw (packed)
+}
+
+// Flags for DrawEntry
+const FLAG_FORTRESS: u8 = 0x01;       // Position is a fortress
+const FLAG_REPETITION: u8 = 0x02;     // Draw via repetition possible
+const FLAG_INSUFFICIENT: u8 = 0x04;   // Insufficient material
+const FLAG_OCB: u8 = 0x08;            // Opposite-colored bishops
+const FLAG_THEORETICAL: u8 = 0x10;    // Theoretical draw (e.g., KBN vs K edge)
+const FLAG_BLOCKADE: u8 = 0x20;       // Blocked pawn structure
+
+fn create_entry(hash: u64, certainty: u8, depth: u8, pieces: u8, flags: u8, best_move: Move) -> DrawEntry {
+    return DrawEntry {
+        hash: hash,
+        draw_certainty: certainty,
+        depth_searched: depth,
+        pieces_count: pieces,
+        flags: flags,
+        best_draw_move: pack_move(best_move),
+    };
+}
+
+fn pack_move(m: Move) -> u32 {
+    // Pack move into 32 bits: from(6) | to(6) | piece(4) | promo(4) | flags(12)
+    return (m.from as u32) |
+           ((m.to as u32) << 6) |
+           ((m.piece as u32) << 12) |
+           ((m.promotion as u32) << 16) |
+           ((m.flags as u32) << 20);
+}
+
+fn unpack_move(packed: u32) -> Move {
+    return Move {
+        from: (packed & 0x3F) as i32,
+        to: ((packed >> 6) & 0x3F) as i32,
+        piece: ((packed >> 12) & 0xF) as i32,
+        capture: 0,
+        promotion: ((packed >> 16) & 0xF) as i32,
+        flags: ((packed >> 20) & 0xFFF) as i32,
+    };
+}
+
+// ============================================================================
+// FAST DRAW DATABASE
+// ============================================================================
+
+struct DrawDatabase {
+    // CPU storage (memory-mapped)
+    entries: tensor<DrawEntry, (DEFAULT_DB_SIZE,)>,
+    num_entries: i64,
+
+    // GPU cache for fast lookups
+    gpu_cache: tensor<DrawEntry, (GPU_BATCH_SIZE * 16,)>,
+    gpu_hashes: tensor<u64, (GPU_BATCH_SIZE,)>,
+    gpu_results: tensor<DrawEntry, (GPU_BATCH_SIZE,)>,
+
+    // Bloom filter for fast rejection
+    bloom_filter: tensor<u64, (1 << 20,)>,  // 8MB bloom filter
+
+    // Statistics
+    lookups: i64,
+    hits: i64,
+    misses: i64,
+
+    // File path
+    path: str,
+    loaded: bool,
+}
+
+fn create_draw_db(path: str) -> DrawDatabase {
+    return DrawDatabase {
+        entries: tensor.zeros[DrawEntry, (DEFAULT_DB_SIZE,)],
+        num_entries: 0,
+        gpu_cache: tensor.zeros[DrawEntry, (GPU_BATCH_SIZE * 16,)],
+        gpu_hashes: tensor.zeros[u64, (GPU_BATCH_SIZE,)],
+        gpu_results: tensor.zeros[DrawEntry, (GPU_BATCH_SIZE,)],
+        bloom_filter: tensor.zeros[u64, (1 << 20,)],
+        lookups: 0,
+        hits: 0,
+        misses: 0,
+        path: path,
+        loaded: false,
+    };
+}
+
+// ============================================================================
+// BLOOM FILTER (Fast rejection)
+// ============================================================================
+
+fn bloom_hash1(h: u64) -> i32 {
+    return ((h >> 0) & 0xFFFFF) as i32;
+}
+
+fn bloom_hash2(h: u64) -> i32 {
+    return ((h >> 20) & 0xFFFFF) as i32;
+}
+
+fn bloom_hash3(h: u64) -> i32 {
+    return ((h >> 40) & 0xFFFFF) as i32;
+}
+
+fn bloom_add(db: &mut DrawDatabase, hash: u64) {
+    let idx1 = bloom_hash1(hash);
+    let idx2 = bloom_hash2(hash);
+    let idx3 = bloom_hash3(hash);
+
+    let word1 = idx1 / 64;
+    let bit1 = idx1 % 64;
+    db.bloom_filter[word1] |= (1 << bit1);
+
+    let word2 = idx2 / 64;
+    let bit2 = idx2 % 64;
+    db.bloom_filter[word2] |= (1 << bit2);
+
+    let word3 = idx3 / 64;
+    let bit3 = idx3 % 64;
+    db.bloom_filter[word3] |= (1 << bit3);
+}
+
+fn bloom_check(db: &DrawDatabase, hash: u64) -> bool {
+    let idx1 = bloom_hash1(hash);
+    let idx2 = bloom_hash2(hash);
+    let idx3 = bloom_hash3(hash);
+
+    let word1 = idx1 / 64;
+    let bit1 = idx1 % 64;
+    if (db.bloom_filter[word1] & (1 << bit1)) == 0 {
+        return false;
+    }
+
+    let word2 = idx2 / 64;
+    let bit2 = idx2 % 64;
+    if (db.bloom_filter[word2] & (1 << bit2)) == 0 {
+        return false;
+    }
+
+    let word3 = idx3 / 64;
+    let bit3 = idx3 % 64;
+    if (db.bloom_filter[word3] & (1 << bit3)) == 0 {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// HASH TABLE OPERATIONS
+// ============================================================================
+
+fn db_index(hash: u64, size: i64) -> i64 {
+    return (hash as i64) % (size / BUCKET_SIZE);
+}
+
+fn db_insert(db: &mut DrawDatabase, entry: DrawEntry) -> bool {
+    let bucket_idx = db_index(entry.hash, DEFAULT_DB_SIZE);
+    let base_idx = bucket_idx * BUCKET_SIZE;
+
+    // Try to find empty slot or replace lower certainty entry
+    let mut worst_idx = base_idx;           // FIX: Made mutable
+    let mut worst_certainty = 256;          // FIX: Made mutable
+
+    for i in 0..BUCKET_SIZE {
+        let idx = base_idx + i;
+        let existing = db.entries[idx];
+
+        // Empty slot
+        if existing.hash == 0 {
+            db.entries[idx] = entry;
+            db.num_entries += 1;
+            bloom_add(db, entry.hash);
+            return true;
+        }
+
+        // Same position - update if higher certainty
+        if existing.hash == entry.hash {
+            if entry.draw_certainty > existing.draw_certainty {
+                db.entries[idx] = entry;
+            }
+            return true;
+        }
+
+        // Track worst entry for replacement
+        if existing.draw_certainty < worst_certainty {
+            worst_certainty = existing.draw_certainty;
+            worst_idx = idx;
+        }
+    }
+
+    // Replace worst entry if new entry is better
+    if entry.draw_certainty > worst_certainty {
+        db.entries[worst_idx] = entry;
+        bloom_add(db, entry.hash);
+        return true;
+    }
+
+    return false;
+}
+
+fn db_lookup(db: &mut DrawDatabase, hash: u64) -> (bool, DrawEntry) {
+    db.lookups += 1;
+
+    // Fast bloom filter rejection
+    if !bloom_check(db, hash) {
+        db.misses += 1;
+        return (false, DrawEntry { hash: 0, draw_certainty: 0, depth_searched: 0, pieces_count: 0, flags: 0, best_draw_move: 0 });
+    }
+
+    let bucket_idx = db_index(hash, DEFAULT_DB_SIZE);
+    let base_idx = bucket_idx * BUCKET_SIZE;
+
+    for i in 0..BUCKET_SIZE {
+        let idx = base_idx + i;
+        let entry = db.entries[idx];
+
+        if entry.hash == hash {
+            db.hits += 1;
+            return (true, entry);
+        }
+
+        if entry.hash == 0 {
+            break;
+        }
+    }
+
+    db.misses += 1;
+    return (false, DrawEntry { hash: 0, draw_certainty: 0, depth_searched: 0, pieces_count: 0, flags: 0, best_draw_move: 0 });
+}
+
+// ============================================================================
+// GPU BATCH LOOKUP (Parallel queries)
+// ============================================================================
+
+fn db_batch_lookup(db: &mut DrawDatabase, hashes: &[u64], results: &mut [DrawEntry]) {
+    let batch_size = hashes.len();
+
+    on(gpu0) {
+        // Copy hashes to GPU
+        for i in 0..batch_size {
+            db.gpu_hashes[i] = hashes[i];
+        }
+
+        // Parallel lookup kernel
+        parallel for tid in 0..batch_size {
+            let hash = db.gpu_hashes[tid];
+            let bucket_idx = db_index(hash, DEFAULT_DB_SIZE);
+            let base_idx = bucket_idx * BUCKET_SIZE;
+
+            let mut found = false;  // FIX: Made mutable
+            for i in 0..BUCKET_SIZE {
+                let idx = base_idx + i;
+                let entry = db.entries[idx];
+
+                if entry.hash == hash {
+                    db.gpu_results[tid] = entry;
+                    found = true;
+                    break;
+                }
+
+                if entry.hash == 0 {
+                    break;
+                }
+            }
+
+            if !found {
+                db.gpu_results[tid] = DrawEntry { hash: 0, draw_certainty: 0, depth_searched: 0, pieces_count: 0, flags: 0, best_draw_move: 0 };
+            }
+        }
+
+        // Copy results back
+        for i in 0..batch_size {
+            results[i] = db.gpu_results[i];
+        }
+    }
+}
+
+// ============================================================================
+// FILE I/O
+// ============================================================================
+
+struct DBHeader {
+    magic: u64,
+    version: u32,
+    num_entries: i64,
+    bloom_size: i64,
+    checksum: u64,
+}
+
+fn db_save(db: &DrawDatabase, path: str) -> bool {
+    let file = io.open(path, "wb");
+    if !file.is_valid() {
+        return false;
+    }
+
+    // Write header
+    let header = DBHeader {
+        magic: DB_MAGIC,
+        version: DB_VERSION,
+        num_entries: db.num_entries,
+        bloom_size: 1 << 20,
+        checksum: compute_checksum(db),
+    };
+
+    file.write_struct(&header);
+
+    // Write bloom filter
+    file.write_tensor(&db.bloom_filter);
+
+    // Write entries (only non-empty)
+    let mut written = 0;  // FIX: Made mutable
+    for i in 0..DEFAULT_DB_SIZE {
+        let entry = db.entries[i];
+        if entry.hash != 0 {
+            file.write_struct(&entry);
+            written += 1;
+        }
+    }
+
+    file.close();
+    println!("DrawDB: Saved {} entries to {}", written, path);
+    return true;
+}
+
+fn db_load(db: &mut DrawDatabase, path: str) -> bool {
+    if !io.exists(path) {
+        return false;
+    }
+
+    let file = io.open(path, "rb");
+    if !file.is_valid() {
+        return false;
+    }
+
+    // Read header
+    let header: DBHeader;
+    file.read_struct(&mut header);
+
+    if header.magic != DB_MAGIC {
+        println!("DrawDB: Invalid magic number");
+        file.close();
+        return false;
+    }
+
+    if header.version != DB_VERSION {
+        println!("DrawDB: Version mismatch ({} vs {})", header.version, DB_VERSION);
+        file.close();
+        return false;
+    }
+
+    // Read bloom filter
+    file.read_tensor(&mut db.bloom_filter);
+
+    // Read entries
+    db.num_entries = 0;
+    for _ in 0..header.num_entries {
+        let entry: DrawEntry;
+        file.read_struct(&mut entry);
+
+        let bucket_idx = db_index(entry.hash, DEFAULT_DB_SIZE);
+        let base_idx = bucket_idx * BUCKET_SIZE;
+
+        // Find slot
+        for i in 0..BUCKET_SIZE {
+            let idx = base_idx + i;
+            if db.entries[idx].hash == 0 {
+                db.entries[idx] = entry;
+                db.num_entries += 1;
+                break;
+            }
+        }
+    }
+
+    file.close();
+    db.loaded = true;
+    db.path = path;
+
+    println!("DrawDB: Loaded {} entries from {}", db.num_entries, path);
+    return true;
+}
+
+fn compute_checksum(db: &DrawDatabase) -> u64 {
+    let checksum: u64 = 0;
+    for i in 0..DEFAULT_DB_SIZE {
+        let entry = db.entries[i];
+        if entry.hash != 0 {
+            checksum ^= entry.hash;
+            checksum = (checksum << 7) | (checksum >> 57);
+        }
+    }
+    return checksum;
+}
+
+// ============================================================================
+// POSITION ANALYSIS
+// ============================================================================
+
+fn analyze_position_for_db(board: Board, depth: i32, search_engine: &mut DrawSearch) -> DrawEntry {
+    // Determine piece count
+    let mut pieces = 0;  // FIX: Made mutable
+    for p in 0..12 {
+        pieces += popcount(board.pieces[p]);
+    }
+
+    // Check for immediate draws
+    let mut flags: u8 = 0;  // FIX: Made mutable
+
+    // Insufficient material
+    if is_insufficient_material(board) {
+        flags |= FLAG_INSUFFICIENT;
+        return create_entry(board.hash, DRAW_PROVEN, 0, pieces as u8, flags, MOVE_NULL);
+    }
+
+    // Check for fortress patterns
+    if detect_fortress_advanced(board) {
+        flags |= FLAG_FORTRESS;
+        return create_entry(board.hash, DRAW_PROVEN, 0, pieces as u8, flags, MOVE_NULL);
+    }
+
+    // Check for OCB
+    if has_opposite_bishops(board) && count_material(board) < 800 {
+        flags |= FLAG_OCB;
+    }
+
+    // Check for blocked pawns
+    if has_blocked_pawns(board) {
+        flags |= FLAG_BLOCKADE;
+    }
+
+    // Deep search to verify draw
+    let result = search(search_engine, board, depth, 60000);
+
+    // If search says draw (score near 0.5), add to database
+    if result.draw_score >= 0.45 && result.draw_score <= 0.55 {
+        let certainty = ((result.draw_score - 0.45) * 10.0 * 155.0 + 100.0) as u8;
+        return create_entry(board.hash, certainty, depth as u8, pieces as u8, flags, result.best_move);
+    }
+
+    // Not a clear draw
+    return DrawEntry { hash: 0, draw_certainty: 0, depth_searched: 0, pieces_count: 0, flags: 0, best_draw_move: 0 };
+}
+
+fn detect_fortress_advanced(board: Board) -> bool {
+    // Extended fortress detection
+
+    // 1. Philidor position (Rook endgame)
+    if is_philidor_position(board) {
+        return true;
+    }
+
+    // 2. Wrong rook pawn (Bishop wrong color)
+    if is_wrong_rook_pawn(board) {
+        return true;
+    }
+
+    // 3. Blocked pawn chain
+    if is_blocked_pawn_chain(board) {
+        return true;
+    }
+
+    // 4. King blockade
+    if is_king_blockade(board) {
+        return true;
+    }
+
+    // 5. Opposite bishops with fixed pawns
+    if is_ocb_fortress(board) {
+        return true;
+    }
+
+    return false;
+}
+
+fn is_philidor_position(board: Board) -> bool {
+    // Detect Philidor defense setup in R+P vs R
+    let white_rooks = popcount(board.pieces[ROOK]);
+    let black_rooks = popcount(board.pieces[ROOK + 6]);
+    let white_pawns = popcount(board.pieces[PAWN]);
+    let black_pawns = popcount(board.pieces[PAWN + 6]);
+
+    // R+P vs R
+    if white_rooks == 1 && black_rooks == 1 {
+        if (white_pawns == 1 && black_pawns == 0) || (white_pawns == 0 && black_pawns == 1) {
+            // Check if defending king is in front of pawn
+            let defending_king = if white_pawns > 0 { board.pieces[KING + 6] } else { board.pieces[KING] };
+            let attacking_pawn = if white_pawns > 0 { board.pieces[PAWN] } else { board.pieces[PAWN + 6] };
+
+            let king_sq = bit_scan(defending_king);
+            let pawn_sq = bit_scan(attacking_pawn);
+
+            // King is in front of pawn
+            let king_file = king_sq % 8;
+            let pawn_file = pawn_sq % 8;
+            let king_rank = king_sq / 8;
+            let pawn_rank = pawn_sq / 8;
+
+            if king_file == pawn_file {
+                if white_pawns > 0 && king_rank > pawn_rank {
+                    return true;  // Black king blocking white pawn
+                }
+                if black_pawns > 0 && king_rank < pawn_rank {
+                    return true;  // White king blocking black pawn
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+fn is_wrong_rook_pawn(board: Board) -> bool {
+    // Bishop + rook pawn where bishop doesn't control promotion square
+    let white_bishops = board.pieces[BISHOP];
+    let black_bishops = board.pieces[BISHOP + 6];
+    let white_pawns = board.pieces[PAWN];
+    let black_pawns = board.pieces[PAWN + 6];
+
+    // White B+P vs bare K
+    if white_bishops != 0 && popcount(white_pawns) == 1 && count_black_pieces(board) == 1 {
+        let pawn_sq = bit_scan(white_pawns);
+        let pawn_file = pawn_sq % 8;
+
+        // Rook pawn (a or h file)
+        if pawn_file == 0 || pawn_file == 7 {
+            let promo_sq = if pawn_file == 0 { 56 } else { 63 };  // a8 or h8
+            let bishop_sq = bit_scan(white_bishops);
+            let bishop_color = (bishop_sq / 8 + bishop_sq % 8) % 2;
+            let promo_color = (promo_sq / 8 + promo_sq % 8) % 2;
+
+            // Bishop doesn't control promotion square
+            if bishop_color != promo_color {
+                // Check if black king can reach promotion square
+                let black_king_sq = bit_scan(board.pieces[KING + 6]);
+                let king_file = black_king_sq % 8;
+                let king_rank = black_king_sq / 8;
+
+                // King is near promotion corner
+                let dist_to_promo = abs(king_file - (promo_sq % 8)) + abs(king_rank - (promo_sq / 8));
+                if dist_to_promo <= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Symmetric for black
+    if black_bishops != 0 && popcount(black_pawns) == 1 && count_white_pieces(board) == 1 {
+        let pawn_sq = bit_scan(black_pawns);
+        let pawn_file = pawn_sq % 8;
+
+        if pawn_file == 0 || pawn_file == 7 {
+            let promo_sq = if pawn_file == 0 { 0 } else { 7 };  // a1 or h1
+            let bishop_sq = bit_scan(black_bishops);
+            let bishop_color = (bishop_sq / 8 + bishop_sq % 8) % 2;
+            let promo_color = (promo_sq / 8 + promo_sq % 8) % 2;
+
+            if bishop_color != promo_color {
+                let white_king_sq = bit_scan(board.pieces[KING]);
+                let king_file = white_king_sq % 8;
+                let king_rank = white_king_sq / 8;
+                let dist_to_promo = abs(king_file - (promo_sq % 8)) + abs(king_rank - (promo_sq / 8));
+                if dist_to_promo <= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+fn is_blocked_pawn_chain(board: Board) -> bool {
+    let white_pawns = board.pieces[PAWN];
+    let black_pawns = board.pieces[PAWN + 6];
+
+    // Count blocked pawns (pawns directly facing each other)
+    let mut blocked = 0;  // FIX: Made mutable
+    let total_pawns = popcount(white_pawns) + popcount(black_pawns);
+
+    let mut wp = white_pawns;  // FIX: Made mutable
+    while wp != 0 {
+        let sq = bit_scan(wp);
+        let blocking_sq = sq + 8;
+        if blocking_sq < 64 && (black_pawns & (1 << blocking_sq)) != 0 {
+            blocked += 2;  // Both pawns are blocked
+        }
+        wp &= wp - 1;
+    }
+
+    // If most pawns are blocked, it's likely a fortress
+    if total_pawns >= 6 && blocked >= total_pawns - 2 {
+        return true;
+    }
+
+    return false;
+}
+
+fn is_king_blockade(board: Board) -> bool {
+    // King blocking passed pawn - defending king directly in front of passed pawn
+    let white_pawns = board.pieces[PAWN];
+    let black_pawns = board.pieces[PAWN + 6];
+    let white_king = board.pieces[KING];
+    let black_king = board.pieces[KING + 6];
+
+    // Check if black king blocks white passed pawn
+    if white_pawns != 0 && popcount(white_pawns) == 1 {
+        let pawn_sq = bit_scan(white_pawns);
+        let pawn_file = pawn_sq % 8;
+        let pawn_rank = pawn_sq / 8;
+
+        // Check if it's a passed pawn (no black pawns blocking)
+        let mut is_passed = true;
+        let mut bp = black_pawns;
+        while bp != 0 {
+            let bsq = bit_scan(bp);
+            let bf = bsq % 8;
+            if abs(bf - pawn_file) <= 1 && bsq / 8 > pawn_rank {
+                is_passed = false;
+                break;
+            }
+            bp &= bp - 1;
+        }
+
+        if is_passed {
+            let king_sq = bit_scan(black_king);
+            let king_file = king_sq % 8;
+            let king_rank = king_sq / 8;
+
+            // King is directly in front of pawn or one square ahead
+            if king_file == pawn_file && king_rank > pawn_rank && king_rank <= pawn_rank + 2 {
+                return true;
+            }
+        }
+    }
+
+    // Check if white king blocks black passed pawn
+    if black_pawns != 0 && popcount(black_pawns) == 1 {
+        let pawn_sq = bit_scan(black_pawns);
+        let pawn_file = pawn_sq % 8;
+        let pawn_rank = pawn_sq / 8;
+
+        // Check if it's a passed pawn
+        let mut is_passed = true;
+        let mut wp = white_pawns;
+        while wp != 0 {
+            let wsq = bit_scan(wp);
+            let wf = wsq % 8;
+            if abs(wf - pawn_file) <= 1 && wsq / 8 < pawn_rank {
+                is_passed = false;
+                break;
+            }
+            wp &= wp - 1;
+        }
+
+        if is_passed {
+            let king_sq = bit_scan(white_king);
+            let king_file = king_sq % 8;
+            let king_rank = king_sq / 8;
+
+            // King is directly in front of pawn
+            if king_file == pawn_file && king_rank < pawn_rank && king_rank >= pawn_rank - 2 {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+fn is_ocb_fortress(board: Board) -> bool {
+    // Opposite bishops with all pawns on same color as one bishop
+    if !has_opposite_bishops(board) {
+        return false;
+    }
+
+    let white_bishop_sq = bit_scan(board.pieces[BISHOP]);
+    let white_bishop_color = (white_bishop_sq / 8 + white_bishop_sq % 8) % 2;
+
+    // Check if all pawns are on squares bishop can't attack
+    let all_pawns = board.pieces[PAWN] | board.pieces[PAWN + 6];
+
+    let mut pawns = all_pawns;          // FIX: Made mutable
+    let mut same_color_pawns = 0;       // FIX: Made mutable
+    while pawns != 0 {
+        let sq = bit_scan(pawns);
+        let sq_color = (sq / 8 + sq % 8) % 2;
+        if sq_color == white_bishop_color {
+            same_color_pawns += 1;
+        }
+        pawns &= pawns - 1;
+    }
+
+    // If most pawns are on bishop's color, fortress likely
+    let total_pawns = popcount(all_pawns);
+    if same_color_pawns >= total_pawns - 1 {
+        return true;
+    }
+
+    return false;
+}
+
+fn has_opposite_bishops(board: Board) -> bool {
+    let white_bishops = board.pieces[BISHOP];
+    let black_bishops = board.pieces[BISHOP + 6];
+
+    if popcount(white_bishops) != 1 || popcount(black_bishops) != 1 {
+        return false;
+    }
+
+    let wb_sq = bit_scan(white_bishops);
+    let bb_sq = bit_scan(black_bishops);
+
+    let wb_color = (wb_sq / 8 + wb_sq % 8) % 2;
+    let bb_color = (bb_sq / 8 + bb_sq % 8) % 2;
+
+    return wb_color != bb_color;
+}
+
+fn has_blocked_pawns(board: Board) -> bool {
+    let white_pawns = board.pieces[PAWN];
+    let black_pawns = board.pieces[PAWN + 6];
+
+    // Check for pawns blocking each other
+    let white_pushed = white_pawns << 8;
+    let blocked_white = white_pushed & black_pawns;
+
+    return blocked_white != 0;
+}
+
+fn count_white_pieces(board: Board) -> i32 {
+    let mut count = 0;  // FIX: Made mutable
+    for p in 0..6 {
+        count += popcount(board.pieces[p]);
+    }
+    return count;
+}
+
+fn count_black_pieces(board: Board) -> i32 {
+    let mut count = 0;  // FIX: Made mutable
+    for p in 6..12 {
+        count += popcount(board.pieces[p]);
+    }
+    return count;
+}
+
+fn count_material(board: Board) -> i32 {
+    let mut material = 0;  // FIX: Made mutable
+    material += popcount(board.pieces[PAWN]) * 100;
+    material += popcount(board.pieces[KNIGHT]) * 320;
+    material += popcount(board.pieces[BISHOP]) * 330;
+    material += popcount(board.pieces[ROOK]) * 500;
+    material += popcount(board.pieces[QUEEN]) * 900;
+    material += popcount(board.pieces[PAWN + 6]) * 100;
+    material += popcount(board.pieces[KNIGHT + 6]) * 320;
+    material += popcount(board.pieces[BISHOP + 6]) * 330;
+    material += popcount(board.pieces[ROOK + 6]) * 500;
+    material += popcount(board.pieces[QUEEN + 6]) * 900;
+    return material;
+}
+
+fn abs(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+
+// ============================================================================
+// DATABASE BUILDER
+// ============================================================================
+
+fn build_draw_db(db: &mut DrawDatabase, positions_path: str, depth: i32) {
+    println!("Building draw database from: {}", positions_path);
+
+    // FIX: Ensure syzygy directory exists
+    if !io.exists("./syzygy") {
+        io.create_dir("./syzygy");
+    }
+
+    let net = create_draw_network();
+    let book = create_opening_book();
+    let mut tb = create_tablebase("./syzygy");  // FIX: Made mutable for tb_init
+    tb_init(&mut tb);  // FIX: Initialize tablebase
+    let mut search_engine = create_search(net, book, tb);  // FIX: Made mutable
+
+    // Load positions from file
+    if !io.exists(positions_path) {
+        println!("Error: Positions file not found");
+        return;
+    }
+
+    let file = io.open(positions_path, "r");
+    let mut processed = 0;  // FIX: Made mutable
+    let mut added = 0;      // FIX: Made mutable
+
+    while let Some(line) = file.read_line() {
+        let fen = line.trim();
+        if fen.is_empty() {
+            continue;
+        }
+
+        let board = from_fen(fen);
+        let entry = analyze_position_for_db(board, depth, &mut search_engine);
+
+        if entry.hash != 0 {
+            if db_insert(db, entry) {
+                added += 1;
+            }
+        }
+
+        processed += 1;
+        if processed % 1000 == 0 {
+            println!("Processed: {} Added: {} ({:.1}%)",
+                     processed, added, (added as f32 / processed as f32) * 100.0);
+        }
+    }
+
+    file.close();
+    println!("Build complete: {} positions, {} draws added", processed, added);
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn db_stats(db: &DrawDatabase) {
+    println!("=== Draw Database Statistics ===");
+    println!("Entries: {}", db.num_entries);
+    println!("Lookups: {}", db.lookups);
+    println!("Hits: {} ({:.2}%)", db.hits, if db.lookups > 0 { (db.hits as f32 / db.lookups as f32) * 100.0 } else { 0.0 });
+    println!("Misses: {}", db.misses);
+    println!("Path: {}", db.path);
+    println!("Loaded: {}", db.loaded);
+
+    // Count by certainty level
+    let mut proven = 0;      // FIX: Made mutable
+    let mut tablebase = 0;   // FIX: Made mutable
+    let mut selfplay = 0;    // FIX: Made mutable
+    let mut analysis = 0;    // FIX: Made mutable
+    let mut heuristic = 0;   // FIX: Made mutable
+
+    for i in 0..DEFAULT_DB_SIZE {
+        let entry = db.entries[i];
+        if entry.hash != 0 {
+            if entry.draw_certainty >= DRAW_PROVEN { proven += 1; }
+            else if entry.draw_certainty >= DRAW_TABLEBASE { tablebase += 1; }
+            else if entry.draw_certainty >= DRAW_SELFPLAY { selfplay += 1; }
+            else if entry.draw_certainty >= DRAW_ANALYSIS { analysis += 1; }
+            else { heuristic += 1; }
+        }
+    }
+
+    println!("By certainty:");
+    println!("  Proven: {}", proven);
+    println!("  Tablebase: {}", tablebase);
+    println!("  Self-play: {}", selfplay);
+    println!("  Analysis: {}", analysis);
+    println!("  Heuristic: {}", heuristic);
+}

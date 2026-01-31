@@ -1,0 +1,326 @@
+// NNUE Training Pipeline - Pure Mind Implementation
+// GPU-accelerated via MIND Runtime CUDA backend
+
+use std::fs;
+use std::thread;
+use runtime::tensor;
+use runtime::cuda;
+use runtime::autodiff;
+
+const BATCH_SIZE: usize = 16384;
+const LEARNING_RATE: f32 = 0.001;
+const L2_LAMBDA: f32 = 0.0001;
+
+// Training data format
+struct TrainingSample {
+    features: Vec<u16>,     // Active HalfKA features
+    score: i16,             // Evaluation in centipawns
+    result: f32,            // Game result: 1.0 win, 0.5 draw, 0.0 loss
+    stm: Color,             // Side to move
+}
+
+// Teacher-Student Distillation Network
+struct TrainingNetwork {
+    // Trainable parameters (f32 for training)
+    ft_weights: tensor<f32, (HALF_DIMS, L1_SIZE)>,
+    ft_biases: tensor<f32, (L1_SIZE,)>,
+
+    l1_weights: tensor<f32, (L1_SIZE * 2, L2_SIZE)>,
+    l1_biases: tensor<f32, (L2_SIZE,)>,
+
+    l2_weights: tensor<f32, (L2_SIZE, L3_SIZE)>,
+    l2_biases: tensor<f32, (L3_SIZE,)>,
+
+    output_weights: tensor<f32, (L3_SIZE, 3)>,
+    output_biases: tensor<f32, (3,)>,
+
+    // Optimizer state (Adam)
+    adam_m: AdamState,
+    adam_v: AdamState,
+    step: u64,
+}
+
+struct AdamState {
+    ft_weights: tensor<f32, (HALF_DIMS, L1_SIZE)>,
+    ft_biases: tensor<f32, (L1_SIZE,)>,
+    l1_weights: tensor<f32, (L1_SIZE * 2, L2_SIZE)>,
+    l1_biases: tensor<f32, (L2_SIZE,)>,
+    l2_weights: tensor<f32, (L2_SIZE, L3_SIZE)>,
+    l2_biases: tensor<f32, (L3_SIZE,)>,
+    output_weights: tensor<f32, (L3_SIZE, 3)>,
+    output_biases: tensor<f32, (3,)>,
+}
+
+impl TrainingNetwork {
+    fn new() -> Self {
+        // Xavier initialization
+        let mut net = TrainingNetwork {
+            ft_weights: tensor::randn() * (2.0 / HALF_DIMS as f32).sqrt(),
+            ft_biases: tensor::zeros(),
+            l1_weights: tensor::randn() * (2.0 / (L1_SIZE * 2) as f32).sqrt(),
+            l1_biases: tensor::zeros(),
+            l2_weights: tensor::randn() * (2.0 / L2_SIZE as f32).sqrt(),
+            l2_biases: tensor::zeros(),
+            output_weights: tensor::randn() * (2.0 / L3_SIZE as f32).sqrt(),
+            output_biases: tensor::zeros(),
+            adam_m: AdamState::zeros(),
+            adam_v: AdamState::zeros(),
+            step: 0,
+        };
+        net
+    }
+
+    fn forward_batch(&self, batch: &[TrainingSample]) -> (tensor<f32, (BATCH_SIZE, 3)>, tensor<f32, (BATCH_SIZE,)>) {
+        let mut wdl_output: tensor<f32, (BATCH_SIZE, 3)> = tensor::zeros();
+        let mut eval_output: tensor<f32, (BATCH_SIZE,)> = tensor::zeros();
+
+        on(cuda::gpu0) {
+            parallel for i in 0..batch.len() {
+                let sample = &batch[i];
+
+                // Feature transformer
+                let mut acc = self.ft_biases.clone();
+                for feat in &sample.features {
+                    acc += self.ft_weights[*feat as usize];
+                }
+
+                // Clipped ReLU (simulate quantization)
+                let l1_input = acc.clamp(0.0, 1.0);
+
+                // Concatenate perspectives (simplified)
+                let mut concat: tensor<f32, (L1_SIZE * 2,)> = tensor::zeros();
+                for j in 0..L1_SIZE {
+                    concat[j] = l1_input[j];
+                    concat[j + L1_SIZE] = l1_input[j];  // Same for both perspectives in training
+                }
+
+                // L1
+                let l1_out = tensor::matmul(concat, self.l1_weights) + self.l1_biases;
+                let l1_relu = l1_out.clamp(0.0, 1.0);
+
+                // L2
+                let l2_out = tensor::matmul(l1_relu, self.l2_weights) + self.l2_biases;
+                let l2_relu = l2_out.clamp(0.0, 1.0);
+
+                // Output (WDL)
+                let output = tensor::matmul(l2_relu, self.output_weights) + self.output_biases;
+                let wdl = tensor::softmax(output);
+
+                wdl_output[i] = wdl;
+                eval_output[i] = wdl[0] - wdl[2];  // Win - Loss
+            }
+        }
+
+        (wdl_output, eval_output)
+    }
+
+    fn compute_loss(&self, predictions: &tensor<f32, (BATCH_SIZE, 3)>,
+                    evals: &tensor<f32, (BATCH_SIZE,)>,
+                    batch: &[TrainingSample]) -> f32 {
+        let mut loss = 0.0f32;
+
+        for i in 0..batch.len() {
+            let sample = &batch[i];
+
+            // WDL Cross-entropy loss
+            let target_wdl = result_to_wdl(sample.result);
+            let pred_wdl = predictions[i];
+            let ce_loss = -target_wdl.dot(pred_wdl.log());
+
+            // Eval MSE loss
+            let target_eval = (sample.score as f32) / 400.0;  // Normalize
+            let pred_eval = evals[i];
+            let mse_loss = (target_eval - pred_eval).powi(2);
+
+            // Combined loss (70% WDL, 30% eval)
+            loss += 0.7 * ce_loss + 0.3 * mse_loss;
+        }
+
+        // L2 regularization
+        let l2_reg = L2_LAMBDA * (
+            self.ft_weights.norm_squared() +
+            self.l1_weights.norm_squared() +
+            self.l2_weights.norm_squared() +
+            self.output_weights.norm_squared()
+        );
+
+        (loss / batch.len() as f32) + l2_reg
+    }
+
+    fn backward_and_update(&mut self, batch: &[TrainingSample]) {
+        // Compute gradients using autodiff
+        let gradients = autodiff::compute_gradients(|| {
+            let (preds, evals) = self.forward_batch(batch);
+            self.compute_loss(&preds, &evals, batch)
+        });
+
+        // Adam optimizer update
+        self.step += 1;
+        let beta1 = 0.9f32;
+        let beta2 = 0.999f32;
+        let epsilon = 1e-8f32;
+
+        let bias_correction1 = 1.0 - beta1.powi(self.step as i32);
+        let bias_correction2 = 1.0 - beta2.powi(self.step as i32);
+
+        // Update each parameter
+        self.adam_update(&mut self.ft_weights, &gradients.ft_weights,
+                         &mut self.adam_m.ft_weights, &mut self.adam_v.ft_weights,
+                         beta1, beta2, epsilon, bias_correction1, bias_correction2);
+
+        self.adam_update(&mut self.l1_weights, &gradients.l1_weights,
+                         &mut self.adam_m.l1_weights, &mut self.adam_v.l1_weights,
+                         beta1, beta2, epsilon, bias_correction1, bias_correction2);
+
+        self.adam_update(&mut self.l2_weights, &gradients.l2_weights,
+                         &mut self.adam_m.l2_weights, &mut self.adam_v.l2_weights,
+                         beta1, beta2, epsilon, bias_correction1, bias_correction2);
+
+        self.adam_update(&mut self.output_weights, &gradients.output_weights,
+                         &mut self.adam_m.output_weights, &mut self.adam_v.output_weights,
+                         beta1, beta2, epsilon, bias_correction1, bias_correction2);
+    }
+
+    fn adam_update<T: Tensor>(&self, param: &mut T, grad: &T,
+                               m: &mut T, v: &mut T,
+                               beta1: f32, beta2: f32, epsilon: f32,
+                               bc1: f32, bc2: f32) {
+        on(cuda::gpu0) {
+            *m = beta1 * *m + (1.0 - beta1) * grad;
+            *v = beta2 * *v + (1.0 - beta2) * grad * grad;
+
+            let m_hat = *m / bc1;
+            let v_hat = *v / bc2;
+
+            *param -= LEARNING_RATE * m_hat / (v_hat.sqrt() + epsilon);
+        }
+    }
+
+    fn export_quantized(&self, path: &str) {
+        // Quantize to int8/int16 for inference
+        let weights = NNUEWeights {
+            ft_weights: quantize_i16(&self.ft_weights, 127.0),
+            ft_biases: quantize_i16(&self.ft_biases, 127.0),
+            l1_weights: quantize_i8(&self.l1_weights, 64.0),
+            l1_biases: quantize_i32(&self.l1_biases, 127.0 * 64.0),
+            l2_weights: quantize_i8(&self.l2_weights, 64.0),
+            l2_biases: quantize_i32(&self.l2_biases, 64.0 * 64.0),
+            output_weights: quantize_i8(&self.output_weights, 64.0),
+            output_biases: quantize_i32(&self.output_biases, 64.0 * 64.0),
+        };
+
+        // Write NKNN format
+        let mut file = fs::File::create(path).unwrap();
+        file.write_u32(0x4E4B4E4E);  // "NKNN" magic
+        file.write_u32(2);            // Version
+        weights.write_to(&mut file);
+    }
+}
+
+// Training data loader
+struct DataLoader {
+    shards: Vec<str>,
+    current_shard: usize,
+    current_samples: Vec<TrainingSample>,
+    sample_idx: usize,
+}
+
+impl DataLoader {
+    fn new(data_dir: &str) -> Self {
+        let shards = fs::read_dir(data_dir)
+            .filter(|p| p.ends_with(".shard"))
+            .collect();
+
+        DataLoader {
+            shards: shards,
+            current_shard: 0,
+            current_samples: Vec::new(),
+            sample_idx: 0,
+        }
+    }
+
+    fn next_batch(&mut self) -> Option<Vec<TrainingSample>> {
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+
+        while batch.len() < BATCH_SIZE {
+            if self.sample_idx >= self.current_samples.len() {
+                if !self.load_next_shard() {
+                    if batch.is_empty() {
+                        return None;
+                    }
+                    break;
+                }
+            }
+
+            batch.push(self.current_samples[self.sample_idx].clone());
+            self.sample_idx += 1;
+        }
+
+        Some(batch)
+    }
+
+    fn load_next_shard(&mut self) -> bool {
+        if self.current_shard >= self.shards.len() {
+            return false;
+        }
+
+        let path = &self.shards[self.current_shard];
+        self.current_samples = parse_shard(path);
+        self.current_shard += 1;
+        self.sample_idx = 0;
+        true
+    }
+}
+
+fn result_to_wdl(result: f32) -> tensor<f32, (3,)> {
+    if result > 0.75 {
+        tensor::from([1.0, 0.0, 0.0])  // Win
+    } else if result < 0.25 {
+        tensor::from([0.0, 0.0, 1.0])  // Loss
+    } else {
+        tensor::from([0.0, 1.0, 0.0])  // Draw
+    }
+}
+
+// Main training loop
+pub fn train(data_dir: &str, output_path: &str, epochs: u32) {
+    println!("NikolaChess NNUE Training");
+    println!("Data: {}", data_dir);
+    println!("Output: {}", output_path);
+
+    let mut network = TrainingNetwork::new();
+    let mut best_loss = f32::MAX;
+
+    for epoch in 0..epochs {
+        println!("\nEpoch {}/{}", epoch + 1, epochs);
+
+        let mut loader = DataLoader::new(data_dir);
+        let mut total_loss = 0.0f32;
+        let mut batch_count = 0u32;
+
+        while let Some(batch) = loader.next_batch() {
+            let (preds, evals) = network.forward_batch(&batch);
+            let loss = network.compute_loss(&preds, &evals, &batch);
+            network.backward_and_update(&batch);
+
+            total_loss += loss;
+            batch_count += 1;
+
+            if batch_count % 100 == 0 {
+                println!("  Batch {}: loss = {:.6}", batch_count, loss);
+            }
+        }
+
+        let avg_loss = total_loss / batch_count as f32;
+        println!("Epoch {} avg loss: {:.6}", epoch + 1, avg_loss);
+
+        // Save checkpoint
+        if avg_loss < best_loss {
+            best_loss = avg_loss;
+            network.export_quantized(output_path);
+            println!("Saved best model to {}", output_path);
+        }
+    }
+
+    println!("\nTraining complete!");
+}

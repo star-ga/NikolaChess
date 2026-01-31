@@ -1,0 +1,386 @@
+// NikolaChess - SIMD-Optimized OCB Fortress Detection
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// AVX2/AVX512 opposite-colored bishop fortress detection
+
+import std.tensor;
+import std.simd;
+import std.bit;
+import board;
+
+// ============================================================================
+// SIMD CONSTANTS - Optimized Masks
+// ============================================================================
+
+const LIGHT_SQUARES: u64 = 0xAA55AA55AA55AA55;
+const DARK_SQUARES: u64 = 0x55AA55AA55AA55AA;
+
+// Edge squares for pawn promotion analysis
+const A_FILE: u64 = 0x0101010101010101;
+const H_FILE: u64 = 0x8080808080808080;
+const EDGE_FILES: u64 = A_FILE | H_FILE;
+
+// Rank masks
+const RANK_1: u64 = 0x00000000000000FF;
+const RANK_2: u64 = 0x000000000000FF00;
+const RANK_7: u64 = 0x00FF000000000000;
+const RANK_8: u64 = 0xFF00000000000000;
+const PROMO_RANKS: u64 = RANK_1 | RANK_8;
+
+// Material values for quick evaluation
+const PAWN_VALUE: i32 = 100;
+const BISHOP_VALUE: i32 = 330;
+const KNIGHT_VALUE: i32 = 320;
+const ROOK_VALUE: i32 = 500;
+const QUEEN_VALUE: i32 = 900;
+
+// Draw certainty thresholds
+const CERTAINTY_PROVEN: u8 = 255;
+const CERTAINTY_VERY_HIGH: u8 = 250;
+const CERTAINTY_HIGH: u8 = 220;
+const CERTAINTY_MEDIUM: u8 = 180;
+const CERTAINTY_LOW: u8 = 140;
+
+// ============================================================================
+// OCB RESULT STRUCTURE
+// ============================================================================
+
+struct OCBResult {
+    is_ocb: bool,              // True if opposite-colored bishops
+    draw_certainty: u8,        // 0-255, 255 = proven draw
+    fortress_pattern: u8,      // Bitflags for specific patterns
+    blocked_pawn_count: i32,   // Number of blocked pawns
+    pawn_advantage: i32,       // Material pawn difference
+    best_draw_move: u32,       // Packed move to maintain draw
+}
+
+// Fortress pattern flags
+const PATTERN_OCB: u8 = 0x01;          // Basic opposite bishops
+const PATTERN_ALL_SAME_COLOR: u8 = 0x02; // All pawns on one bishop color
+const PATTERN_BLOCKED_CENTER: u8 = 0x04; // Central pawns blocked
+const PATTERN_EDGE_PAWNS: u8 = 0x08;   // Only edge pawns (a/h file)
+const PATTERN_FORTRESS_SETUP: u8 = 0x10; // King/bishop optimal setup
+const PATTERN_NO_PASSED: u8 = 0x20;    // No passed pawns
+
+// ============================================================================
+// SIMD INTRINSICS
+// ============================================================================
+
+// 128-bit SIMD popcount (SSE4.2 / AVX2)
+@inline
+fn popcount_simd(x: u64) -> i32 {
+    return simd.popcnt64(x);
+}
+
+// 256-bit SIMD dual popcount (AVX2)
+@inline
+fn popcount_dual(a: u64, b: u64) -> (i32, i32) {
+    let vec = simd.load_u64x4([a, b, 0, 0]);
+    let counts = simd.popcnt_u64x4(vec);
+    return (counts[0], counts[1]);
+}
+
+// Parallel AND-popcount for multiple masks
+@inline
+fn masked_popcount(value: u64, masks: &[u64; 4]) -> [i32; 4] {
+    let v = simd.broadcast_u64(value);
+    let m = simd.load_u64x4(*masks);
+    let masked = simd.and_u64x4(v, m);
+    return simd.popcnt_u64x4(masked);
+}
+
+// ============================================================================
+// MAIN OCB DETECTION
+// ============================================================================
+
+fn detect_ocb_fortress(board: &Board) -> OCBResult {
+    // Extract bishop bitboards
+    let wb = board.pieces[BISHOP];       // White bishops
+    let bb = board.pieces[BISHOP + 6];   // Black bishops
+
+    // SIMD popcount for bishop counts
+    let (wb_count, bb_count) = popcount_dual(wb, bb);
+
+    // Must have exactly one bishop per side
+    if wb_count != 1 || bb_count != 1 {
+        return OCBResult {
+            is_ocb: false,
+            draw_certainty: 0,
+            fortress_pattern: 0,
+            blocked_pawn_count: 0,
+            pawn_advantage: 0,
+            best_draw_move: 0,
+        };
+    }
+
+    // Check bishop square colors using SIMD masks
+    let masks = [LIGHT_SQUARES, DARK_SQUARES, LIGHT_SQUARES, DARK_SQUARES];
+    let wb_masked = masked_popcount(wb, &masks);
+    let bb_masked = masked_popcount(bb, &masks);
+
+    let wb_on_light = wb_masked[0] > 0;
+    let wb_on_dark = wb_masked[1] > 0;
+    let bb_on_light = bb_masked[2] > 0;
+    let bb_on_dark = bb_masked[3] > 0;
+
+    // OCB condition: bishops on different colors
+    let is_ocb = (wb_on_light && bb_on_dark) || (wb_on_dark && bb_on_light);
+
+    if !is_ocb {
+        return OCBResult {
+            is_ocb: false,
+            draw_certainty: 0,
+            fortress_pattern: 0,
+            blocked_pawn_count: 0,
+            pawn_advantage: 0,
+            best_draw_move: 0,
+        };
+    }
+
+    // We have OCB! Now analyze fortress potential
+    let mut pattern: u8 = PATTERN_OCB;
+    let mut certainty: u8 = CERTAINTY_LOW;
+
+    // Extract pawns
+    let wp = board.pieces[PAWN];       // White pawns
+    let bp = board.pieces[PAWN + 6];   // Black pawns
+
+    // Check for other pieces (queens, rooks, knights)
+    let wq = board.pieces[QUEEN];
+    let bq = board.pieces[QUEEN + 6];
+    let wr = board.pieces[ROOK];
+    let br = board.pieces[ROOK + 6];
+    let wn = board.pieces[KNIGHT];
+    let bn = board.pieces[KNIGHT + 6];
+
+    // No queens = much more likely draw
+    if wq == 0 && bq == 0 {
+        certainty += 40;
+    } else {
+        // Queens present - less likely draw
+        certainty = max_u8(certainty, 50) - 50;
+    }
+
+    // No rooks = more likely draw
+    if wr == 0 && br == 0 {
+        certainty += 30;
+    }
+
+    // No knights = more likely draw
+    if wn == 0 && bn == 0 {
+        certainty += 20;
+    }
+
+    // Analyze pawn structure
+    let (wp_count, bp_count) = popcount_dual(wp, bp);
+    let pawn_diff = abs_i32(wp_count - bp_count);
+
+    // More balanced pawns = more likely draw
+    if pawn_diff == 0 {
+        certainty += 30;
+    } else if pawn_diff == 1 {
+        certainty += 15;
+    } else if pawn_diff >= 3 {
+        certainty = max_u8(certainty, 20) - 20;
+    }
+
+    // Check if pawns are blocked (facing each other)
+    let wp_pushed = wp << 8;  // White pawns one rank forward
+    let blocked = wp_pushed & bp;  // Where they meet black pawns
+    let blocked_count = popcount_simd(blocked);
+
+    if blocked_count >= 3 {
+        pattern |= PATTERN_BLOCKED_CENTER;
+        certainty += 25;
+    }
+
+    // Check if pawns are on same color as opponent's bishop
+    let bishop_color = if wb_on_light { LIGHT_SQUARES } else { DARK_SQUARES };
+    let opponent_bishop_color = if bb_on_light { LIGHT_SQUARES } else { DARK_SQUARES };
+
+    let wp_on_opp_color = popcount_simd(wp & opponent_bishop_color);
+    let bp_on_opp_color = popcount_simd(bp & bishop_color);
+
+    // Pawns protected from opponent's bishop
+    if wp_on_opp_color >= wp_count - 1 {
+        pattern |= PATTERN_ALL_SAME_COLOR;
+        certainty += 35;
+    }
+    if bp_on_opp_color >= bp_count - 1 {
+        certainty += 25;
+    }
+
+    // Check for edge pawns only (rook pawns)
+    let wp_edge = popcount_simd(wp & EDGE_FILES);
+    let bp_edge = popcount_simd(bp & EDGE_FILES);
+
+    if wp_count > 0 && wp_edge == wp_count {
+        pattern |= PATTERN_EDGE_PAWNS;
+        certainty += 15;
+    }
+
+    // Check for passed pawns (reduce certainty if present)
+    let passed_pawns = detect_passed_pawns(wp, bp);
+    if passed_pawns == 0 {
+        pattern |= PATTERN_NO_PASSED;
+        certainty += 20;
+    } else {
+        let passed_count = popcount_simd(passed_pawns);
+        certainty = max_u8(certainty, passed_count as u8 * 15) - (passed_count as u8 * 15);
+    }
+
+    // Cap certainty at 255
+    certainty = min_u8(certainty, CERTAINTY_PROVEN);
+
+    // If certainty is very high and no queens/rooks, it's proven
+    if certainty >= CERTAINTY_HIGH && wq == 0 && bq == 0 && wr == 0 && br == 0 {
+        certainty = CERTAINTY_PROVEN;
+    }
+
+    return OCBResult {
+        is_ocb: true,
+        draw_certainty: certainty,
+        fortress_pattern: pattern,
+        blocked_pawn_count: blocked_count,
+        pawn_advantage: pawn_diff,
+        best_draw_move: 0,  // Move found during search, not static eval
+    };
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn detect_passed_pawns(wp: u64, bp: u64) -> u64 {
+    // White passed pawns: no black pawns ahead on same or adjacent files
+    let mut wp_passed: u64 = 0;
+
+    let all_files = [
+        0x0101010101010101u64, // a
+        0x0202020202020202u64, // b
+        0x0404040404040404u64, // c
+        0x0808080808080808u64, // d
+        0x1010101010101010u64, // e
+        0x2020202020202020u64, // f
+        0x4040404040404040u64, // g
+        0x8080808080808080u64, // h
+    ];
+
+    // For each white pawn, check if path is clear
+    let mut pawns = wp;
+    while pawns != 0 {
+        let sq = bit_scan_forward(pawns);
+        let file = sq % 8;
+        let rank = sq / 8;
+
+        // Mask for squares ahead on this file
+        let ahead_mask = all_files[file as usize] & !((1u64 << ((rank + 1) * 8)) - 1);
+
+        // Adjacent files
+        let adj_left = if file > 0 { all_files[(file - 1) as usize] } else { 0 };
+        let adj_right = if file < 7 { all_files[(file + 1) as usize] } else { 0 };
+
+        let block_mask = (ahead_mask | (adj_left & ahead_mask) | (adj_right & ahead_mask));
+
+        if (bp & block_mask) == 0 {
+            wp_passed |= 1u64 << sq;
+        }
+
+        pawns &= pawns - 1;
+    }
+
+    return wp_passed;
+}
+
+@inline
+fn max_u8(a: u8, b: u8) -> u8 {
+    if a > b { a } else { b }
+}
+
+@inline
+fn min_u8(a: u8, b: u8) -> u8 {
+    if a < b { a } else { b }
+}
+
+@inline
+fn abs_i32(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}
+
+@inline
+fn bit_scan_forward(x: u64) -> i32 {
+    return simd.ctz64(x);  // Count trailing zeros
+}
+
+// ============================================================================
+// BATCH PROCESSING
+// ============================================================================
+
+const OCB_BATCH_SIZE: i32 = 1024;
+
+fn detect_ocb_batch(boards: &[Board]) -> Vec<OCBResult> {
+    let mut results = Vec.with_capacity(boards.len());
+
+    // Process in parallel on GPU if available
+    on(gpu0) {
+        parallel for i in 0..boards.len() {
+            let result = detect_ocb_fortress(&boards[i]);
+            results.push(result);
+        }
+    }
+
+    return results;
+}
+
+// ============================================================================
+// QUICK CHECK (for search integration)
+// ============================================================================
+
+// Fast check if position MIGHT be OCB fortress
+// Use this to decide whether to call full detection
+@inline
+fn is_potential_ocb(board: &Board) -> bool {
+    let wb = board.pieces[BISHOP];
+    let bb = board.pieces[BISHOP + 6];
+
+    // Quick reject: need exactly 1 bishop each
+    if popcount_simd(wb) != 1 || popcount_simd(bb) != 1 {
+        return false;
+    }
+
+    // Quick reject: no queens present (much higher draw chance)
+    if board.pieces[QUEEN] != 0 || board.pieces[QUEEN + 6] != 0 {
+        return false;
+    }
+
+    // Check color with single AND
+    let same_color = ((wb & LIGHT_SQUARES) != 0) == ((bb & LIGHT_SQUARES) != 0);
+    return !same_color;  // OCB if different colors
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn ocb_result_to_string(result: &OCBResult) -> str {
+    if !result.is_ocb {
+        return "Not OCB";
+    }
+
+    let mut s = format!("OCB Fortress (certainty: {}/255)", result.draw_certainty);
+
+    if result.fortress_pattern & PATTERN_ALL_SAME_COLOR != 0 {
+        s = format!("{} [All pawns same color]", s);
+    }
+    if result.fortress_pattern & PATTERN_BLOCKED_CENTER != 0 {
+        s = format!("{} [Blocked center]", s);
+    }
+    if result.fortress_pattern & PATTERN_EDGE_PAWNS != 0 {
+        s = format!("{} [Edge pawns only]", s);
+    }
+    if result.fortress_pattern & PATTERN_NO_PASSED != 0 {
+        s = format!("{} [No passed pawns]", s);
+    }
+
+    return s;
+}

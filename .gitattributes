@@ -1,0 +1,7 @@
+*.dat filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.nnue filter=lfs diff=lfs merge=lfs -text
+
+# Mind language detection
+*.mind linguist-language=Rust
+*.mic linguist-detectable=false

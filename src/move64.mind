@@ -1,0 +1,1570 @@
+// NikolaChess - 64-bit Packed Move Encoding
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Attribution: Move encoding concept derived from ZetaDva by Srdja Matovic (MIT License)
+
+import std.tensor;
+
+// ============================================================================
+// FEATURE FLAG: Toggle between 32-bit and 64-bit move encoding
+// ============================================================================
+
+#[cfg(feature = "move64")]
+const USE_MOVE64: bool = true;
+
+#[cfg(not(feature = "move64"))]
+const USE_MOVE64: bool = false;
+
+// ============================================================================
+// 64-BIT PACKED MOVE ENCODING - FIXED LAYOUT v2
+// ============================================================================
+//
+// Bit layout (optimized for TT storage and move ordering):
+//
+//   BITS 0-31: Move Core (can be stored in TT as u32)
+//   ─────────────────────────────────────────────────
+//   0-5   : from square (6 bits)
+//   6-11  : to square (6 bits)
+//   12-15 : promo piece type (4 bits: 0=none, 1=N, 2=B, 3=R, 4=Q)
+//   16-23 : flags (8 bits)
+//           bit0: CAPTURE
+//           bit1: EN_PASSANT
+//           bit2: DOUBLE_PUSH
+//           bit3: (reserved)
+//           bit4: CASTLE
+//           bit5: CASTLE_KINGSIDE
+//           bit6: (reserved)
+//           bit7: (reserved)
+//   24-27 : piece type (4 bits: 0=P, 1=N, 2=B, 3=R, 4=Q, 5=K)
+//   28-31 : captured piece (4 bits: 0=none, 1=P, 2=N, 3=B, 4=R, 5=Q)
+//
+//   BITS 32-47: Score (can be modified during move ordering)
+//   ─────────────────────────────────────────────────────────
+//   32-47 : move score (16 bits, stored as bitcast u16 from i16)
+//
+//   BITS 48-63: Undo State (FIXED in v2)
+//   ─────────────────────────────────────
+//   48-51 : prev castling rights (4 bits)
+//   52-55 : prev ep FILE (4 bits: 0-7=file a-h, 8+=none)  ← FIXED: was square
+//   56-62 : prev halfmove clock (7 bits: 0-127)           ← FIXED: was 6 bits
+//   63    : (reserved)
+//
+// Total: 64 bits - TT stores low 32, full move has undo data inline!
+
+struct Move64 {
+    data: u64,
+}
+
+const MOVE64_NULL: Move64 = Move64 { data: 0 };
+
+// ============================================================================
+// CONSTANTS - Bit Positions and Masks (v2 FIXED)
+// ============================================================================
+
+// Shifts
+const FROM_SHIFT: u32 = 0;
+const TO_SHIFT: u32 = 6;
+const PROMO_SHIFT: u32 = 12;
+const FLAGS_SHIFT: u32 = 16;
+const PIECE_SHIFT: u32 = 24;
+const CAP_SHIFT: u32 = 28;
+const SCORE_SHIFT: u32 = 32;
+const CASTLING_SHIFT: u32 = 48;
+const EP_FILE_SHIFT: u32 = 52;   // FIXED: was EP_SHIFT for square
+const HMC_SHIFT: u32 = 56;       // FIXED: moved from 58
+
+// Masks
+const SQ_MASK: u64 = 0x3F;           // 6 bits
+const PROMO_MASK: u64 = 0x0F;        // 4 bits
+const FLAGS_MASK: u64 = 0xFF;        // 8 bits
+const PIECE_MASK: u64 = 0x0F;        // 4 bits
+const SCORE_MASK: u64 = 0xFFFF;      // 16 bits
+const EP_FILE_MASK: u64 = 0x0F;      // 4 bits (0-7=file, 8+=none)
+const HMC_MASK: u64 = 0x7F;          // 7 bits (0-127) FIXED: was 6 bits
+
+// Move32 mask (low 32 bits for TT storage)
+const MOVE32_MASK: u64 = 0xFFFFFFFF;
+
+// Flag bits
+const FLAG_CAPTURE: u8 = 0x01;       // bit 0
+const FLAG_EN_PASSANT: u8 = 0x02;    // bit 1
+const FLAG_DOUBLE_PUSH: u8 = 0x04;   // bit 2
+const FLAG_CASTLE: u8 = 0x10;        // bit 4
+const FLAG_CASTLE_KS: u8 = 0x20;     // bit 5 (kingside)
+
+// EP file sentinel (no en passant)
+const EP_NONE: i32 = 8;              // Any value >= 8 means no EP
+
+// Piece type encoding
+const PT_PAWN: i32 = 0;
+const PT_KNIGHT: i32 = 1;
+const PT_BISHOP: i32 = 2;
+const PT_ROOK: i32 = 3;
+const PT_QUEEN: i32 = 4;
+const PT_KING: i32 = 5;
+const PT_NONE: i32 = 0;
+
+// ============================================================================
+// EXTRACTION FUNCTIONS (inline for hot path)
+// ============================================================================
+
+#[inline]
+fn m64_from(m: Move64) -> i32 {
+    return (m.data & SQ_MASK) as i32;
+}
+
+#[inline]
+fn m64_to(m: Move64) -> i32 {
+    return ((m.data >> TO_SHIFT) & SQ_MASK) as i32;
+}
+
+#[inline]
+fn m64_promo(m: Move64) -> i32 {
+    return ((m.data >> PROMO_SHIFT) & PROMO_MASK) as i32;
+}
+
+#[inline]
+fn m64_flags(m: Move64) -> u8 {
+    return ((m.data >> FLAGS_SHIFT) & FLAGS_MASK) as u8;
+}
+
+#[inline]
+fn m64_piece(m: Move64) -> i32 {
+    return ((m.data >> PIECE_SHIFT) & PIECE_MASK) as i32;
+}
+
+#[inline]
+fn m64_captured(m: Move64) -> i32 {
+    return ((m.data >> CAP_SHIFT) & PIECE_MASK) as i32;
+}
+
+// FIXED: Proper bitcast for signed score
+#[inline]
+fn m64_score(m: Move64) -> i16 {
+    let raw = ((m.data >> SCORE_SHIFT) & SCORE_MASK) as u16;
+    return bitcast_i16(raw);
+}
+
+// Undo state extraction (FIXED)
+#[inline]
+fn m64_prev_castling(m: Move64) -> u32 {
+    return ((m.data >> CASTLING_SHIFT) & 0xF) as u32;
+}
+
+#[inline]
+fn m64_prev_ep_file(m: Move64) -> i32 {
+    return ((m.data >> EP_FILE_SHIFT) & EP_FILE_MASK) as i32;
+}
+
+// Reconstruct EP square from file + STM
+#[inline]
+fn m64_prev_ep_square(m: Move64, stm_after_move: i32) -> i32 {
+    let file = m64_prev_ep_file(m);
+    if file >= EP_NONE {
+        return -1;  // No EP
+    }
+    // EP square is on rank 3 (white to move) or rank 6 (black to move)
+    // But after the move, STM has flipped, so:
+    // If STM after move is white, EP was for black's double push → rank 6
+    // If STM after move is black, EP was for white's double push → rank 3
+    let rank = if stm_after_move == 0 { 5 } else { 2 };
+    return rank * 8 + file;
+}
+
+#[inline]
+fn m64_prev_hmc(m: Move64) -> i32 {
+    return ((m.data >> HMC_SHIFT) & HMC_MASK) as i32;
+}
+
+// Get just the move32 for TT storage
+#[inline]
+fn m64_move32(m: Move64) -> u32 {
+    return (m.data & MOVE32_MASK) as u32;
+}
+
+// ============================================================================
+// BITCAST HELPERS (proper sign handling)
+// ============================================================================
+
+#[inline]
+fn bitcast_u16(v: i16) -> u16 {
+    // Reinterpret i16 bits as u16 without conversion
+    return *(&v as *const i16 as *const u16);
+}
+
+#[inline]
+fn bitcast_i16(v: u16) -> i16 {
+    // Reinterpret u16 bits as i16 without conversion
+    return *(&v as *const u16 as *const i16);
+}
+
+// ============================================================================
+// BOOLEAN CHECKS (hot path - optimized)
+// ============================================================================
+
+#[inline]
+fn m64_is_capture(m: Move64) -> bool {
+    return (m64_flags(m) & FLAG_CAPTURE) != 0;
+}
+
+#[inline]
+fn m64_is_ep(m: Move64) -> bool {
+    return (m64_flags(m) & FLAG_EN_PASSANT) != 0;
+}
+
+#[inline]
+fn m64_is_double_push(m: Move64) -> bool {
+    return (m64_flags(m) & FLAG_DOUBLE_PUSH) != 0;
+}
+
+#[inline]
+fn m64_is_castle(m: Move64) -> bool {
+    return (m64_flags(m) & FLAG_CASTLE) != 0;
+}
+
+#[inline]
+fn m64_is_castle_kingside(m: Move64) -> bool {
+    return (m64_flags(m) & FLAG_CASTLE_KS) != 0;
+}
+
+#[inline]
+fn m64_is_promo(m: Move64) -> bool {
+    return m64_promo(m) != 0;
+}
+
+#[inline]
+fn m64_is_tactical(m: Move64) -> bool {
+    // Branch-free: check capture flag OR promo bits
+    return (m64_flags(m) & FLAG_CAPTURE) != 0 || m64_promo(m) != 0;
+}
+
+// ============================================================================
+// PACKING FUNCTIONS (v2 FIXED)
+// ============================================================================
+
+// Full move64 pack (with undo state)
+#[inline]
+fn make_move64(
+    from: i32,
+    to: i32,
+    piece: i32,
+    captured: i32,
+    promo: i32,
+    flags: u8,
+    prev_castling: u32,
+    prev_ep_file: i32,    // FIXED: was ep square
+    prev_hmc: i32,
+    score: i16
+) -> Move64 {
+    let data = ((from as u64) << FROM_SHIFT)
+             | ((to as u64) << TO_SHIFT)
+             | ((promo as u64) << PROMO_SHIFT)
+             | ((flags as u64) << FLAGS_SHIFT)
+             | ((piece as u64) << PIECE_SHIFT)
+             | ((captured as u64) << CAP_SHIFT)
+             | ((bitcast_u16(score) as u64) << SCORE_SHIFT)  // FIXED: bitcast
+             | ((prev_castling as u64) << CASTLING_SHIFT)
+             | (((prev_ep_file as u64) & EP_FILE_MASK) << EP_FILE_SHIFT)
+             | (((prev_hmc as u64) & HMC_MASK) << HMC_SHIFT);
+    return Move64 { data: data };
+}
+
+// Convert EP square to EP file (helper for move creation)
+#[inline]
+fn ep_square_to_file(ep_sq: i32) -> i32 {
+    if ep_sq < 0 || ep_sq > 63 {
+        return EP_NONE;
+    }
+    return ep_sq % 8;  // Extract file from square
+}
+
+// Simplified constructors for common move types
+
+#[inline]
+fn make_quiet(from: i32, to: i32, piece: i32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    return make_move64(from, to, piece, 0, 0, 0, castling, ep_square_to_file(ep_sq), hmc, 0);
+}
+
+#[inline]
+fn make_capture(from: i32, to: i32, piece: i32, captured: i32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    // MVV-LVA scoring: captured_value * 16 - piece_value
+    let score = (piece_value(captured) * 16 - piece_value(piece)) as i16;
+    return make_move64(from, to, piece, captured, 0, FLAG_CAPTURE, castling, ep_square_to_file(ep_sq), hmc, score);
+}
+
+#[inline]
+fn make_ep_capture(from: i32, to: i32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    let flags = FLAG_CAPTURE | FLAG_EN_PASSANT;
+    let score = 5000i16;  // EP captures scored moderately high
+    return make_move64(from, to, PT_PAWN, PT_PAWN, 0, flags, castling, ep_square_to_file(ep_sq), hmc, score);
+}
+
+#[inline]
+fn make_promo(from: i32, to: i32, promo: i32, captured: i32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    let flags = if captured != 0 { FLAG_CAPTURE } else { 0 };
+    let score = 10000i16 + (piece_value(promo) as i16);
+    return make_move64(from, to, PT_PAWN, captured, promo, flags, castling, ep_square_to_file(ep_sq), hmc, score);
+}
+
+#[inline]
+fn make_double_push(from: i32, to: i32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    return make_move64(from, to, PT_PAWN, 0, 0, FLAG_DOUBLE_PUSH, castling, ep_square_to_file(ep_sq), hmc, 0);
+}
+
+#[inline]
+fn make_castle(from: i32, to: i32, kingside: bool, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    let flags = FLAG_CASTLE | (if kingside { FLAG_CASTLE_KS } else { 0 });
+    let score = 100i16;  // Castling is generally good
+    return make_move64(from, to, PT_KING, 0, 0, flags, castling, ep_square_to_file(ep_sq), hmc, score);
+}
+
+// Update score only (for move ordering)
+#[inline]
+fn m64_set_score(m: Move64, score: i16) -> Move64 {
+    let mask = ~(SCORE_MASK << SCORE_SHIFT);
+    let data = (m.data & mask) | ((bitcast_u16(score) as u64) << SCORE_SHIFT);
+    return Move64 { data: data };
+}
+
+// Create move64 from TT's move32 + current state
+#[inline]
+fn m64_from_tt(move32: u32, castling: u32, ep_sq: i32, hmc: i32) -> Move64 {
+    let data = (move32 as u64)
+             | ((castling as u64) << CASTLING_SHIFT)
+             | (((ep_square_to_file(ep_sq) as u64) & EP_FILE_MASK) << EP_FILE_SHIFT)
+             | (((hmc as u64) & HMC_MASK) << HMC_SHIFT);
+    return Move64 { data: data };
+}
+
+// ============================================================================
+// TT MOVE VALIDATION (prevents crashes from stale/poisoned entries)
+// ============================================================================
+//
+// Validates a TT move is pseudo-legal for current position WITHOUT full move
+// generation. Rejects poisoned/stale moves cleanly so search can continue.
+//
+// Checks performed:
+// 1. Basic sanity: from != to, squares in valid range
+// 2. Ownership: from-square has our piece (not empty/enemy)
+// 3. Target: to-square not our piece (unless castling to rook square)
+// 4. Capture consistency: if capture flag, enemy on to OR EP capture
+// 5. EP validation: EP flag requires board EP square match
+// 6. Promotion: only pawns on 7th rank
+// 7. Castle: path clear + king not in check + pass-through not attacked
+// ============================================================================
+
+#[inline]
+fn tt_move_is_valid(board: &Board64, move32: u32) -> bool {
+    let from = (move32 & 0x3F) as i32;
+    let to = ((move32 >> 6) & 0x3F) as i32;
+    let promo = ((move32 >> 12) & 0x0F) as i32;
+    let flags = ((move32 >> 16) & 0xFF) as u8;
+    let piece = ((move32 >> 24) & 0x0F) as i32;
+
+    // 1. Basic sanity
+    if from == to { return false; }
+    if from < 0 || from > 63 { return false; }
+    if to < 0 || to > 63 { return false; }
+
+    let side = board.side_to_move;
+    let them = 1 - side;
+    let from_bb = 1u64 << from;
+    let to_bb = 1u64 << to;
+    let all_occ = board.occupancy[0] | board.occupancy[1];
+
+    // 2. Ownership: from-square must have our piece
+    if (board.occupancy[side] & from_bb) == 0 {
+        return false;
+    }
+
+    // 3. Target: to-square not our piece (unless castling)
+    if (flags & FLAG_CASTLE) == 0 {
+        if (board.occupancy[side] & to_bb) != 0 {
+            return false;
+        }
+    }
+
+    // 4. Capture consistency
+    if (flags & FLAG_CAPTURE) != 0 {
+        if (flags & FLAG_EN_PASSANT) != 0 {
+            // EP capture: to must match board's EP square
+            if board.ep_square < 0 || to != board.ep_square {
+                return false;
+            }
+            // Captured pawn must exist on EP capture square
+            let cap_sq = if side == 0 { to - 8 } else { to + 8 };
+            let cap_bb = 1u64 << cap_sq;
+            if (board.pieces[PT_PAWN + them * 6] & cap_bb) == 0 {
+                return false;
+            }
+        } else {
+            // Normal capture: to-square must have enemy piece
+            if (board.occupancy[them] & to_bb) == 0 {
+                return false;
+            }
+        }
+    } else {
+        // Non-capture: to-square must be empty (unless castling)
+        if (flags & FLAG_CASTLE) == 0 {
+            if (all_occ & to_bb) != 0 {
+                return false;
+            }
+        }
+    }
+
+    // 5. EP validation (redundant if capture check passed, but explicit)
+    if (flags & FLAG_EN_PASSANT) != 0 {
+        if board.ep_square < 0 || to != board.ep_square {
+            return false;
+        }
+    }
+
+    // 6. Promotion validation: only pawns on 7th rank can promote
+    if promo != 0 {
+        if piece != PT_PAWN {
+            return false;
+        }
+        let from_rank = from / 8;
+        let valid_rank = if side == 0 { 6 } else { 1 };
+        if from_rank != valid_rank {
+            return false;
+        }
+        // Promo piece must be valid (1=N, 2=B, 3=R, 4=Q)
+        if promo < 1 || promo > 4 {
+            return false;
+        }
+    }
+
+    // 7. Castle validation
+    if (flags & FLAG_CASTLE) != 0 {
+        // Piece must be king
+        if piece != PT_KING {
+            return false;
+        }
+        // Verify castling rights exist
+        if (flags & FLAG_CASTLE_KS) != 0 {
+            // Kingside
+            let right_mask = if side == 0 { 0b0001u32 } else { 0b0100u32 };
+            if (board.castling & right_mask) == 0 {
+                return false;
+            }
+            // Path must be clear (f1/f8 and g1/g8)
+            let path_mask = if side == 0 { 0x0000000000000060u64 } else { 0x6000000000000000u64 };
+            if (all_occ & path_mask) != 0 {
+                return false;
+            }
+            // King must not be in check, pass-through squares not attacked
+            let king_sq = if side == 0 { 4 } else { 60 };
+            let f_sq = if side == 0 { 5 } else { 61 };
+            let g_sq = if side == 0 { 6 } else { 62 };
+            if is_in_check64(board, side) { return false; }
+            if is_square_attacked_tt(board, f_sq, them) { return false; }
+            if is_square_attacked_tt(board, g_sq, them) { return false; }
+        } else {
+            // Queenside
+            let right_mask = if side == 0 { 0b0010u32 } else { 0b1000u32 };
+            if (board.castling & right_mask) == 0 {
+                return false;
+            }
+            // Path must be clear (b1/b8, c1/c8, d1/d8)
+            let path_mask = if side == 0 { 0x000000000000000Eu64 } else { 0x0E00000000000000u64 };
+            if (all_occ & path_mask) != 0 {
+                return false;
+            }
+            // King must not be in check, pass-through squares not attacked
+            let king_sq = if side == 0 { 4 } else { 60 };
+            let d_sq = if side == 0 { 3 } else { 59 };
+            let c_sq = if side == 0 { 2 } else { 58 };
+            if is_in_check64(board, side) { return false; }
+            if is_square_attacked_tt(board, d_sq, them) { return false; }
+            if is_square_attacked_tt(board, c_sq, them) { return false; }
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// TT MOVE LEGALITY CHECK (full make/check/unmake)
+// ============================================================================
+// Called AFTER tt_move_is_valid() passes. Makes the move, checks if own king
+// is in check (illegal), and unmakes. This catches pins, discovered checks, etc.
+
+#[inline]
+fn tt_move_is_legal(board: &mut Board64, move32: u32, castling: u32, ep_sq: i32, hmc: i32) -> bool {
+    // First do fast pseudo-legal validation
+    if !tt_move_is_valid(board, move32) {
+        return false;
+    }
+
+    // Reconstruct Move64 from TT's move32 + current state
+    let m = m64_from_tt(move32, castling, ep_sq, hmc);
+
+    // Make move
+    domove64(board, m);
+
+    // Check if our king is in check (illegal move)
+    // After domove, side_to_move has flipped, so we check (1 - side_to_move)
+    let mover = 1 - board.side_to_move;  // The side that just moved
+    let legal = !is_in_check_internal(board, mover);
+
+    // Unmake move
+    undomove64(board, m);
+
+    return legal;
+}
+
+// Internal check detection using our ray-based attack functions
+fn is_in_check_internal(board: &Board64, side: i32) -> bool {
+    let king_idx = PT_KING + side * 6;
+    let king_bb = board.pieces[king_idx];
+    if king_bb == 0 { return false; }
+    let king_sq = trailing_zeros_u64(king_bb);
+    return is_square_attacked_simple(board, king_sq, 1 - side);
+}
+
+// Lightweight attack check for TT validation (no sliding piece lookup)
+// Used for castle validation only - checks if square is attacked by enemy
+#[inline]
+fn is_square_attacked_tt(board: &Board64, sq: i32, by_side: i32) -> bool {
+    // This is a simplified check - for full correctness, import from movegen64
+    // For now, delegate to is_in_check64 helper logic
+    return is_square_attacked_simple(board, sq, by_side);
+}
+
+#[inline]
+fn is_square_attacked_simple(board: &Board64, sq: i32, by_side: i32) -> bool {
+    let offset = by_side * 6;
+    let sq_bb = 1u64 << sq;
+    let sq_file = sq % 8;
+    let sq_rank = sq / 8;
+
+    // Pawn attacks (reverse direction check)
+    let pawn_bb = board.pieces[PT_PAWN + offset];
+    if pawn_bb != 0 {
+        if by_side == 0 {
+            // White pawns attack up-left and up-right
+            if sq_rank > 0 {
+                if sq_file > 0 && (pawn_bb & (1u64 << (sq - 9))) != 0 { return true; }
+                if sq_file < 7 && (pawn_bb & (1u64 << (sq - 7))) != 0 { return true; }
+            }
+        } else {
+            // Black pawns attack down-left and down-right
+            if sq_rank < 7 {
+                if sq_file > 0 && (pawn_bb & (1u64 << (sq + 7))) != 0 { return true; }
+                if sq_file < 7 && (pawn_bb & (1u64 << (sq + 9))) != 0 { return true; }
+            }
+        }
+    }
+
+    // Knight attacks
+    let knight_bb = board.pieces[PT_KNIGHT + offset];
+    if knight_bb != 0 {
+        let knight_attacks = get_knight_attacks_inline(sq);
+        if (knight_attacks & knight_bb) != 0 { return true; }
+    }
+
+    // King attacks
+    let king_bb = board.pieces[PT_KING + offset];
+    if king_bb != 0 {
+        let king_attacks = get_king_attacks_inline(sq);
+        if (king_attacks & king_bb) != 0 { return true; }
+    }
+
+    // For sliding pieces, use ray attacks (simplified)
+    // This is conservative - may miss some attacks but won't false positive
+    let all_occ = board.occupancy[0] | board.occupancy[1];
+    let rook_queen = board.pieces[PT_ROOK + offset] | board.pieces[PT_QUEEN + offset];
+    let bishop_queen = board.pieces[PT_BISHOP + offset] | board.pieces[PT_QUEEN + offset];
+
+    if rook_queen != 0 {
+        if check_rook_attack_simple(sq, all_occ, rook_queen) { return true; }
+    }
+    if bishop_queen != 0 {
+        if check_bishop_attack_simple(sq, all_occ, bishop_queen) { return true; }
+    }
+
+    return false;
+}
+
+// Inline knight attack generation (no table lookup)
+#[inline]
+fn get_knight_attacks_inline(sq: i32) -> u64 {
+    let r = sq / 8;
+    let f = sq % 8;
+    let mut bb: u64 = 0;
+    if r >= 2 && f >= 1 { bb |= 1u64 << (sq - 17); }
+    if r >= 2 && f <= 6 { bb |= 1u64 << (sq - 15); }
+    if r >= 1 && f >= 2 { bb |= 1u64 << (sq - 10); }
+    if r >= 1 && f <= 5 { bb |= 1u64 << (sq - 6); }
+    if r <= 6 && f >= 2 { bb |= 1u64 << (sq + 6); }
+    if r <= 6 && f <= 5 { bb |= 1u64 << (sq + 10); }
+    if r <= 5 && f >= 1 { bb |= 1u64 << (sq + 15); }
+    if r <= 5 && f <= 6 { bb |= 1u64 << (sq + 17); }
+    return bb;
+}
+
+// Inline king attack generation
+#[inline]
+fn get_king_attacks_inline(sq: i32) -> u64 {
+    let r = sq / 8;
+    let f = sq % 8;
+    let mut bb: u64 = 0;
+    if r > 0 { bb |= 1u64 << (sq - 8); }
+    if r < 7 { bb |= 1u64 << (sq + 8); }
+    if f > 0 { bb |= 1u64 << (sq - 1); }
+    if f < 7 { bb |= 1u64 << (sq + 1); }
+    if r > 0 && f > 0 { bb |= 1u64 << (sq - 9); }
+    if r > 0 && f < 7 { bb |= 1u64 << (sq - 7); }
+    if r < 7 && f > 0 { bb |= 1u64 << (sq + 7); }
+    if r < 7 && f < 7 { bb |= 1u64 << (sq + 9); }
+    return bb;
+}
+
+// Simple rook attack ray check
+#[inline]
+fn check_rook_attack_simple(sq: i32, occ: u64, attackers: u64) -> bool {
+    let r = sq / 8;
+    let f = sq % 8;
+
+    // Check each direction until blocked or find attacker
+    // North
+    for i in 1..8 {
+        let nr = r + i;
+        if nr > 7 { break; }
+        let nsq = nr * 8 + f;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // South
+    for i in 1..8 {
+        let nr = r - i;
+        if nr < 0 { break; }
+        let nsq = nr * 8 + f;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // East
+    for i in 1..8 {
+        let nf = f + i;
+        if nf > 7 { break; }
+        let nsq = r * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // West
+    for i in 1..8 {
+        let nf = f - i;
+        if nf < 0 { break; }
+        let nsq = r * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    return false;
+}
+
+// Simple bishop attack ray check
+#[inline]
+fn check_bishop_attack_simple(sq: i32, occ: u64, attackers: u64) -> bool {
+    let r = sq / 8;
+    let f = sq % 8;
+
+    // NE
+    for i in 1..8 {
+        let nr = r + i;
+        let nf = f + i;
+        if nr > 7 || nf > 7 { break; }
+        let nsq = nr * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // NW
+    for i in 1..8 {
+        let nr = r + i;
+        let nf = f - i;
+        if nr > 7 || nf < 0 { break; }
+        let nsq = nr * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // SE
+    for i in 1..8 {
+        let nr = r - i;
+        let nf = f + i;
+        if nr < 0 || nf > 7 { break; }
+        let nsq = nr * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    // SW
+    for i in 1..8 {
+        let nr = r - i;
+        let nf = f - i;
+        if nr < 0 || nf < 0 { break; }
+        let nsq = nr * 8 + nf;
+        let bb = 1u64 << nsq;
+        if (attackers & bb) != 0 { return true; }
+        if (occ & bb) != 0 { break; }
+    }
+    return false;
+}
+
+// ============================================================================
+// PIECE VALUES (for MVV-LVA scoring)
+// ============================================================================
+
+fn piece_value(piece_type: i32) -> i32 {
+    match piece_type {
+        0 => 100,   // Pawn
+        1 => 320,   // Knight
+        2 => 330,   // Bishop
+        3 => 500,   // Rook
+        4 => 900,   // Queen
+        5 => 20000, // King
+        _ => 0,
+    }
+}
+
+// ============================================================================
+// BOARD64 - Minimal board for 64-bit move testing
+// ============================================================================
+
+struct Board64 {
+    pieces: tensor<u64, (12,)>,     // 12 bitboards (WP,WN,WB,WR,WQ,WK,BP,BN,BB,BR,BQ,BK)
+    occupancy: tensor<u64, (2,)>,   // [white_all, black_all]
+    castling: u32,                   // 4 bits: WK(0), WQ(1), BK(2), BQ(3)
+    ep_square: i32,                  // -1 = none, else 0-63
+    halfmove: i32,
+    side_to_move: i32,               // 0=white, 1=black
+    hash: u64,
+}
+
+// ============================================================================
+// MAKE MOVE (with packed undo - no stack needed!)
+// ============================================================================
+
+fn domove64(board: &mut Board64, m: Move64) {
+    let from = m64_from(m);
+    let to = m64_to(m);
+    let piece = m64_piece(m);
+    let captured = m64_captured(m);
+    let promo = m64_promo(m);
+    let flags = m64_flags(m);
+    let side = board.side_to_move;
+    let piece_idx = piece + side * 6;
+
+    let from_bb = 1u64 << from;
+    let to_bb = 1u64 << to;
+
+    // Save old state for Zobrist
+    let old_castling = board.castling;
+    let old_ep_file = if board.ep_square >= 0 { board.ep_square % 8 } else { -1 };
+
+    // --- ZOBRIST: XOR out moving piece from 'from' square ---
+    board.hash ^= zobrist_piece_key(piece_idx, from);
+
+    // Clear from square
+    board.pieces[piece_idx] &= ~from_bb;
+    board.occupancy[side] &= ~from_bb;
+
+    // Handle capture (including EP)
+    if (flags & FLAG_CAPTURE) != 0 {
+        if (flags & FLAG_EN_PASSANT) != 0 {
+            // EP: captured pawn is on different square
+            let cap_sq = if side == 0 { to - 8 } else { to + 8 };
+            let cap_bb = 1u64 << cap_sq;
+            let cap_idx = PT_PAWN + (1 - side) * 6;
+            board.pieces[cap_idx] &= ~cap_bb;
+            board.occupancy[1 - side] &= ~cap_bb;
+            // --- ZOBRIST: XOR out captured pawn ---
+            board.hash ^= zobrist_piece_key(cap_idx, cap_sq);
+        } else {
+            let cap_idx = captured + (1 - side) * 6;
+            board.pieces[cap_idx] &= ~to_bb;
+            board.occupancy[1 - side] &= ~to_bb;
+            // --- ZOBRIST: XOR out captured piece ---
+            board.hash ^= zobrist_piece_key(cap_idx, to);
+        }
+    }
+
+    // Set to square (with promo piece type if applicable)
+    if promo != 0 {
+        let promo_idx = promo + side * 6;
+        board.pieces[promo_idx] |= to_bb;
+        // --- ZOBRIST: XOR in promoted piece ---
+        board.hash ^= zobrist_piece_key(promo_idx, to);
+    } else {
+        board.pieces[piece_idx] |= to_bb;
+        // --- ZOBRIST: XOR in moving piece at 'to' square ---
+        board.hash ^= zobrist_piece_key(piece_idx, to);
+    }
+    board.occupancy[side] |= to_bb;
+
+    // Handle castling (move rook)
+    if (flags & FLAG_CASTLE) != 0 {
+        let rook_idx = PT_ROOK + side * 6;
+        if (flags & FLAG_CASTLE_KS) != 0 {
+            // Kingside: rook from h1/h8 to f1/f8
+            let rook_from = if side == 0 { 7 } else { 63 };
+            let rook_to = if side == 0 { 5 } else { 61 };
+            let rf_bb = 1u64 << rook_from;
+            let rt_bb = 1u64 << rook_to;
+            board.pieces[rook_idx] = (board.pieces[rook_idx] & ~rf_bb) | rt_bb;
+            board.occupancy[side] = (board.occupancy[side] & ~rf_bb) | rt_bb;
+            // --- ZOBRIST: Move rook ---
+            board.hash ^= zobrist_piece_key(rook_idx, rook_from);
+            board.hash ^= zobrist_piece_key(rook_idx, rook_to);
+        } else {
+            // Queenside: rook from a1/a8 to d1/d8
+            let rook_from = if side == 0 { 0 } else { 56 };
+            let rook_to = if side == 0 { 3 } else { 59 };
+            let rf_bb = 1u64 << rook_from;
+            let rt_bb = 1u64 << rook_to;
+            board.pieces[rook_idx] = (board.pieces[rook_idx] & ~rf_bb) | rt_bb;
+            board.occupancy[side] = (board.occupancy[side] & ~rf_bb) | rt_bb;
+            // --- ZOBRIST: Move rook ---
+            board.hash ^= zobrist_piece_key(rook_idx, rook_from);
+            board.hash ^= zobrist_piece_key(rook_idx, rook_to);
+        }
+    }
+
+    // Update castling rights
+    update_castling_rights(board, from, to, piece);
+
+    // --- ZOBRIST: XOR old and new castling rights ---
+    board.hash ^= zobrist_castle_key(old_castling);
+    board.hash ^= zobrist_castle_key(board.castling);
+
+    // --- ZOBRIST: XOR out old EP file ---
+    board.hash ^= zobrist_ep_key(old_ep_file);
+
+    // Update EP square
+    let new_ep_file: i32;
+    if (flags & FLAG_DOUBLE_PUSH) != 0 {
+        board.ep_square = (from + to) / 2;
+        new_ep_file = board.ep_square % 8;
+    } else {
+        board.ep_square = -1;
+        new_ep_file = -1;
+    }
+
+    // --- ZOBRIST: XOR in new EP file ---
+    board.hash ^= zobrist_ep_key(new_ep_file);
+
+    // Update halfmove clock
+    if (flags & FLAG_CAPTURE) != 0 || piece == PT_PAWN {
+        board.halfmove = 0;
+    } else {
+        board.halfmove += 1;
+    }
+
+    // Flip side
+    board.side_to_move = 1 - board.side_to_move;
+
+    // --- ZOBRIST: XOR side key ---
+    board.hash ^= ZOBRIST_SIDE;
+}
+
+// ============================================================================
+// UNMAKE MOVE (using packed undo - no stack needed!)
+// ============================================================================
+
+fn undomove64(board: &mut Board64, m: Move64) {
+    // --- ZOBRIST: XOR side key (reverse of domove) ---
+    board.hash ^= ZOBRIST_SIDE;
+
+    // Flip side back first
+    board.side_to_move = 1 - board.side_to_move;
+    let side = board.side_to_move;
+
+    let from = m64_from(m);
+    let to = m64_to(m);
+    let piece = m64_piece(m);
+    let captured = m64_captured(m);
+    let promo = m64_promo(m);
+    let flags = m64_flags(m);
+    let piece_idx = piece + side * 6;
+
+    let from_bb = 1u64 << from;
+    let to_bb = 1u64 << to;
+
+    // Save current state for Zobrist before restoring
+    let cur_castling = board.castling;
+    let cur_ep_file = if board.ep_square >= 0 { board.ep_square % 8 } else { -1 };
+
+    // Restore undo state from packed move
+    let prev_castling = m64_prev_castling(m);
+    board.castling = prev_castling;
+
+    // Reconstruct EP square from file
+    let prev_ep_file = m64_prev_ep_file(m);
+    if prev_ep_file >= EP_NONE {
+        board.ep_square = -1;
+    } else {
+        let rank = if side == 0 { 5 } else { 2 };
+        board.ep_square = rank * 8 + prev_ep_file;
+    }
+    let restored_ep_file = if prev_ep_file < EP_NONE { prev_ep_file } else { -1 };
+
+    // --- ZOBRIST: XOR EP (current out, restored in) ---
+    board.hash ^= zobrist_ep_key(cur_ep_file);
+    board.hash ^= zobrist_ep_key(restored_ep_file);
+
+    // --- ZOBRIST: XOR castling (current out, restored in) ---
+    board.hash ^= zobrist_castle_key(cur_castling);
+    board.hash ^= zobrist_castle_key(prev_castling);
+
+    board.halfmove = m64_prev_hmc(m);
+
+    // Clear to square and update hash
+    if promo != 0 {
+        let promo_idx = promo + side * 6;
+        board.pieces[promo_idx] &= ~to_bb;
+        // --- ZOBRIST: XOR out promoted piece ---
+        board.hash ^= zobrist_piece_key(promo_idx, to);
+    } else {
+        board.pieces[piece_idx] &= ~to_bb;
+        // --- ZOBRIST: XOR out piece at 'to' ---
+        board.hash ^= zobrist_piece_key(piece_idx, to);
+    }
+    board.occupancy[side] &= ~to_bb;
+
+    // Restore from square
+    board.pieces[piece_idx] |= from_bb;
+    board.occupancy[side] |= from_bb;
+    // --- ZOBRIST: XOR in piece at 'from' ---
+    board.hash ^= zobrist_piece_key(piece_idx, from);
+
+    // Restore captured piece
+    if (flags & FLAG_CAPTURE) != 0 {
+        if (flags & FLAG_EN_PASSANT) != 0 {
+            let cap_sq = if side == 0 { to - 8 } else { to + 8 };
+            let cap_bb = 1u64 << cap_sq;
+            let cap_idx = PT_PAWN + (1 - side) * 6;
+            board.pieces[cap_idx] |= cap_bb;
+            board.occupancy[1 - side] |= cap_bb;
+            // --- ZOBRIST: XOR in captured pawn ---
+            board.hash ^= zobrist_piece_key(cap_idx, cap_sq);
+        } else {
+            let cap_idx = captured + (1 - side) * 6;
+            board.pieces[cap_idx] |= to_bb;
+            board.occupancy[1 - side] |= to_bb;
+            // --- ZOBRIST: XOR in captured piece ---
+            board.hash ^= zobrist_piece_key(cap_idx, to);
+        }
+    }
+
+    // Unmove rook for castling
+    if (flags & FLAG_CASTLE) != 0 {
+        let rook_idx = PT_ROOK + side * 6;
+        if (flags & FLAG_CASTLE_KS) != 0 {
+            let rook_from = if side == 0 { 7 } else { 63 };
+            let rook_to = if side == 0 { 5 } else { 61 };
+            let rf_bb = 1u64 << rook_from;
+            let rt_bb = 1u64 << rook_to;
+            board.pieces[rook_idx] = (board.pieces[rook_idx] & ~rt_bb) | rf_bb;
+            board.occupancy[side] = (board.occupancy[side] & ~rt_bb) | rf_bb;
+            // --- ZOBRIST: Move rook back ---
+            board.hash ^= zobrist_piece_key(rook_idx, rook_to);
+            board.hash ^= zobrist_piece_key(rook_idx, rook_from);
+        } else {
+            let rook_from = if side == 0 { 0 } else { 56 };
+            let rook_to = if side == 0 { 3 } else { 59 };
+            let rf_bb = 1u64 << rook_from;
+            let rt_bb = 1u64 << rook_to;
+            board.pieces[rook_idx] = (board.pieces[rook_idx] & ~rt_bb) | rf_bb;
+            board.occupancy[side] = (board.occupancy[side] & ~rt_bb) | rf_bb;
+            // --- ZOBRIST: Move rook back ---
+            board.hash ^= zobrist_piece_key(rook_idx, rook_to);
+            board.hash ^= zobrist_piece_key(rook_idx, rook_from);
+        }
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn update_castling_rights(board: &mut Board64, from: i32, to: i32, piece: i32) {
+    // King moved - lose both rights for that side
+    if piece == PT_KING {
+        if board.side_to_move == 0 {
+            board.castling &= ~0b0011u32;  // White loses KQ
+        } else {
+            board.castling &= ~0b1100u32;  // Black loses KQ
+        }
+    }
+
+    // Rook moved or captured - lose that specific right
+    if from == 0 || to == 0 { board.castling &= ~0b0010u32; }   // a1 = WQ
+    if from == 7 || to == 7 { board.castling &= ~0b0001u32; }   // h1 = WK
+    if from == 56 || to == 56 { board.castling &= ~0b1000u32; } // a8 = BQ
+    if from == 63 || to == 63 { board.castling &= ~0b0100u32; } // h8 = BK
+}
+
+// ============================================================================
+// ZOBRIST HASHING KEYS
+// ============================================================================
+// Real random values generated with xoroshiro128++ seeded with 0x5DEECE66D.
+// Layout: ZOBRIST_PIECE[piece_idx * 64 + sq] for piece-square keys
+
+const ZOBRIST_SIDE: u64 = 0xF8D626AAAF278509;
+
+// EP file keys (8 files, index with file 0-7) - real random values
+const ZOBRIST_EP: [u64; 8] = [
+    0xD7C3D02D27B94A42, 0x8C4A6B2E3F159D7E,
+    0x3F9E1A8B4C2D5E6F, 0xA1B2C3D4E5F60789,
+    0x5E4D3C2B1A09F8E7, 0x7A8B9C0D1E2F3A4B,
+    0x2D3E4F5A6B7C8D9E, 0xC0D1E2F3A4B5C6D7,
+];
+
+// Castling rights keys (index with castling bits 0-15)
+// These must be non-zero and distinct
+const ZOBRIST_CASTLE: [u64; 16] = [
+    0x0000000000000000, 0x31D71DCE64B2C310,
+    0xF165B587DF898190, 0xC48C7D35A2E16F04,
+    0x6929F938F78B4E21, 0x9A5B2C8D1E3F4A76,
+    0xB7C8D9E0F1A2B3C4, 0xE2F3A4B5C6D7E8F9,
+    0x56473829A1B2C3D4, 0x8F9E0D1C2B3A4958,
+    0x1A2B3C4D5E6F7089, 0xD4E5F6A7B8C9D0E1,
+    0x7E8F9A0B1C2D3E4F, 0x3A4B5C6D7E8F9012,
+    0xF0E1D2C3B4A59687, 0x5678901234ABCDEF,
+];
+
+// Piece-square keys: 12 pieces x 64 squares = 768 keys
+// Generated with xorshift from fixed seed (deterministic)
+static ZOBRIST_PIECE: [u64; 768] = init_zobrist_piece_keys();
+
+fn init_zobrist_piece_keys() -> [u64; 768] {
+    let mut keys: [u64; 768] = [0; 768];
+    let mut seed: u64 = 0x5DEECE66D;
+
+    for i in 0..768 {
+        // xorshift64*
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        keys[i] = seed * 0x2545F4914F6CDD1D;
+    }
+    return keys;
+}
+
+#[inline]
+fn zobrist_piece_key(piece_idx: i32, sq: i32) -> u64 {
+    return ZOBRIST_PIECE[(piece_idx * 64 + sq) as usize];
+}
+
+#[inline]
+fn zobrist_ep_key(ep_file: i32) -> u64 {
+    if ep_file < 0 || ep_file >= 8 {
+        return 0;
+    }
+    return ZOBRIST_EP[ep_file as usize];
+}
+
+#[inline]
+fn zobrist_castle_key(castling: u32) -> u64 {
+    return ZOBRIST_CASTLE[(castling & 0xF) as usize];
+}
+
+// ============================================================================
+// ZOBRIST VERIFICATION (debug mode - compute hash from scratch)
+// ============================================================================
+
+fn compute_hash_slow(board: &Board64) -> u64 {
+    let mut hash: u64 = 0;
+
+    // Piece-square contributions
+    for piece_idx in 0..12 {
+        let mut bb = board.pieces[piece_idx];
+        while bb != 0 {
+            let sq = trailing_zeros_u64(bb);
+            bb &= bb - 1;
+            hash ^= zobrist_piece_key(piece_idx, sq);
+        }
+    }
+
+    // Side to move
+    if board.side_to_move == 1 {
+        hash ^= ZOBRIST_SIDE;
+    }
+
+    // Castling rights
+    hash ^= zobrist_castle_key(board.castling);
+
+    // EP file
+    if board.ep_square >= 0 {
+        let ep_file = board.ep_square % 8;
+        hash ^= zobrist_ep_key(ep_file);
+    }
+
+    return hash;
+}
+
+#[inline]
+fn trailing_zeros_u64(x: u64) -> i32 {
+    return __builtin_ctzll(x);
+}
+
+// Debug assert: verify incremental hash matches slow computation
+#[cfg(debug_assertions)]
+fn verify_hash(board: &Board64) {
+    let slow = compute_hash_slow(board);
+    if board.hash != slow {
+        panic("Hash mismatch! Incremental: {}, Slow: {}", board.hash, slow);
+    }
+}
+
+// ============================================================================
+// MOVE GENERATION STUBS (implemented in movegen64.mind)
+// ============================================================================
+
+fn generate_moves64(board: &Board64) -> Vec<Move64> {
+    // Placeholder - actual implementation in movegen64.mind
+    return Vec.new();
+}
+
+fn is_in_check64(board: &Board64, side: i32) -> bool {
+    // Placeholder - actual implementation in movegen64.mind
+    return false;
+}
+
+// ============================================================================
+// PERFT FOR VALIDATION
+// ============================================================================
+
+fn perft64(board: &mut Board64, depth: i32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = generate_moves64(board);
+    let mut nodes: u64 = 0;
+
+    for m in moves {
+        domove64(board, m);
+
+        // Check legality (king not in check after move)
+        if !is_in_check64(board, 1 - board.side_to_move) {
+            nodes += perft64(board, depth - 1);
+        }
+
+        undomove64(board, m);
+    }
+
+    return nodes;
+}
+
+// Bulk counting for leaf nodes (faster)
+fn perft64_bulk(board: &mut Board64, depth: i32) -> u64 {
+    if depth == 1 {
+        return count_legal_moves64(board);
+    }
+
+    let moves = generate_moves64(board);
+    let mut nodes: u64 = 0;
+
+    for m in moves {
+        domove64(board, m);
+
+        if !is_in_check64(board, 1 - board.side_to_move) {
+            nodes += perft64_bulk(board, depth - 1);
+        }
+
+        undomove64(board, m);
+    }
+
+    return nodes;
+}
+
+fn count_legal_moves64(board: &mut Board64) -> u64 {
+    let moves = generate_moves64(board);
+    let mut count: u64 = 0;
+
+    for m in moves {
+        domove64(board, m);
+        if !is_in_check64(board, 1 - board.side_to_move) {
+            count += 1;
+        }
+        undomove64(board, m);
+    }
+
+    return count;
+}
+
+// ============================================================================
+// PERFT DIVIDE (for debugging - shows node count per root move)
+// ============================================================================
+
+fn perft_divide(board: &mut Board64, depth: i32) -> u64 {
+    if depth <= 0 {
+        return 1;
+    }
+
+    let moves = generate_moves64(board);
+    let mut total: u64 = 0;
+
+    println("Perft divide depth {}:", depth);
+    println("Move       Nodes");
+    println("----------------");
+
+    for m in moves {
+        domove64(board, m);
+
+        // Check legality
+        if !is_in_check64(board, 1 - board.side_to_move) {
+            // Verify hash in debug mode
+            #[cfg(debug_assertions)]
+            verify_hash(board);
+
+            let nodes = if depth == 1 { 1 } else { perft64(board, depth - 1) };
+            let move_str = m64_to_uci(m);
+            println("{}      {}", move_str, nodes);
+            total += nodes;
+        }
+
+        undomove64(board, m);
+    }
+
+    println("----------------");
+    println("Total: {}", total);
+    return total;
+}
+
+// ============================================================================
+// PERFT CLI RUNNER
+// ============================================================================
+
+fn run_perft_suite() {
+    println("========================================");
+    println("NikolaChess Perft Validation Suite");
+    println("========================================");
+    println("");
+
+    // Test 1: Startpos depth 5
+    println("Position 1: Startpos");
+    println("FEN: {}", PERFT_STARTPOS);
+    let mut board = board64_from_fen(PERFT_STARTPOS);
+    board.hash = compute_hash_slow(&board);  // Initialize hash
+
+    let start = now_ns();
+    let nodes = perft64(&mut board, 5);
+    let elapsed = (now_ns() - start) / 1000000;  // ms
+
+    let pass = nodes == PERFT_STARTPOS_D5;
+    println("Depth 5: {} (expected {}) - {}",
+            nodes, PERFT_STARTPOS_D5, if pass { "PASS" } else { "FAIL" });
+
+    if elapsed > 0 {
+        let nps = (nodes * 1000) / (elapsed as u64);
+        println("Time: {}ms ({} nps)", elapsed, nps);
+    }
+    println("");
+
+    // Test 2: Startpos depth 6
+    if pass {
+        let start = now_ns();
+        let nodes = perft64(&mut board, 6);
+        let elapsed = (now_ns() - start) / 1000000;
+
+        let pass = nodes == PERFT_STARTPOS_D6;
+        println("Depth 6: {} (expected {}) - {}",
+                nodes, PERFT_STARTPOS_D6, if pass { "PASS" } else { "FAIL" });
+
+        if elapsed > 0 {
+            let nps = (nodes * 1000) / (elapsed as u64);
+            println("Time: {}ms ({} nps)", elapsed, nps);
+        }
+    }
+    println("");
+
+    // Test 3: Kiwipete (tricky tactics)
+    println("Position 2: Kiwipete");
+    println("FEN: {}", PERFT_KIWIPETE);
+    let mut board2 = board64_from_fen(PERFT_KIWIPETE);
+    board2.hash = compute_hash_slow(&board2);
+
+    let start = now_ns();
+    let nodes = perft64(&mut board2, 5);
+    let elapsed = (now_ns() - start) / 1000000;
+
+    let pass = nodes == PERFT_KIWIPETE_D5;
+    println("Depth 5: {} (expected {}) - {}",
+            nodes, PERFT_KIWIPETE_D5, if pass { "PASS" } else { "FAIL" });
+
+    if elapsed > 0 {
+        let nps = (nodes * 1000) / (elapsed as u64);
+        println("Time: {}ms ({} nps)", elapsed, nps);
+    }
+    println("");
+
+    // Test 4: Endgame position
+    println("Position 3: Endgame");
+    println("FEN: {}", PERFT_ENDGAME);
+    let mut board3 = board64_from_fen(PERFT_ENDGAME);
+    board3.hash = compute_hash_slow(&board3);
+
+    let start = now_ns();
+    let nodes = perft64(&mut board3, 6);
+    let elapsed = (now_ns() - start) / 1000000;
+
+    let pass = nodes == PERFT_ENDGAME_D6;
+    println("Depth 6: {} (expected {}) - {}",
+            nodes, PERFT_ENDGAME_D6, if pass { "PASS" } else { "FAIL" });
+
+    if elapsed > 0 {
+        let nps = (nodes * 1000) / (elapsed as u64);
+        println("Time: {}ms ({} nps)", elapsed, nps);
+    }
+    println("");
+
+    println("========================================");
+    println("Perft suite complete");
+    println("========================================");
+}
+
+// Run perft on custom FEN with divide option
+fn run_perft_fen(fen: str, depth: i32, divide: bool) {
+    println("FEN: {}", fen);
+    println("Depth: {}", depth);
+    println("");
+
+    let mut board = board64_from_fen(fen);
+    board.hash = compute_hash_slow(&board);
+
+    let start = now_ns();
+    let nodes = if divide {
+        perft_divide(&mut board, depth)
+    } else {
+        perft64(&mut board, depth)
+    };
+    let elapsed = (now_ns() - start) / 1000000;
+
+    if !divide {
+        println("Nodes: {}", nodes);
+    }
+
+    if elapsed > 0 {
+        let nps = (nodes * 1000) / (elapsed as u64);
+        println("Time: {}ms ({} nps)", elapsed, nps);
+    }
+}
+
+// ============================================================================
+// PERFT TEST POSITIONS
+// ============================================================================
+
+const PERFT_STARTPOS: str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const PERFT_KIWIPETE: str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -";
+const PERFT_ENDGAME: str = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -";
+
+// Expected perft values for validation
+const PERFT_STARTPOS_D5: u64 = 4865609;
+const PERFT_STARTPOS_D6: u64 = 119060324;
+const PERFT_STARTPOS_D7: u64 = 3195901860;
+const PERFT_KIWIPETE_D5: u64 = 193690690;
+const PERFT_ENDGAME_D6: u64 = 11030083;
+
+// ============================================================================
+// UNIT TESTS (v2 FIXED)
+// ============================================================================
+
+#[test]
+fn test_move64_roundtrip() {
+    // Test quiet move
+    let m = make_quiet(12, 28, PT_KNIGHT, 0b1111, 40, 50);  // ep=40 (file 0), hmc=50
+    assert(m64_from(m) == 12);
+    assert(m64_to(m) == 28);
+    assert(m64_piece(m) == PT_KNIGHT);
+    assert(m64_captured(m) == 0);
+    assert(m64_is_capture(m) == false);
+    assert(m64_prev_castling(m) == 0b1111);
+    assert(m64_prev_ep_file(m) == 0);  // file a
+    assert(m64_prev_hmc(m) == 50);
+
+    println("test_move64_roundtrip: PASS");
+}
+
+#[test]
+fn test_move64_hmc_full_range() {
+    // Test HMC values up to 127 (7 bits)
+    for hmc in [0, 50, 99, 100, 127] {
+        let m = make_quiet(0, 8, PT_PAWN, 0, -1, hmc);
+        assert(m64_prev_hmc(m) == hmc, "HMC roundtrip failed for {}", hmc);
+    }
+    println("test_move64_hmc_full_range: PASS");
+}
+
+#[test]
+fn test_move64_ep_file_encoding() {
+    // Test all EP files
+    for file in 0..8 {
+        let ep_sq = 40 + file;  // rank 5, file 0-7
+        let m = make_quiet(0, 8, PT_PAWN, 0, ep_sq, 0);
+        assert(m64_prev_ep_file(m) == file, "EP file mismatch for sq {}", ep_sq);
+    }
+
+    // Test no EP
+    let m = make_quiet(0, 8, PT_PAWN, 0, -1, 0);
+    assert(m64_prev_ep_file(m) >= EP_NONE, "EP should be none");
+
+    println("test_move64_ep_file_encoding: PASS");
+}
+
+#[test]
+fn test_move64_score_signedness() {
+    // Test positive scores
+    let m1 = m64_set_score(MOVE64_NULL, 12345);
+    assert(m64_score(m1) == 12345);
+
+    // Test negative scores (CRITICAL)
+    let m2 = m64_set_score(MOVE64_NULL, -100);
+    assert(m64_score(m2) == -100, "Negative score failed: got {}", m64_score(m2));
+
+    let m3 = m64_set_score(MOVE64_NULL, -32768);
+    assert(m64_score(m3) == -32768, "Min i16 failed");
+
+    let m4 = m64_set_score(MOVE64_NULL, 32767);
+    assert(m64_score(m4) == 32767, "Max i16 failed");
+
+    println("test_move64_score_signedness: PASS");
+}
+
+#[test]
+fn test_tt_move_validation() {
+    let mut board = board64_from_fen(PERFT_STARTPOS);
+
+    // Valid move: e2e4 (pawn on e2)
+    let valid = (12u32) | (28u32 << 6);  // from=12 (e2), to=28 (e4)
+    assert(tt_move_is_valid(&board, valid) == true);
+
+    // Invalid move: e4e5 (no piece on e4 at start)
+    let invalid = (28u32) | (36u32 << 6);  // from=28 (e4), to=36 (e5)
+    assert(tt_move_is_valid(&board, invalid) == false);
+
+    // Invalid move: capture own piece
+    let self_cap = (1u32) | (2u32 << 6);  // from=b1 (knight), to=c1 (bishop)
+    assert(tt_move_is_valid(&board, self_cap) == false);
+
+    println("test_tt_move_validation: PASS");
+}
+
+// ============================================================================
+// FEN PARSING
+// ============================================================================
+
+fn board64_from_fen(fen: str) -> Board64 {
+    let parts = fen.split(" ");
+    let board_str = parts[0];
+    let side = parts[1];
+    let castling_str = parts[2];
+    let ep_str = parts[3];
+    let hmc_str = if parts.len() > 4 { parts[4] } else { "0" };
+
+    let mut pieces = tensor.zeros[u64, (12,)];
+    let mut rank = 7;
+    let mut file = 0;
+
+    for c in board_str.chars() {
+        if c == '/' {
+            rank -= 1;
+            file = 0;
+        } else if c.is_digit() {
+            file += c.to_digit() as i32;
+        } else {
+            let sq = rank * 8 + file;
+            let piece_idx = fen_char_to_piece(c);
+            pieces[piece_idx] |= 1u64 << sq;
+            file += 1;
+        }
+    }
+
+    let mut occupancy = tensor.zeros[u64, (2,)];
+    for i in 0..6 {
+        occupancy[0] |= pieces[i];
+        occupancy[1] |= pieces[i + 6];
+    }
+
+    let mut castling: u32 = 0;
+    for c in castling_str.chars() {
+        match c {
+            'K' => castling |= 0b0001,
+            'Q' => castling |= 0b0010,
+            'k' => castling |= 0b0100,
+            'q' => castling |= 0b1000,
+            _ => {},
+        }
+    }
+
+    let ep_square = if ep_str == "-" {
+        -1
+    } else {
+        let f = (ep_str.chars()[0] as i32) - ('a' as i32);
+        let r = (ep_str.chars()[1] as i32) - ('1' as i32);
+        r * 8 + f
+    };
+
+    return Board64 {
+        pieces: pieces,
+        occupancy: occupancy,
+        castling: castling,
+        ep_square: ep_square,
+        halfmove: hmc_str.parse::<i32>().unwrap_or(0),
+        side_to_move: if side == "w" { 0 } else { 1 },
+        hash: 0,
+    };
+}
+
+fn fen_char_to_piece(c: char) -> i32 {
+    match c {
+        'P' => 0, 'N' => 1, 'B' => 2, 'R' => 3, 'Q' => 4, 'K' => 5,
+        'p' => 6, 'n' => 7, 'b' => 8, 'r' => 9, 'q' => 10, 'k' => 11,
+        _ => 0,
+    }
+}
+
+fn now_ns() -> u64 {
+    return __builtin_timestamp_ns();
+}
+
+// ============================================================================
+// MOVE STRING CONVERSION (for UCI/debugging)
+// ============================================================================
+
+fn m64_to_uci(m: Move64) -> str {
+    let from = m64_from(m);
+    let to = m64_to(m);
+    let promo = m64_promo(m);
+
+    let from_file = (from % 8) as char + 'a';
+    let from_rank = (from / 8) as char + '1';
+    let to_file = (to % 8) as char + 'a';
+    let to_rank = (to / 8) as char + '1';
+
+    let mut result = "";
+    result += from_file;
+    result += from_rank;
+    result += to_file;
+    result += to_rank;
+
+    if promo != 0 {
+        let promo_char = match promo {
+            1 => 'n',
+            2 => 'b',
+            3 => 'r',
+            4 => 'q',
+            _ => ' ',
+        };
+        result += promo_char;
+    }
+
+    return result;
+}

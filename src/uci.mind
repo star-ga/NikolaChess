@@ -1,0 +1,510 @@
+// NikolaChess - UCI Interface
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// Standard UCI protocol with draw-focused extensions
+
+import std.io;
+import std.string;
+
+// ============================================================================
+// UCI ENGINE
+// ============================================================================
+
+struct UCIEngine {
+    name: str,
+    author: str,
+    search: DrawSearch,
+    board: Board,
+
+    // UCI options
+    draw_mode: bool,         // Always enabled for this engine
+    draw_threshold: i32,     // Draw probability threshold (0-1000)
+    contempt: i32,           // Set to 0 (no winning ambition)
+    max_depth: i32,
+    hash_size: i32,          // MB
+    nnue_url: str,           // Remote NNUE service URL
+    move_overhead_ms: i64,   // Latency buffer (default 100ms)
+    max_move_time_ms: i64,   // Hard cap on think time (0 = unlimited)
+
+    // State
+    running: bool,
+    searching: bool,
+}
+
+fn create_uci_engine() -> UCIEngine {
+    let net = create_draw_network();
+    let book = create_opening_book();
+    let tb = create_tablebase("./syzygy");
+
+    return UCIEngine {
+        name: "NikolaChess v2 Fortress",
+        author: "NikolaChess Team",
+        search: create_search(net, book, tb),
+        board: starting_position(),
+        draw_mode: true,
+        draw_threshold: 990,  // 99% draw probability
+        contempt: 0,          // No contempt - we want draws!
+        max_depth: 64,
+        hash_size: 256,
+        nnue_url: "",         // Empty = use local NNUE
+        move_overhead_ms: 100,    // 100ms latency buffer for Lichess
+        max_move_time_ms: 0,      // 0 = no hard cap
+        running: true,
+        searching: false,
+    };
+}
+
+// ============================================================================
+// UCI PROTOCOL
+// ============================================================================
+
+fn uci_loop(engine: &mut UCIEngine) {
+    while engine.running {
+        let line = io.stdin.read_line();
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts = line.split(" ");
+        let command = parts[0];
+
+        match command {
+            "uci" => handle_uci(engine),
+            "isready" => handle_isready(engine),
+            "ucinewgame" => handle_newgame(engine),
+            "position" => handle_position(engine, &parts),
+            "go" => handle_go(engine, &parts),
+            "stop" => handle_stop(engine),
+            "quit" => handle_quit(engine),
+            "setoption" => handle_setoption(engine, &parts),
+            "d" => handle_display(engine),
+            "drawprob" => handle_drawprob(engine),
+            _ => {},  // Ignore unknown commands
+        }
+    }
+}
+
+fn handle_uci(engine: &UCIEngine) {
+    println("id name {}", engine.name);
+    println("id author {}", engine.author);
+    println("");
+
+    // Custom options for draw-seeking
+    println("option name DrawMode type check default true");
+    println("option name DrawThreshold type spin default 990 min 500 max 1000");
+    println("option name Contempt type spin default 0 min -100 max 100");
+    println("option name Hash type spin default 256 min 1 max 4096");
+    println("option name MaxDepth type spin default 64 min 1 max 100");
+    println("option name MoveOverhead type spin default 100 min 0 max 5000");
+    println("option name MaxMoveTimeMs type spin default 0 min 0 max 60000");
+    println("option name SyzygyPath type string default ./syzygy");
+    println("option name NnueUrl type string default ");
+
+    println("uciok");
+}
+
+fn handle_isready(engine: &mut UCIEngine) {
+    // Initialize if needed
+    if !engine.search.tb.loaded {
+        tb_init(&mut engine.search.tb);
+    }
+    println("readyok");
+}
+
+fn handle_newgame(engine: &mut UCIEngine) {
+    engine.board = starting_position();
+    // FIX: Use fast tt_clear instead of slow loop
+    tt_clear(&mut engine.search.tt);
+}
+
+fn handle_position(engine: &mut UCIEngine, parts: &[str]) {
+    let mut idx: usize = 1;  // FIX: Made mutable
+
+    if parts.len() <= idx {
+        return;
+    }
+
+    // Parse position
+    if parts[idx] == "startpos" {
+        engine.board = starting_position();
+        idx += 1;
+    } else if parts[idx] == "fen" {
+        // Collect FEN parts
+        let mut fen_parts = Vec.new();  // FIX: Made mutable
+        idx += 1;
+        while idx < parts.len() && parts[idx] != "moves" {
+            fen_parts.push(parts[idx]);
+            idx += 1;
+        }
+        let fen = fen_parts.join(" ");
+        engine.board = from_fen(&fen);
+    }
+
+    // Parse moves
+    if idx < parts.len() && parts[idx] == "moves" {
+        idx += 1;
+        while idx < parts.len() {
+            let move_str = parts[idx];
+            let m = parse_uci_move(move_str, engine.board);
+            engine.board = make_move(engine.board, m);
+            idx += 1;
+        }
+    }
+}
+
+fn handle_go(engine: &mut UCIEngine, parts: &[str]) {
+    engine.searching = true;
+
+    // Parse go parameters
+    let mut depth = engine.max_depth;
+    let mut wtime: i64 = 0;
+    let mut btime: i64 = 0;
+    let mut winc: i64 = 0;
+    let mut binc: i64 = 0;
+    let mut movetime: i64 = 0;
+    let mut movestogo: i64 = 0;
+    let mut infinite = false;
+
+    let mut idx: usize = 1;
+    while idx < parts.len() {
+        match parts[idx] {
+            "depth" => {
+                idx += 1;
+                if idx < parts.len() {
+                    depth = parts[idx].parse::<i32>().unwrap_or(engine.max_depth);
+                }
+            },
+            "wtime" => {
+                idx += 1;
+                if idx < parts.len() {
+                    wtime = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "btime" => {
+                idx += 1;
+                if idx < parts.len() {
+                    btime = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "winc" => {
+                idx += 1;
+                if idx < parts.len() {
+                    winc = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "binc" => {
+                idx += 1;
+                if idx < parts.len() {
+                    binc = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "movetime" => {
+                idx += 1;
+                if idx < parts.len() {
+                    movetime = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "movestogo" => {
+                idx += 1;
+                if idx < parts.len() {
+                    movestogo = parts[idx].parse::<i64>().unwrap_or(0);
+                }
+            },
+            "infinite" => {
+                infinite = true;
+            },
+            _ => {},
+        }
+        idx += 1;
+    }
+
+    // Calculate time to use
+    let time_ms = if movetime > 0 {
+        // GUI-provided movetime: subtract overhead for safety
+        max_i64(0, movetime - engine.move_overhead_ms)
+    } else if infinite {
+        1000000000  // Effectively infinite
+    } else {
+        // Time management with proper formula
+        let our_time = if engine.board.side_to_move == 0 { wtime } else { btime };
+        let our_inc = if engine.board.side_to_move == 0 { winc } else { binc };
+        compute_movetime(
+            our_time,
+            our_inc,
+            movestogo,
+            engine.move_overhead_ms,
+            engine.max_move_time_ms
+        )
+    };
+
+    // Run search
+    let result = search(&mut engine.search, engine.board, depth, time_ms);
+
+    // Output best move
+    let best_uci = move_to_uci(result.best_move);
+    println("bestmove {}", best_uci);
+
+    engine.searching = false;
+}
+
+fn handle_stop(engine: &mut UCIEngine) {
+    engine.search.stop = true;
+}
+
+fn handle_quit(engine: &mut UCIEngine) {
+    engine.running = false;
+}
+
+fn handle_setoption(engine: &mut UCIEngine, parts: &[str]) {
+    // setoption name <name> [value <value>]
+    // FIX: Parse according to UCI spec, allowing multi-word names/values
+
+    // Find "name" and "value" keywords
+    let mut name_start: i32 = -1;
+    let mut value_start: i32 = -1;
+
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "name" && name_start < 0 {
+            name_start = (i + 1) as i32;
+        } else if *part == "value" {
+            value_start = (i + 1) as i32;
+        }
+    }
+
+    if name_start < 0 {
+        return;  // No name found
+    }
+
+    // Extract option name (everything between "name" and "value" or end)
+    let name_end = if value_start > 0 { (value_start - 1) as usize } else { parts.len() };
+    let name_parts = &parts[name_start as usize..name_end];
+    let name = name_parts.join(" ");
+
+    // Extract value (everything after "value")
+    let value = if value_start > 0 && (value_start as usize) < parts.len() {
+        parts[value_start as usize..].join(" ")
+    } else {
+        "".to_string()
+    };
+
+    match name.as_str() {
+        "DrawThreshold" => {
+            engine.draw_threshold = value.parse::<i32>().unwrap_or(990);
+        },
+        "Contempt" => {
+            engine.contempt = value.parse::<i32>().unwrap_or(0);
+        },
+        "Hash" => {
+            // FIX: Actually resize the TT when Hash option changes
+            let new_size = value.parse::<u64>().unwrap_or(256);
+            if new_size != engine.hash_size as u64 {
+                engine.hash_size = new_size as i32;
+                tt_resize(&mut engine.search.tt, new_size);
+                println("info string Hash table resized to {} MB", new_size);
+            }
+        },
+        "MaxDepth" => {
+            engine.max_depth = value.parse::<i32>().unwrap_or(64);
+        },
+        "MoveOverhead" => {
+            let v = value.parse::<i64>().unwrap_or(100);
+            engine.move_overhead_ms = max_i64(0, min_i64(v, 5000));
+            println("info string MoveOverhead set to {} ms", engine.move_overhead_ms);
+        },
+        "MaxMoveTimeMs" => {
+            let v = value.parse::<i64>().unwrap_or(0);
+            engine.max_move_time_ms = max_i64(0, min_i64(v, 60000));
+            println("info string MaxMoveTimeMs set to {} ms", engine.max_move_time_ms);
+        },
+        "SyzygyPath" => {
+            engine.search.tb.path = value.to_string();
+            if io.exists(&value) {
+                tb_init(&mut engine.search.tb);
+            } else {
+                println("info string Warning: Syzygy path does not exist: {}", value);
+            }
+        },
+        "NnueUrl" => {
+            engine.nnue_url = value.to_string();
+            println("info string NnueUrl set to {}", value);
+        },
+        _ => {
+            // Unknown option, ignore silently per UCI spec
+        },
+    }
+}
+
+fn handle_display(engine: &UCIEngine) {
+    // Display current position
+    print_board(engine.board);
+}
+
+fn handle_drawprob(engine: &mut UCIEngine) {
+    // Custom command: show draw probability
+    let board_tensor = to_tensor_16ch(engine.board);
+    let features = extract_features(engine.board);
+    let draw_prob = forward(engine.search.net, board_tensor, features);
+
+    println("Draw probability: {:.3} ({:.1}%)", draw_prob, draw_prob * 100.0);
+}
+
+// ============================================================================
+// UCI HELPERS
+// ============================================================================
+
+fn parse_uci_move(uci: str, board: Board) -> Move {
+    // Validate input length (min 4 chars: e2e4, max 5 chars: e7e8q)
+    if uci.len() < 4 {
+        return MOVE_NULL;  // Invalid move string
+    }
+
+    let from_file = (uci.chars()[0] as i32) - ('a' as i32);
+    let from_rank = (uci.chars()[1] as i32) - ('1' as i32);
+    let to_file = (uci.chars()[2] as i32) - ('a' as i32);
+    let to_rank = (uci.chars()[3] as i32) - ('1' as i32);
+
+    // Validate coordinate bounds (0-7)
+    if from_file < 0 || from_file > 7 || from_rank < 0 || from_rank > 7 ||
+       to_file < 0 || to_file > 7 || to_rank < 0 || to_rank > 7 {
+        return MOVE_NULL;  // Invalid coordinates
+    }
+
+    let from = from_rank * 8 + from_file;
+    let to = to_rank * 8 + to_file;
+
+    // Find piece on from square
+    let mut piece = 0;     // FIX: Made mutable
+    for p in 0..12 {
+        if (board.pieces[p] & (1 << from)) != 0 {
+            piece = p;
+            break;
+        }
+    }
+
+    // Check for capture
+    let mut capture = 0;   // FIX: Made mutable
+    for p in 0..12 {
+        if (board.pieces[p] & (1 << to)) != 0 {
+            capture = p;
+            break;
+        }
+    }
+
+    // Check for promotion
+    let mut promo = 0;     // FIX: Made mutable
+    if uci.len() > 4 {
+        let promo_char = uci.chars()[4];
+        let color_offset = if piece < 6 { 0 } else { 6 };
+        promo = match promo_char {
+            'q' => QUEEN + color_offset,
+            'r' => ROOK + color_offset,
+            'b' => BISHOP + color_offset,
+            'n' => KNIGHT + color_offset,
+            _ => 0,
+        };
+    }
+
+    return create_move(from, to, piece, capture, promo, 0);
+}
+
+// Time management helper functions
+fn min_i64(a: i64, b: i64) -> i64 { if a < b { a } else { b } }
+fn max_i64(a: i64, b: i64) -> i64 { if a > b { a } else { b } }
+
+fn compute_movetime(
+    time_left_ms: i64,
+    inc_ms: i64,
+    movestogo: i64,
+    move_overhead_ms: i64,
+    max_move_time_ms: i64
+) -> i64 {
+    if time_left_ms <= 0 {
+        return 1;  // Return minimal time, not 0 (0 could mean infinite)
+    }
+
+    // Reserve: 3% of remaining or 150ms, whichever is larger
+    let reserve_ms = max_i64(150, (time_left_ms * 3) / 100);
+    // Cap: remaining minus reserve (overhead handled in base time only)
+    let cap_ms = max_i64(0, time_left_ms - reserve_ms);
+
+    // Panic mode: very low on clock
+    if time_left_ms < 2000 {
+        // Use minimal time, ensuring no underflow when overhead > 80
+        let panic_target = max_i64(20, 80 - move_overhead_ms);
+        let t = min_i64(cap_ms, panic_target);
+        return max_i64(20, t);
+    }
+
+    // Base time: remaining/(movestogo+1) + 0.75*increment
+    let base_ms = if movestogo > 0 {
+        (time_left_ms / (movestogo + 1)) + ((inc_ms * 3) / 4)
+    } else {
+        (time_left_ms / 30) + ((inc_ms * 3) / 4)
+    };
+
+    // Subtract overhead, enforce floor
+    let mut t = base_ms - move_overhead_ms;
+    let floor_ms: i64 = 40;
+
+    // Clamp to [floor, cap]
+    t = max_i64(t, floor_ms);
+    t = min_i64(t, cap_ms);
+
+    // Optional absolute max per move
+    if max_move_time_ms > 0 {
+        t = min_i64(t, max_move_time_ms);
+    }
+
+    return max_i64(1, t);
+}
+
+fn print_board(board: Board) {
+    let pieces_chars = "PNBRQKpnbrqk";
+
+    println("+---+---+---+---+---+---+---+---+");
+
+    for rank in (0..8).rev() {
+        print("|");
+        for file in 0..8 {
+            let sq = rank * 8 + file;
+            let mut piece_char = '.';  // FIX: Made mutable
+
+            for p in 0..12 {
+                if (board.pieces[p] & (1 << sq)) != 0 {
+                    piece_char = pieces_chars.chars()[p];
+                    break;
+                }
+            }
+
+            print(" {} |", piece_char);
+        }
+        println(" {}", rank + 1);
+        println("+---+---+---+---+---+---+---+---+");
+    }
+
+    println("  a   b   c   d   e   f   g   h");
+    println("");
+    println("Side to move: {}", if board.side_to_move == 0 { "White" } else { "Black" });
+    println("Halfmove clock: {}", board.halfmove);
+    println("Fullmove: {}", board.fullmove);
+}
+
+// ============================================================================
+// OUTPUT HELPERS
+// ============================================================================
+
+fn println(fmt: str, args: ...) {
+    print(fmt, args);
+    print("\n");
+    io.stdout.flush();
+}
+
+fn print(fmt: str, args: ...) {
+    io.stdout.write(format(fmt, args));
+}
+
+fn max(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}

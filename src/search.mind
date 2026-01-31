@@ -1,0 +1,1175 @@
+// NikolaChess - Draw-First Search with Advanced Optimizations
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// Search algorithm optimized for finding draws, not wins
+// Key insight: Repetitions are GOOD, not bad!
+//
+// advanced Optimizations:
+// - HalfKA feature extraction for NNUE evaluation
+// - Transformer-based root move reranking
+// - ABDADA parallel search for multi-core scaling
+// - Late Move Reductions with NNUE-adaptive tuning
+// - Expected combined ELO gain: +80-120
+
+import std.tensor;
+import std.cuda;
+import std.time;
+import std.mem;
+
+// Import advanced optimization modules
+import halfka;
+import transformer;
+import abdada;
+import lmr;
+
+// ============================================================================
+// SEARCH RESULT
+// ============================================================================
+
+struct SearchResult {
+    best_move: Move,
+    draw_score: f32,     // Draw probability [0, 1] - higher = better
+    depth: i32,
+    nodes: i64,
+    time_ms: i64,
+    pv: Vec<Move>,       // Principal variation
+    draw_type: str,      // "book", "tablebase", "repetition", "search"
+}
+
+fn default_result() -> SearchResult {
+    return SearchResult {
+        best_move: MOVE_NULL,
+        draw_score: 0.0,
+        depth: 0,
+        nodes: 0,
+        time_ms: 0,
+        pv: Vec.new(),
+        draw_type: "none",
+    };
+}
+
+// ============================================================================
+// TRANSPOSITION TABLE
+// ============================================================================
+
+struct TTEntry {
+    hash: u64,
+    depth: i32,
+    draw_score: f32,
+    best_move: Move,
+    flag: i32,           // EXACT, LOWER, UPPER
+    age: i32,            // For replacement
+}
+
+const TT_EXACT: i32 = 0;
+const TT_LOWER: i32 = 1;  // Alpha bound
+const TT_UPPER: i32 = 2;  // Beta bound
+
+// Default TT size (16M entries), can be resized via UCI Hash option
+const TT_DEFAULT_SIZE: u64 = 1 << 24;
+
+// Global TT size (set by Hash option)
+static mut TT_SIZE: u64 = TT_DEFAULT_SIZE;
+
+struct TranspositionTable {
+    entries: Vec<TTEntry>,  // Dynamic size instead of fixed tensor
+    size: u64,              // Current size
+    age: i32,
+    use_gpu: bool,          // Whether GPU is available
+}
+
+fn create_tt() -> TranspositionTable {
+    return create_tt_with_size(TT_DEFAULT_SIZE);
+}
+
+fn create_tt_with_size(size_mb: u64) -> TranspositionTable {
+    // Calculate number of entries from MB
+    let entry_size: u64 = 32;  // sizeof(TTEntry) approximately
+    let num_entries = (size_mb * 1024 * 1024) / entry_size;
+    // Round down to power of 2 for fast modulo
+    let mut actual_size: u64 = 1;
+    while actual_size * 2 <= num_entries {
+        actual_size *= 2;
+    }
+
+    let use_gpu = cuda.is_available();
+
+    if use_gpu {
+        // GPU allocation
+        on(gpu0) {
+            let entries = Vec.with_capacity(actual_size as usize);
+            for _ in 0..actual_size {
+                entries.push(TTEntry {
+                    hash: 0, depth: 0, draw_score: 0.0,
+                    best_move: MOVE_NULL, flag: 0, age: 0
+                });
+            }
+            return TranspositionTable {
+                entries: entries,
+                size: actual_size,
+                age: 0,
+                use_gpu: true,
+            };
+        }
+    } else {
+        // CPU fallback
+        let entries = Vec.with_capacity(actual_size as usize);
+        for _ in 0..actual_size {
+            entries.push(TTEntry {
+                hash: 0, depth: 0, draw_score: 0.0,
+                best_move: MOVE_NULL, flag: 0, age: 0
+            });
+        }
+        return TranspositionTable {
+            entries: entries,
+            size: actual_size,
+            age: 0,
+            use_gpu: false,
+        };
+    }
+}
+
+fn tt_resize(tt: &mut TranspositionTable, size_mb: u64) {
+    // Resize TT based on Hash UCI option
+    let new_tt = create_tt_with_size(size_mb);
+    *tt = new_tt;
+}
+
+fn tt_clear(tt: &mut TranspositionTable) {
+    // Fast clear using memset instead of loop
+    // FIX: Handle GPU/CPU memory correctly
+    let entry_size = std::mem::size_of::<TTEntry>();
+    if tt.use_gpu {
+        on(gpu0) {
+            mem.memset(tt.entries.as_mut_ptr(), 0, tt.size as usize * entry_size);
+        }
+    } else {
+        mem.memset(tt.entries.as_mut_ptr(), 0, tt.size as usize * entry_size);
+    }
+    tt.age = 0;
+}
+
+fn tt_probe(tt: &TranspositionTable, hash: u64) -> Option<TTEntry> {
+    let idx = (hash % tt.size) as usize;
+    // FIX: Access GPU memory in correct context
+    if tt.use_gpu {
+        on(gpu0) {
+            let entry = tt.entries[idx];
+            if entry.hash == hash {
+                return Some(entry);
+            }
+        }
+    } else {
+        let entry = tt.entries[idx];
+        if entry.hash == hash {
+            return Some(entry);
+        }
+    }
+    return None;
+}
+
+fn tt_store(tt: &mut TranspositionTable, hash: u64, depth: i32, draw_score: f32, best_move: Move, flag: i32) {
+    let idx = (hash % tt.size) as usize;
+
+    // FIX: Access GPU memory in correct context
+    if tt.use_gpu {
+        on(gpu0) {
+            let existing = tt.entries[idx];
+            // Replace if: empty, older, or deeper search
+            if existing.hash == 0 || existing.age < tt.age || depth >= existing.depth {
+                tt.entries[idx] = TTEntry {
+                    hash: hash,
+                    depth: depth,
+                    draw_score: draw_score,
+                    best_move: best_move,
+                    flag: flag,
+                    age: tt.age,
+                };
+            }
+        }
+    } else {
+        let existing = tt.entries[idx];
+        // Replace if: empty, older, or deeper search
+        if existing.hash == 0 || existing.age < tt.age || depth >= existing.depth {
+            tt.entries[idx] = TTEntry {
+                hash: hash,
+                depth: depth,
+                draw_score: draw_score,
+                best_move: best_move,
+                flag: flag,
+                age: tt.age,
+            };
+        }
+    }
+}
+
+// ============================================================================
+// DRAW-FIRST SEARCH ENGINE
+// ============================================================================
+
+// ============================================================================
+// DRAW-FIRST SEARCH ENGINE
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+struct DrawSearch {
+    net: DrawNetwork,
+    tt: TranspositionTable,
+    book: OpeningBook,
+    tb: Tablebase,
+    nodes: i64,
+    max_depth: i32,
+    start_time: i64,
+    time_limit: i64,
+    stop: bool,
+
+    // Draw-seeking statistics
+    repetitions_found: i64,
+    fortresses_found: i64,
+    perpetuals_found: i64,
+
+    // advanced Optimization modules
+    halfka_weights: HalfKAWeights,
+    halfka_acc: HalfKAAccumulator,
+    transformer: TransformerHead,
+    abdada: AbdadaController,
+    history: HistoryTable,
+    killers: KillerTable,
+    num_threads: usize,
+}
+
+fn create_search(net: DrawNetwork, book: OpeningBook, tb: Tablebase) -> DrawSearch {
+    return create_search_with_threads(net, book, tb, 1);
+}
+
+fn create_search_with_threads(net: DrawNetwork, book: OpeningBook, tb: Tablebase, num_threads: usize) -> DrawSearch {
+    return DrawSearch {
+        net: net,
+        tt: create_tt(),
+        book: book,
+        tb: tb,
+        nodes: 0,
+        max_depth: 64,
+        start_time: 0,
+        time_limit: 0,
+        stop: false,
+        repetitions_found: 0,
+        fortresses_found: 0,
+        perpetuals_found: 0,
+
+        // advanced modules
+        halfka_weights: create_weights(),
+        halfka_acc: create_accumulator(),
+        transformer: create_transformer(),
+        abdada: create_controller(num_threads),
+        history: create_history(),
+        killers: create_killers(),
+        num_threads: num_threads,
+    };
+}
+
+// ============================================================================
+// MAIN SEARCH FUNCTION
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+fn search(s: &mut DrawSearch, board: Board, depth: i32, time_ms: i64) -> SearchResult {
+    s.nodes = 0;
+    s.start_time = time.now_ms();
+    s.time_limit = time_ms;
+    s.stop = false;
+    s.tt.age += 1;
+
+    // Reset advanced search state
+    reset_controller(&s.abdada);
+    age_history(&mut s.history);
+    clear_killers(&mut s.killers);
+
+    // Initialize HalfKA accumulator for position
+    let (white_features, black_features) = extract_halfka_indices(board);
+    refresh_accumulator(&mut s.halfka_acc, &s.halfka_weights, board);
+
+    // 1. Check opening book first
+    if let Some(book_move) = s.book.probe(board) {
+        return SearchResult {
+            best_move: book_move,
+            draw_score: 1.0,  // Book moves are pre-verified draws
+            depth: 0,
+            nodes: 1,
+            time_ms: 0,
+            pv: vec![book_move],
+            draw_type: "book",
+        };
+    }
+
+    // 2. Check tablebase
+    if let Some(tb_result) = s.tb.probe(board) {
+        if tb_result.is_draw() {
+            return SearchResult {
+                best_move: tb_result.best_move,
+                draw_score: 1.0,
+                depth: 0,
+                nodes: 1,
+                time_ms: 0,
+                pv: vec![tb_result.best_move],
+                draw_type: "tablebase",
+            };
+        }
+    }
+
+    // 3. Check for immediate draw claims
+    let (can_draw, draw_reason) = can_claim_draw(board, &board.history);
+    if can_draw {
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: 1.0,
+            depth: 0,
+            nodes: 1,
+            time_ms: 0,
+            pv: vec![],
+            draw_type: draw_reason,
+        };
+    }
+
+    // 4. Iterative deepening search with advanced optimizations
+    let mut best_result = default_result();
+    let mut prev_score: f32 = 0.5;  // Start at neutral (draw probability)
+
+    for d in 1..=depth {
+        if s.stop {
+            break;
+        }
+
+        let mut pv = Vec.new();
+
+        // Use aspiration windows for depth >= 4
+        let result = if d >= 4 {
+            aspiration_search(s, board, d, prev_score)
+        } else {
+            draw_negamax(s, board, d, 0.0, 1.0, &mut pv, 0)
+        };
+
+        if !s.stop {
+            best_result = result;
+            best_result.pv = pv.clone();
+            best_result.depth = d;
+            prev_score = best_result.draw_score;
+
+            // Transformer reranking at root (advanced)
+            if d >= 3 && !best_result.pv.is_empty() {
+                rerank_root_with_transformer(s, board, &mut best_result);
+            }
+
+            // Print UCI info
+            let elapsed = time.now_ms() - s.start_time;
+            print_uci_info(d, best_result.draw_score, s.nodes, elapsed, &best_result.pv);
+        }
+
+        // If we found a guaranteed draw, stop searching
+        if best_result.draw_score >= 0.99 {
+            break;
+        }
+
+        // Time management
+        if time.now_ms() - s.start_time > time_ms / 2 {
+            break;
+        }
+    }
+
+    best_result.nodes = s.nodes;
+    best_result.time_ms = time.now_ms() - s.start_time;
+    return best_result;
+}
+
+// ============================================================================
+// TRANSFORMER ROOT RERANKING (advanced)
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+fn rerank_root_with_transformer(s: &mut DrawSearch, board: Board, result: &mut SearchResult) {
+    // Generate all root moves
+    let moves = generate_moves(board);
+    if moves.len() < 2 {
+        return;  // No reranking needed for single move
+    }
+
+    // Get NNUE accumulator states for each move
+    let mut accumulators: Vec<Vec<f32>> = Vec.new();
+    let mut move_scores: Vec<(Move, i32)> = Vec.new();
+
+    for m in &moves {
+        let new_board = make_move(board, *m);
+
+        // Compute HalfKA accumulator for this position
+        let mut acc = create_accumulator();
+        refresh_accumulator(&mut acc, &s.halfka_weights, new_board);
+
+        // Get accumulator as embedding
+        let embedding = accumulator_to_embedding(&acc, new_board.side_to_move == 0);
+        accumulators.push(embedding);
+
+        // Get NNUE score
+        let score = evaluate_halfka(&acc, &s.halfka_weights, new_board.side_to_move == 0);
+        move_scores.push((*m, score));
+    }
+
+    // Rerank using transformer
+    let reranked = rerank_root_moves(&s.transformer, &move_scores, &accumulators);
+
+    // Update result with best move from transformer
+    if !reranked.is_empty() {
+        let (best_mv, _) = reranked[0];
+        // Only update if different from current best
+        if best_mv.data != result.best_move.data {
+            // Verify with search that new move is good
+            let new_board = make_move(board, best_mv);
+            let mut verify_pv = Vec.new();
+            let verify_result = draw_negamax(s, new_board, 2, 0.0, 1.0, &mut verify_pv, 1);
+
+            // Accept if draw probability is still high
+            if verify_result.draw_score >= result.draw_score * 0.95 {
+                result.best_move = best_mv;
+                result.pv.insert(0, best_mv);
+            }
+        }
+    }
+}
+
+fn accumulator_to_embedding(acc: &HalfKAAccumulator, white_to_move: bool) -> Vec<f32> {
+    let perspective = if white_to_move { &acc.white } else { &acc.black };
+    let mut embedding = Vec.with_capacity(256);
+    for i in 0..256 {
+        embedding.push(perspective[i]);
+    }
+    return embedding;
+}
+
+fn refresh_accumulator(acc: &mut HalfKAAccumulator, weights: &HalfKAWeights, board: Board) {
+    // Full refresh of accumulator (for position changes)
+    let (white_features, black_features) = extract_halfka_indices(board);
+
+    // Reset accumulators to bias
+    for i in 0..256 {
+        acc.white[i] = weights.b1[i];
+        acc.black[i] = weights.b1[i];
+    }
+
+    // Add active features
+    for idx in white_features {
+        add_feature(&mut acc.white, weights, idx as usize);
+    }
+    for idx in black_features {
+        add_feature(&mut acc.black, weights, idx as usize);
+    }
+
+    acc.computed = true;
+}
+
+// ============================================================================
+// DRAW-FOCUSED NEGAMAX WITH ALPHA-BETA + LMR
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+// Maximum ply depth to prevent stack overflow
+const MAX_PLY: i32 = 128;
+
+// Returns draw probability from perspective of side to move
+// Higher = better (more likely to draw = GOOD!)
+fn draw_negamax(
+    s: &mut DrawSearch,
+    board: Board,
+    depth: i32,
+    mut alpha: f32,
+    mut beta: f32,
+    pv: &mut Vec<Move>,
+    ply: i32
+) -> SearchResult {
+    s.nodes += 1;
+    add_nodes(&s.abdada, 1);
+
+    // Hard ply limit to prevent stack overflow (advanced safety)
+    if ply >= MAX_PLY - 10 {
+        let score = evaluate_position(s, board);
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: score,
+            depth: 0,
+            nodes: 1,
+            time_ms: 0,
+            pv: pv.clone(),
+            draw_type: "ply_limit",
+        };
+    }
+
+    // Time check - check every 1024 nodes for more responsive stopping
+    if s.nodes % 1024 == 0 {
+        if time.now_ms() - s.start_time > s.time_limit {
+            s.stop = true;
+            return default_result();
+        }
+    }
+
+    let hash = board.hash;
+    let mut local_pv = Vec.new();
+    let is_pv = beta - alpha > 0.01;  // PV node detection
+    let in_check = is_in_check(board);
+
+    // ========================================
+    // DRAW DETECTION (This is GOOD for us!)
+    // Emphasize repetitions
+    // ========================================
+
+    // Check for draw by repetition
+    // FIX: Include side-to-move in repetition check by using board.hash
+    // which already incorporates side-to-move via Zobrist hashing
+    let rep_count = count_repetitions(&board.history, hash);
+    if rep_count >= 2 {
+        s.repetitions_found += 1;
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: 1.0,  // Guaranteed draw!
+            depth: depth,
+            nodes: 1,
+            time_ms: 0,
+            pv: pv.clone(),
+            draw_type: "repetition",
+        };
+    }
+
+    // Check 50-move rule
+    if board.halfmove >= 100 {
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: 1.0,
+            depth: depth,
+            nodes: 1,
+            time_ms: 0,
+            pv: pv.clone(),
+            draw_type: "fifty_move",
+        };
+    }
+
+    // Check insufficient material
+    if is_insufficient_material(board) {
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: 1.0,
+            depth: depth,
+            nodes: 1,
+            time_ms: 0,
+            pv: pv.clone(),
+            draw_type: "insufficient",
+        };
+    }
+
+    // ========================================
+    // TRANSPOSITION TABLE
+    // ========================================
+
+    let mut tt_move = MOVE_NULL;  // FIX: Made mutable
+    if let Some(entry) = tt_probe(&s.tt, hash) {
+        tt_move = entry.best_move;
+
+        if entry.depth >= depth {
+            match entry.flag {
+                TT_EXACT => {
+                    pv.push(entry.best_move);
+                    return SearchResult {
+                        best_move: entry.best_move,
+                        draw_score: entry.draw_score,
+                        depth: depth,
+                        nodes: 1,
+                        time_ms: 0,
+                        pv: pv.clone(),
+                        draw_type: "tt",
+                    };
+                },
+                TT_LOWER => {
+                    alpha = max_f32(alpha, entry.draw_score);
+                },
+                TT_UPPER => {
+                    beta = min_f32(beta, entry.draw_score);
+                },
+            }
+
+            if alpha >= beta {
+                return SearchResult {
+                    best_move: entry.best_move,
+                    draw_score: entry.draw_score,
+                    depth: depth,
+                    nodes: 1,
+                    time_ms: 0,
+                    pv: pv.clone(),
+                    draw_type: "tt_cutoff",
+                };
+            }
+        }
+    }
+
+    // ========================================
+    // TABLEBASE PROBE (Endgame)
+    // ========================================
+
+    if let Some(tb_result) = s.tb.probe(board) {
+        if tb_result.is_draw() {
+            return SearchResult {
+                best_move: tb_result.best_move,
+                draw_score: 1.0,
+                depth: depth,
+                nodes: 1,
+                time_ms: 0,
+                pv: vec![tb_result.best_move],
+                draw_type: "tablebase",
+            };
+        }
+    }
+
+    // ========================================
+    // LEAF NODE EVALUATION
+    // ========================================
+
+    if depth <= 0 {
+        let score = quiescence(s, board, alpha, beta);
+        return SearchResult {
+            best_move: MOVE_NULL,
+            draw_score: score,
+            depth: 0,
+            nodes: 1,
+            time_ms: 0,
+            pv: pv.clone(),
+            draw_type: "eval",
+        };
+    }
+
+    // ========================================
+    // MOVE GENERATION AND ORDERING
+    // ========================================
+
+    let moves = generate_moves(board);
+
+    if moves.is_empty() {
+        // No legal moves - checkmate or stalemate
+        if is_in_check(board) {
+            // Checkmate - worst outcome (we lost)
+            return SearchResult {
+                best_move: MOVE_NULL,
+                draw_score: 0.0,  // Not a draw - we lost
+                depth: depth,
+                nodes: 1,
+                time_ms: 0,
+                pv: pv.clone(),
+                draw_type: "checkmate",
+            };
+        } else {
+            // Stalemate - PERFECT! It's a draw!
+            return SearchResult {
+                best_move: MOVE_NULL,
+                draw_score: 1.0,
+                depth: depth,
+                nodes: 1,
+                time_ms: 0,
+                pv: pv.clone(),
+                draw_type: "stalemate",
+            };
+        }
+    }
+
+    // Order moves for draw-seeking
+    order_moves_for_draw(&mut moves, board, &s.tt, hash, tt_move);
+
+    // ========================================
+    // MAIN SEARCH LOOP WITH LMR (advanced)
+    // Copyright (c) 2025 STARGA, Inc. All rights reserved.
+    // ========================================
+
+    let mut best_score: f32 = -1.0;  // Start below valid range (0-1) so any move improves
+    let mut best_move = moves[0];    // Default to first move
+    let mut flag = TT_UPPER;
+    let mut moves_searched: usize = 0;
+
+    // Get static eval for pruning decisions (convert NNUE score to draw probability)
+    let static_eval = evaluate_position(s, board);
+    let static_eval_cp = ((static_eval - 0.5) * 200.0) as i32;
+
+    for (i, m) in moves.iter().enumerate() {
+        let new_board = make_move(board, *m);
+        let mut child_pv = Vec.new();
+
+        // Get move properties for LMR
+        let is_capture = is_capture(*m);
+        let gives_check_flag = gives_check(*m, board);
+        let piece = move_piece(*m);
+        let to_sq = move_to(*m);
+        let history_score = get_history_score(&s.history, piece, to_sq);
+
+        // NNUE score for adaptive LMR (convert draw prob to centipawns)
+        let nnue_score_cp = static_eval_cp;
+
+        // ========================================
+        // LATE MOVE REDUCTIONS (advanced)
+        // ========================================
+
+        let mut search_depth = depth - 1;
+        let mut needs_full_search = true;
+
+        // Apply LMR for late moves
+        if i >= 3 && depth >= 3 && !in_check {
+            let reduction = adaptive_lmr_reduction(
+                depth,
+                i,
+                nnue_score_cp,
+                is_pv,
+                is_capture,
+                gives_check_flag,
+                history_score
+            );
+
+            if reduction > 0 {
+                // Reduced depth search
+                let reduced_depth = (depth - 1 - reduction).max(1);
+                let reduced_result = draw_negamax(s, new_board, reduced_depth, alpha, alpha + 0.01, &mut child_pv, ply + 1);
+
+                // If reduced search fails high, do full search
+                if reduced_result.draw_score > alpha {
+                    needs_full_search = true;
+                    child_pv.clear();
+                } else {
+                    // Reduced search accepted
+                    needs_full_search = false;
+                    if reduced_result.draw_score > best_score {
+                        best_score = reduced_result.draw_score;
+                        best_move = *m;
+                        local_pv.clear();
+                        local_pv.push(*m);
+                        local_pv.extend(child_pv.clone());
+                        flag = TT_EXACT;
+                    }
+                }
+            }
+        }
+
+        // Full search (PVS)
+        let result = if needs_full_search {
+            if i == 0 {
+                // First move: full window
+                draw_negamax(s, new_board, depth - 1, alpha, beta, &mut child_pv, ply + 1)
+            } else {
+                // Null window search
+                let null_result = draw_negamax(s, new_board, depth - 1, alpha, alpha + 0.01, &mut child_pv, ply + 1);
+
+                if null_result.draw_score > alpha && null_result.draw_score < beta {
+                    // Re-search with full window
+                    child_pv.clear();
+                    draw_negamax(s, new_board, depth - 1, alpha, beta, &mut child_pv, ply + 1)
+                } else {
+                    null_result
+                }
+            }
+        } else {
+            // LMR already handled this move
+            SearchResult {
+                best_move: *m,
+                draw_score: best_score,
+                depth: depth - 1,
+                nodes: 1,
+                time_ms: 0,
+                pv: child_pv.clone(),
+                draw_type: "lmr",
+            }
+        };
+
+        if s.stop {
+            break;
+        }
+
+        moves_searched += 1;
+
+        // We want HIGH draw scores (draws are good!)
+        if needs_full_search && result.draw_score > best_score {
+            best_score = result.draw_score;
+            best_move = *m;
+            local_pv.clear();
+            local_pv.push(*m);
+            local_pv.extend(child_pv);
+            flag = TT_EXACT;
+        }
+
+        alpha = max_f32(alpha, best_score);
+
+        if alpha >= beta {
+            flag = TT_LOWER;
+
+            // Update killer and history on beta cutoff
+            if !is_capture {
+                store_killer(&mut s.killers, ply as usize, *m);
+                update_history(&mut s.history, piece, to_sq, depth, true);
+            }
+            break;
+        }
+
+        // Negative history for moves that don't cause cutoff
+        if !is_capture && i > 0 {
+            update_history(&mut s.history, piece, to_sq, depth, false);
+        }
+    }
+
+    // Store in transposition table
+    tt_store(&mut s.tt, hash, depth, best_score, best_move, flag);
+
+    *pv = local_pv;
+
+    return SearchResult {
+        best_move: best_move,
+        draw_score: best_score,
+        depth: depth,
+        nodes: s.nodes,
+        time_ms: 0,
+        pv: pv.clone(),
+        draw_type: "search",
+    };
+}
+
+// ============================================================================
+// QUIESCENCE SEARCH
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+fn quiescence(s: &mut DrawSearch, board: Board, mut alpha: f32, beta: f32) -> f32 {
+    s.nodes += 1;
+
+    // Stand pat evaluation using HalfKA (advanced)
+    let stand_pat = evaluate_position(s, board);
+
+    if stand_pat >= beta {
+        return beta;
+    }
+
+    alpha = max_f32(alpha, stand_pat);
+
+    // Only search captures
+    let captures = generate_captures(board);
+    order_moves_for_draw(&mut captures, board, &s.tt, board.hash, MOVE_NULL);
+
+    for m in captures {
+        let new_board = make_move(board, m);
+        let score = quiescence(s, new_board, alpha, beta);
+
+        if score >= beta {
+            return beta;
+        }
+        alpha = max_f32(alpha, score);
+    }
+
+    return alpha;
+}
+
+// ============================================================================
+// NNUE/HALFKA EVALUATION (advanced)
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+fn evaluate_position(s: &mut DrawSearch, board: Board) -> f32 {
+    // Refresh accumulator for this position
+    let mut acc = create_accumulator();
+    refresh_accumulator(&mut acc, &s.halfka_weights, board);
+
+    // Get HalfKA evaluation in centipawns
+    let halfka_cp = evaluate_halfka(&acc, &s.halfka_weights, board.side_to_move == 0);
+
+    // Also get draw network evaluation for blending
+    let board_tensor = to_tensor_16ch(board);
+    let features = extract_features(board);
+    let draw_net_score = forward(s.net, board_tensor, features);
+
+    // Blend HalfKA and draw network
+    // Convert HalfKA centipawns to draw probability
+    // -100cp to +100cp maps roughly to 0.3 to 0.7 draw probability
+    let halfka_draw_prob = sigmoid((halfka_cp as f32) / 200.0) * 0.4 + 0.3;
+
+    // Weight: 60% draw network, 40% HalfKA
+    let blended = draw_net_score * 0.6 + halfka_draw_prob * 0.4;
+
+    return blended.clamp(0.0, 1.0);
+}
+
+fn sigmoid(x: f32) -> f32 {
+    return 1.0 / (1.0 + (-x).exp());
+}
+
+// ============================================================================
+// MOVE ORDERING (Draw-Seeking Priority + LMR Heuristics)
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+fn order_moves_for_draw(
+    moves: &mut Vec<Move>,
+    board: Board,
+    tt: &TranspositionTable,
+    hash: u64,
+    tt_move: Move
+) {
+    // Sort by draw priority (descending)
+    moves.sort_by(|a, b| {
+        let score_a = move_draw_priority(*a, board, tt, hash, tt_move);
+        let score_b = move_draw_priority(*b, board, tt, hash, tt_move);
+        score_b.partial_cmp(&score_a).unwrap()
+    });
+}
+
+// Extended move ordering with LMR heuristics (advanced)
+fn order_moves_with_lmr(
+    moves: &mut Vec<Move>,
+    board: Board,
+    tt: &TranspositionTable,
+    hash: u64,
+    tt_move: Move,
+    killers: &KillerTable,
+    history: &HistoryTable,
+    prev_move: Option<Move>,
+    ply: usize
+) {
+    // Sort by combined priority (descending)
+    moves.sort_by(|a, b| {
+        let score_a = move_ordering_score_combined(*a, board, tt_move, killers, history, prev_move, ply);
+        let score_b = move_ordering_score_combined(*b, board, tt_move, killers, history, prev_move, ply);
+        score_b.partial_cmp(&score_a).unwrap()
+    });
+}
+
+fn move_ordering_score_combined(
+    mv: Move,
+    board: Board,
+    tt_move: Move,
+    killers: &KillerTable,
+    history: &HistoryTable,
+    prev_move: Option<Move>,
+    ply: usize
+) -> i32 {
+    // Use LMR move ordering score as base
+    let lmr_score = move_ordering_score(mv, board, Some(tt_move), killers, history, prev_move, ply);
+
+    // Add draw-seeking bonuses
+    let mut draw_bonus: i32 = 0;
+
+    let new_board = make_move(board, mv);
+    let new_hash = new_board.hash;
+
+    // Repetition moves are EXCELLENT for draw-seeking
+    let rep_count = count_repetitions(&board.history, new_hash);
+    if rep_count >= 1 {
+        draw_bonus += 40000;  // Potential threefold!
+    }
+    if rep_count >= 2 {
+        draw_bonus += 80000;  // Guaranteed draw!
+    }
+
+    // Checks that might lead to perpetual
+    if gives_check(mv, board) {
+        draw_bonus += 500;
+    }
+
+    // Moves toward opposite-colored bishops (drawish)
+    if detect_opposite_colored_bishops(new_board) && !detect_opposite_colored_bishops(board) {
+        draw_bonus += 300;
+    }
+
+    return lmr_score + draw_bonus;
+}
+
+fn move_draw_priority(m: Move, board: Board, tt: &TranspositionTable, hash: u64, tt_move: Move) -> f32 {
+    let mut score = 0.0;
+
+    // Priority order:
+    // 1. TT move (highest priority)
+    // 2. Moves that cause repetition
+    // 3. Moves toward tablebase territory (captures/trades)
+    // 4. Perpetual check moves
+    // 5. Moves that maintain material balance
+    // 6. Defensive moves
+
+    // TT move gets highest priority
+    if m.data == tt_move.data && tt_move.data != 0 {
+        score += 100000.0;
+    }
+
+    let new_board = make_move(board, m);
+    let new_hash = new_board.hash;
+
+    // Repetition moves are EXCELLENT!
+    // (In normal engines these are bad, but we WANT draws)
+    let rep_count = count_repetitions(&board.history, new_hash);
+    if rep_count >= 1 {
+        score += 50000.0;  // Potential threefold!
+    }
+    if rep_count >= 2 {
+        score += 100000.0;  // Guaranteed draw!
+    }
+
+    // Moves that reduce material (toward tablebase)
+    if is_capture(m) {
+        let material_before = total_material(board);
+        let material_after = total_material(new_board);
+        let reduction = (material_before - material_after) as f32;
+        score += reduction * 10.0;
+
+        // Equal trades are especially good
+        let capture_value = piece_value(move_capture(m));
+        let moved_value = piece_value(move_piece(m) % 6);
+        if capture_value >= moved_value {
+            score += 1000.0;
+        }
+    }
+
+    // Checks that might lead to perpetual
+    if gives_check(m, board) {
+        score += 500.0;
+
+        // If we've been giving checks, perpetual is likely
+        score += 200.0;
+    }
+
+    // Moves that maintain material balance
+    let balance_before = abs(material_balance(board));
+    let balance_after = abs(material_balance(new_board));
+    if balance_after <= balance_before {
+        score += 200.0;
+    }
+
+    // Moves toward opposite-colored bishops (drawish)
+    if detect_opposite_colored_bishops(new_board) && !detect_opposite_colored_bishops(board) {
+        score += 300.0;
+    }
+
+    // Pawn symmetry preservation
+    let sym_before = calc_pawn_symmetry(board);
+    let sym_after = calc_pawn_symmetry(new_board);
+    if sym_after >= sym_before {
+        score += 100.0;
+    }
+
+    return score;
+}
+
+fn piece_value(piece: i32) -> i32 {
+    match piece % 6 {
+        0 => 100,   // Pawn
+        1 => 320,   // Knight
+        2 => 330,   // Bishop
+        3 => 500,   // Rook
+        4 => 900,   // Queen
+        5 => 0,     // King (not capturable)
+        _ => 0,
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn count_repetitions(history: &Vec<u64>, hash: u64) -> i32 {
+    let mut count: i32 = 0;  // FIX: Made mutable
+    for h in history {
+        if *h == hash {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn print_uci_info(depth: i32, draw_prob: f32, nodes: i64, time_ms: i64, pv: &Vec<Move>) {
+    // Convert draw probability to centipawn-like score
+    // 1.0 = draw = 0cp, 0.0 = losing = -10000cp
+    let cp = ((draw_prob - 0.5) * 200.0) as i32;
+
+    let nps = if time_ms > 0 { (nodes * 1000) / time_ms } else { 0 };
+
+    let pv_str = pv.iter().map(|m| move_to_uci(*m)).collect::<Vec<_>>().join(" ");
+
+    print("info depth", depth,
+          "score cp", cp,
+          "drawprob", (draw_prob * 1000.0) as i32,
+          "nodes", nodes,
+          "time", time_ms,
+          "nps", nps,
+          "pv", pv_str);
+}
+
+fn move_to_uci(m: Move) -> str {
+    let from = move_from(m);
+    let to = move_to(m);
+    let promo = move_promo(m);
+
+    let from_file = ('a' as i32 + from % 8) as char;
+    let from_rank = ('1' as i32 + from / 8) as char;
+    let to_file = ('a' as i32 + to % 8) as char;
+    let to_rank = ('1' as i32 + to / 8) as char;
+
+    let mut uci = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);  // FIX: Made mutable
+
+    if promo != 0 {
+        let promo_char = match promo % 6 {
+            1 => 'n',
+            2 => 'b',
+            3 => 'r',
+            4 => 'q',
+            _ => ' ',
+        };
+        uci = format!("{}{}", uci, promo_char);
+    }
+
+    return uci;
+}
+
+// ============================================================================
+// ASPIRATION WINDOWS (Draw-focused)
+// Narrow window around 0.5
+// ============================================================================
+
+fn aspiration_search(s: &mut DrawSearch, board: Board, depth: i32, prev_score: f32) -> SearchResult {
+    // Start with narrow window around previous score
+    // For draw-seeking: window around 0.5 (draw probability)
+    let mut delta: f32 = 0.05;  // FIX: Made mutable
+    let mut alpha = max_f32(0.0, prev_score - delta);
+    let mut beta = min_f32(1.0, prev_score + delta);
+
+    loop {
+        let mut pv = Vec.new();
+        let result = draw_negamax(s, board, depth, alpha, beta, &mut pv, 0);
+
+        if s.stop {
+            return result;
+        }
+
+        // Check if we need to re-search with wider window
+        if result.draw_score <= alpha {
+            // Fail low - widen alpha
+            alpha = max_f32(0.0, alpha - delta * 2.0);
+            delta *= 2.0;
+        } else if result.draw_score >= beta {
+            // Fail high - widen beta
+            beta = min_f32(1.0, beta + delta * 2.0);
+            delta *= 2.0;
+        } else {
+            // Search succeeded within window
+            return result;
+        }
+
+        // Full window search if delta is too large
+        if delta > 0.5 {
+            alpha = 0.0;
+            beta = 1.0;
+        }
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+fn min_f32(a: f32, b: f32) -> f32 {
+    if a < b { a } else { b }
+}

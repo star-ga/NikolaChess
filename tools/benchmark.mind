@@ -1,0 +1,182 @@
+// NikolaChess Benchmark Suite - Pure Mind Implementation
+// Performance testing and Elo estimation
+
+use std::time;
+use std::fs;
+
+const BENCHMARK_POSITIONS: [str] = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+];
+
+struct BenchResult {
+    position: str,
+    depth: u32,
+    nodes: u64,
+    time_ms: u64,
+    nps: u64,
+    best_move: str,
+    score: i32,
+}
+
+pub fn run_benchmark(depth: u32) -> Vec<BenchResult> {
+    println!("NikolaChess Benchmark");
+    println!("Depth: {}", depth);
+    println!("Positions: {}", BENCHMARK_POSITIONS.len());
+    println!("─".repeat(60));
+
+    let mut results = Vec::new();
+    let mut total_nodes = 0u64;
+    let mut total_time = 0u64;
+
+    for (i, fen) in BENCHMARK_POSITIONS.iter().enumerate() {
+        print!("Position {}/{}... ", i + 1, BENCHMARK_POSITIONS.len());
+
+        let board = Board::from_fen(fen);
+        let engine = Engine::new();
+
+        let start = time::now();
+        let search_result = engine.search(&board, SearchParams {
+            depth: Some(depth),
+            movetime: None,
+            nodes: None,
+        });
+        let elapsed = time::now() - start;
+
+        let nps = if elapsed > 0 {
+            (search_result.nodes * 1000) / elapsed
+        } else {
+            0
+        };
+
+        let result = BenchResult {
+            position: fen.to_string(),
+            depth: depth,
+            nodes: search_result.nodes,
+            time_ms: elapsed,
+            nps: nps,
+            best_move: search_result.best_move.to_uci(),
+            score: search_result.score,
+        };
+
+        println!("{} nodes, {} ms, {} nps",
+            format_nodes(result.nodes),
+            result.time_ms,
+            format_nodes(result.nps));
+
+        total_nodes += result.nodes;
+        total_time += result.time_ms;
+        results.push(result);
+    }
+
+    println!("─".repeat(60));
+    let avg_nps = if total_time > 0 {
+        (total_nodes * 1000) / total_time
+    } else {
+        0
+    };
+    println!("Total: {} nodes in {} ms", format_nodes(total_nodes), total_time);
+    println!("Average: {} nodes/sec", format_nodes(avg_nps));
+
+    results
+}
+
+fn format_nodes(n: u64) -> str {
+    if n >= 1_000_000_000 {
+        format!("{:.2}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.2}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+// Elo estimation from self-play
+pub fn estimate_elo(games: u32, depth: u32) -> f64 {
+    println!("Elo Estimation via Self-Play");
+    println!("Games: {}, Depth: {}", games, depth);
+
+    let mut wins = 0u32;
+    let mut draws = 0u32;
+    let mut losses = 0u32;
+
+    for game in 0..games {
+        print!("\rGame {}/{}...", game + 1, games);
+
+        let result = play_game(depth);
+        match result {
+            GameResult::WhiteWins => wins += 1,
+            GameResult::Draw => draws += 1,
+            GameResult::BlackWins => losses += 1,
+        }
+    }
+
+    println!("\nResults: +{} ={} -{}", wins, draws, losses);
+
+    // Calculate Elo difference
+    let score = (wins as f64 + draws as f64 * 0.5) / games as f64;
+    let elo_diff = -400.0 * (1.0 / score - 1.0).log10();
+
+    println!("Win rate: {:.1}%", score * 100.0);
+    println!("Estimated Elo: {:.0}", 1500.0 + elo_diff);
+
+    elo_diff
+}
+
+fn play_game(depth: u32) -> GameResult {
+    let mut board = Board::startpos();
+    let engine = Engine::new();
+
+    for _ in 0..500 {  // Max 500 plies
+        if board.is_game_over() {
+            break;
+        }
+
+        let result = engine.search(&board, SearchParams {
+            depth: Some(depth),
+            movetime: None,
+            nodes: None,
+        });
+
+        board.make_move(result.best_move);
+    }
+
+    board.game_result()
+}
+
+// Compare two engine versions
+pub fn elo_match(engine1: &str, engine2: &str, games: u32) {
+    println!("Elo Match: {} vs {}", engine1, engine2);
+    println!("Games: {}", games);
+
+    // Implementation for running matches between two engines
+    // Uses UCI protocol to communicate with external engines
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    if args.len() < 2 {
+        println!("Usage: benchmark <depth>");
+        println!("       benchmark elo <games> <depth>");
+        return;
+    }
+
+    match args[1].as_str() {
+        "elo" => {
+            let games = args.get(2).map(|s| s.parse().unwrap_or(100)).unwrap_or(100);
+            let depth = args.get(3).map(|s| s.parse().unwrap_or(8)).unwrap_or(8);
+            estimate_elo(games, depth);
+        }
+        _ => {
+            let depth = args[1].parse().unwrap_or(12);
+            run_benchmark(depth);
+        }
+    }
+}

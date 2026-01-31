@@ -1,0 +1,275 @@
+// Lichess Bot Integration - Pure Mind Implementation
+// Connects NikolaChess to Lichess API
+
+use std::net::http;
+use std::json;
+use std::thread;
+use std::time;
+
+const LICHESS_API: str = "https://lichess.org/api";
+
+struct LichessBot {
+    token: str,
+    engine: Engine,
+    active_games: HashMap<str, Game>,
+    client: http::Client,
+}
+
+struct Game {
+    id: str,
+    white: str,
+    black: str,
+    initial_fen: str,
+    moves: Vec<str>,
+    our_color: Color,
+    time_control: TimeControl,
+}
+
+struct TimeControl {
+    initial: u64,  // milliseconds
+    increment: u64,
+    our_time: u64,
+    their_time: u64,
+}
+
+impl LichessBot {
+    pub fn new(token: str) -> Self {
+        LichessBot {
+            token: token,
+            engine: Engine::new(),
+            active_games: HashMap::new(),
+            client: http::Client::new(),
+        }
+    }
+
+    pub fn run(&mut self) {
+        println!("NikolaChess Lichess Bot starting...");
+
+        // Start event stream
+        let stream = self.stream_events();
+
+        for event in stream {
+            match event.type {
+                "challenge" => self.handle_challenge(event),
+                "gameStart" => self.handle_game_start(event),
+                "gameFinish" => self.handle_game_finish(event),
+                _ => {}
+            }
+        }
+    }
+
+    fn stream_events(&self) -> EventStream {
+        let url = format!("{}/stream/event", LICHESS_API);
+        let headers = [
+            ("Authorization", format!("Bearer {}", self.token)),
+            ("Accept", "application/x-ndjson"),
+        ];
+
+        self.client.stream_get(url, headers)
+    }
+
+    fn handle_challenge(&mut self, event: json::Value) {
+        let challenge = event["challenge"];
+        let id = challenge["id"].as_str();
+        let variant = challenge["variant"]["key"].as_str();
+
+        // Only accept standard chess
+        if variant != "standard" {
+            self.decline_challenge(id, "variant");
+            return;
+        }
+
+        // Accept the challenge
+        self.accept_challenge(id);
+    }
+
+    fn accept_challenge(&self, id: str) {
+        let url = format!("{}/challenge/{}/accept", LICHESS_API, id);
+        self.client.post(url, self.auth_headers(), "");
+    }
+
+    fn decline_challenge(&self, id: str, reason: str) {
+        let url = format!("{}/challenge/{}/decline", LICHESS_API, id);
+        let body = format!("{{\"reason\":\"{}\"}}", reason);
+        self.client.post(url, self.auth_headers(), body);
+    }
+
+    fn handle_game_start(&mut self, event: json::Value) {
+        let game_id = event["game"]["gameId"].as_str();
+
+        // Spawn game handler thread
+        let token = self.token.clone();
+        thread::spawn(move || {
+            let mut handler = GameHandler::new(game_id, token);
+            handler.run();
+        });
+    }
+
+    fn handle_game_finish(&mut self, event: json::Value) {
+        let game_id = event["game"]["gameId"].as_str();
+        self.active_games.remove(game_id);
+        println!("Game {} finished", game_id);
+    }
+
+    fn auth_headers(&self) -> [(str, str); 1] {
+        [("Authorization", format!("Bearer {}", self.token))]
+    }
+}
+
+struct GameHandler {
+    game_id: str,
+    token: str,
+    engine: Engine,
+    board: Board,
+    our_color: Color,
+    client: http::Client,
+}
+
+impl GameHandler {
+    fn new(game_id: str, token: str) -> Self {
+        GameHandler {
+            game_id: game_id,
+            token: token,
+            engine: Engine::new(),
+            board: Board::startpos(),
+            our_color: Color::White,
+            client: http::Client::new(),
+        }
+    }
+
+    fn run(&mut self) {
+        println!("Starting game {}", self.game_id);
+
+        // Stream game state
+        let url = format!("{}/bot/game/stream/{}", LICHESS_API, self.game_id);
+        let stream = self.client.stream_get(url, self.auth_headers());
+
+        for event in stream {
+            match event.type {
+                "gameFull" => self.handle_game_full(event),
+                "gameState" => self.handle_game_state(event),
+                "chatLine" => {} // Ignore chat
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_game_full(&mut self, event: json::Value) {
+        // Determine our color
+        let white_id = event["white"]["id"].as_str();
+        let our_id = self.get_account_id();
+
+        self.our_color = if white_id == our_id {
+            Color::White
+        } else {
+            Color::Black
+        };
+
+        // Set initial position
+        let initial_fen = event["initialFen"].as_str();
+        if initial_fen != "startpos" {
+            self.board = Board::from_fen(initial_fen);
+        }
+
+        // Apply existing moves
+        let moves = event["state"]["moves"].as_str();
+        self.apply_moves(moves);
+
+        // Make move if it's our turn
+        if self.board.side_to_move() == self.our_color {
+            self.make_move(event["state"]);
+        }
+    }
+
+    fn handle_game_state(&mut self, event: json::Value) {
+        // Reset and replay all moves
+        self.board = Board::startpos();
+        let moves = event["moves"].as_str();
+        self.apply_moves(moves);
+
+        // Check game status
+        let status = event["status"].as_str();
+        if status != "started" {
+            return;
+        }
+
+        // Make move if it's our turn
+        if self.board.side_to_move() == self.our_color {
+            self.make_move(event);
+        }
+    }
+
+    fn apply_moves(&mut self, moves_str: str) {
+        if moves_str.is_empty() {
+            return;
+        }
+
+        for move_uci in moves_str.split(' ') {
+            let mv = Move::from_uci(move_uci, &self.board);
+            self.board.make_move(mv);
+        }
+    }
+
+    fn make_move(&mut self, state: json::Value) {
+        // Parse time control
+        let wtime = state["wtime"].as_u64().unwrap_or(60000);
+        let btime = state["btime"].as_u64().unwrap_or(60000);
+        let winc = state["winc"].as_u64().unwrap_or(0);
+        let binc = state["binc"].as_u64().unwrap_or(0);
+
+        let (our_time, our_inc) = if self.our_color == Color::White {
+            (wtime, winc)
+        } else {
+            (btime, binc)
+        };
+
+        // Calculate thinking time
+        let think_time = self.calculate_time(our_time, our_inc);
+
+        // Search for best move
+        let result = self.engine.search(&self.board, SearchParams {
+            movetime: Some(think_time),
+            depth: None,
+            nodes: None,
+        });
+
+        // Send move to Lichess
+        self.send_move(result.best_move);
+    }
+
+    fn calculate_time(&self, time_left: u64, increment: u64) -> u64 {
+        // Aggressive time management for online play
+        let base_time = time_left / 30;  // Use 1/30th of remaining time
+        let bonus = increment / 2;       // Use half the increment
+        let min_time = 100;              // Minimum 100ms
+        let max_time = time_left / 4;    // Never use more than 1/4 of time
+
+        (base_time + bonus).clamp(min_time, max_time)
+    }
+
+    fn send_move(&self, mv: Move) {
+        let url = format!("{}/bot/game/{}/move/{}",
+            LICHESS_API, self.game_id, mv.to_uci());
+        self.client.post(url, self.auth_headers(), "");
+    }
+
+    fn get_account_id(&self) -> str {
+        let url = format!("{}/account", LICHESS_API);
+        let response = self.client.get(url, self.auth_headers());
+        let json = json::parse(response);
+        json["id"].as_str().to_string()
+    }
+
+    fn auth_headers(&self) -> [(str, str); 1] {
+        [("Authorization", format!("Bearer {}", self.token))]
+    }
+}
+
+// Entry point for bot
+pub fn main() {
+    let token = std::env::var("LICHESS_API_TOKEN")
+        .expect("LICHESS_API_TOKEN not set");
+
+    let mut bot = LichessBot::new(token);
+    bot.run();
+}

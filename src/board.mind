@@ -1,0 +1,616 @@
+// NikolaChess - Board Representation
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// GPU-optimized tensor-based board for RTX acceleration
+
+import std.tensor;
+import std.cuda;
+import std.hash;
+
+// ============================================================================
+// PIECE AND COLOR CONSTANTS
+// ============================================================================
+
+const PAWN: i32 = 0;
+const KNIGHT: i32 = 1;
+const BISHOP: i32 = 2;
+const ROOK: i32 = 3;
+const QUEEN: i32 = 4;
+const KING: i32 = 5;
+
+const WHITE: i32 = 0;
+const BLACK: i32 = 6;
+
+const NO_SQUARE: i32 = -1;
+
+// Castling rights indices
+const WK_CASTLE: i32 = 0;  // White kingside
+const WQ_CASTLE: i32 = 1;  // White queenside
+const BK_CASTLE: i32 = 2;  // Black kingside
+const BQ_CASTLE: i32 = 3;  // Black queenside
+
+// ============================================================================
+// ZOBRIST HASHING (Pre-computed random numbers)
+// ============================================================================
+
+// 768 keys for piece-square (12 pieces * 64 squares)
+const ZOBRIST_KEYS: tensor<u64, (768,)> = init_zobrist_keys();
+const ZOBRIST_SIDE: u64 = 0xF8D626AAAF278509;  // Side to move
+const ZOBRIST_CASTLING: tensor<u64, (4,)> = [
+    0x31D71DCE64B2C310,  // WK
+    0xF165B587DF898190,  // WQ
+    0xA57E6339DD2CF3A0,  // BK
+    0x1EF6E6DBB1961EC9,  // BQ
+];
+const ZOBRIST_EP: tensor<u64, (8,)> = init_zobrist_ep();
+
+fn init_zobrist_keys() -> tensor<u64, (768,)> {
+    // Deterministic PRNG for reproducibility
+    let keys = tensor.zeros[u64, (768,)];
+    let mut seed: u64 = 0xDEADBEEF12345678;  // FIX: Made mutable
+    for i in 0..768 {
+        seed = seed ^ (seed << 13);
+        seed = seed ^ (seed >> 7);
+        seed = seed ^ (seed << 17);
+        keys[i] = seed;
+    }
+    return keys;
+}
+
+fn init_zobrist_ep() -> tensor<u64, (8,)> {
+    let keys = tensor.zeros[u64, (8,)];
+    let mut seed: u64 = 0xCAFEBABE87654321;  // FIX: Made mutable
+    for i in 0..8 {
+        seed = seed ^ (seed << 13);
+        seed = seed ^ (seed >> 7);
+        seed = seed ^ (seed << 17);
+        keys[i] = seed;
+    }
+    return keys;
+}
+
+// ============================================================================
+// BOARD STATE
+// ============================================================================
+
+// Board state as tensors (GPU-friendly Structure of Arrays)
+struct Board {
+    // Primary: 12 bitboards for each piece type (6 white + 6 black)
+    pieces: tensor<u64, (12,)>,
+
+    // Occupancy masks for quick access
+    occupancy: tensor<u64, (2,)>,  // [white_all, black_all]
+
+    // Game state
+    castling: tensor<bool, (4,)>,  // [WK, WQ, BK, BQ]
+    ep_square: i32,                 // En passant target (-1 if none)
+    halfmove: i32,                  // Halfmove clock (50-move rule)
+    fullmove: i32,                  // Fullmove counter
+    side_to_move: i32,              // 0=White, 1=Black
+
+    // Pre-computed hash for transposition table
+    hash: u64,
+
+    // Position history for repetition detection (critical for draw-seeking!)
+    history: Vec<u64>,
+}
+
+// Move representation (32-bit packed)
+struct Move {
+    data: u32,  // [from(6)|to(6)|promo(3)|piece(4)|capture(4)|flags(9)]
+}
+
+const MOVE_NULL: Move = Move { data: 0 };
+
+fn move_from(m: Move) -> i32 { return (m.data & 0x3F) as i32; }
+fn move_to(m: Move) -> i32 { return ((m.data >> 6) & 0x3F) as i32; }
+fn move_promo(m: Move) -> i32 { return ((m.data >> 12) & 0x7) as i32; }
+fn move_piece(m: Move) -> i32 { return ((m.data >> 15) & 0xF) as i32; }
+fn move_capture(m: Move) -> i32 { return ((m.data >> 19) & 0xF) as i32; }
+fn move_flags(m: Move) -> i32 { return ((m.data >> 23) & 0x1FF) as i32; }
+
+fn create_move(from: i32, to: i32, piece: i32, capture: i32, promo: i32, flags: i32) -> Move {
+    let data = (from as u32) |
+               ((to as u32) << 6) |
+               ((promo as u32) << 12) |
+               ((piece as u32) << 15) |
+               ((capture as u32) << 19) |
+               ((flags as u32) << 23);
+    return Move { data: data };
+}
+
+fn is_capture(m: Move) -> bool {
+    return move_capture(m) != 0;
+}
+
+fn gives_check(m: Move, board: Board) -> bool {
+    let new_board = make_move(board, m);
+    return is_in_check(new_board);
+}
+
+// ============================================================================
+// BOARD CREATION AND MANIPULATION
+// ============================================================================
+
+fn starting_position() -> Board {
+    let pieces = tensor.zeros[u64, (12,)];
+
+    // White pieces (rank 1 and 2)
+    pieces[PAWN + WHITE] = 0x000000000000FF00;    // a2-h2
+    pieces[KNIGHT + WHITE] = 0x0000000000000042;  // b1, g1
+    pieces[BISHOP + WHITE] = 0x0000000000000024;  // c1, f1
+    pieces[ROOK + WHITE] = 0x0000000000000081;    // a1, h1
+    pieces[QUEEN + WHITE] = 0x0000000000000008;   // d1
+    pieces[KING + WHITE] = 0x0000000000000010;    // e1
+
+    // Black pieces (rank 7 and 8)
+    pieces[PAWN + BLACK] = 0x00FF000000000000;    // a7-h7
+    pieces[KNIGHT + BLACK] = 0x4200000000000000;  // b8, g8
+    pieces[BISHOP + BLACK] = 0x2400000000000000;  // c8, f8
+    pieces[ROOK + BLACK] = 0x8100000000000000;    // a8, h8
+    pieces[QUEEN + BLACK] = 0x0800000000000000;   // d8
+    pieces[KING + BLACK] = 0x1000000000000000;    // e8
+
+    let occupancy = tensor.zeros[u64, (2,)];
+    occupancy[0] = 0x000000000000FFFF;  // White
+    occupancy[1] = 0xFFFF000000000000;  // Black
+
+    let board = Board {
+        pieces: pieces,
+        occupancy: occupancy,
+        castling: [true, true, true, true],
+        ep_square: NO_SQUARE,
+        halfmove: 0,
+        fullmove: 1,
+        side_to_move: WHITE,
+        hash: 0,
+        history: Vec.new(),
+    };
+
+    // Compute initial hash
+    board.hash = zobrist_hash(board);
+    return board;
+}
+
+fn from_fen(fen: str) -> Board {
+    // Parse FEN string into board state
+    let parts = fen.split(" ");
+    let board_str = parts[0];
+    let side = parts[1];
+    let castling_str = parts[2];
+    let ep_str = parts[3];
+    let halfmove_str = if parts.len() > 4 { parts[4] } else { "0" };
+    let fullmove_str = if parts.len() > 5 { parts[5] } else { "1" };
+
+    let mut pieces = tensor.zeros[u64, (12,)];  // FIX: Made mutable
+    let mut rank = 7;   // FIX: Made mutable
+    let mut file = 0;   // FIX: Made mutable
+
+    for c in board_str.chars() {
+        if c == '/' {
+            rank -= 1;
+            file = 0;
+        } else if c.is_digit() {
+            file += c.to_digit() as i32;
+        } else {
+            let sq = rank * 8 + file;
+            let piece_idx = char_to_piece(c);
+            pieces[piece_idx] |= 1 << sq;
+            file += 1;
+        }
+    }
+
+    let mut occupancy = tensor.zeros[u64, (2,)];  // FIX: Made mutable
+    for i in 0..6 {
+        occupancy[0] |= pieces[i];        // White
+        occupancy[1] |= pieces[i + 6];    // Black
+    }
+
+    let mut castling = [false, false, false, false];  // FIX: Made mutable
+    for c in castling_str.chars() {
+        match c {
+            'K' => castling[WK_CASTLE] = true,
+            'Q' => castling[WQ_CASTLE] = true,
+            'k' => castling[BK_CASTLE] = true,
+            'q' => castling[BQ_CASTLE] = true,
+            _ => {},
+        }
+    }
+
+    let ep_square = if ep_str == "-" {
+        NO_SQUARE
+    } else {
+        algebraic_to_square(ep_str)
+    };
+
+    let board = Board {
+        pieces: pieces,
+        occupancy: occupancy,
+        castling: castling,
+        ep_square: ep_square,
+        halfmove: halfmove_str.parse::<i32>().unwrap_or(0),
+        fullmove: fullmove_str.parse::<i32>().unwrap_or(1),
+        side_to_move: if side == "w" { WHITE } else { BLACK / 6 },
+        hash: 0,
+        history: Vec.new(),
+    };
+
+    // FIX: Create mutable copy to set hash
+    let mut result = board;
+    result.hash = zobrist_hash(result);
+    return result;
+}
+
+fn char_to_piece(c: char) -> i32 {
+    match c {
+        'P' => PAWN + WHITE,
+        'N' => KNIGHT + WHITE,
+        'B' => BISHOP + WHITE,
+        'R' => ROOK + WHITE,
+        'Q' => QUEEN + WHITE,
+        'K' => KING + WHITE,
+        'p' => PAWN + BLACK,
+        'n' => KNIGHT + BLACK,
+        'b' => BISHOP + BLACK,
+        'r' => ROOK + BLACK,
+        'q' => QUEEN + BLACK,
+        'k' => KING + BLACK,
+        _ => 0,
+    }
+}
+
+fn algebraic_to_square(s: str) -> i32 {
+    let file = (s.chars()[0] as i32) - ('a' as i32);
+    let rank = (s.chars()[1] as i32) - ('1' as i32);
+    return rank * 8 + file;
+}
+
+// ============================================================================
+// ZOBRIST HASHING
+// ============================================================================
+
+fn zobrist_hash(board: Board) -> u64 {
+    on(gpu0) {
+        let mut hash: u64 = 0;  // FIX: Made mutable
+
+        // Hash all pieces
+        for piece_type in 0..12 {
+            let mut bb = board.pieces[piece_type];  // FIX: Made mutable
+            while bb != 0 {
+                let sq = trailing_zeros(bb);
+                hash ^= ZOBRIST_KEYS[piece_type * 64 + sq];
+                bb &= bb - 1;  // Clear LSB
+            }
+        }
+
+        // Side to move
+        if board.side_to_move == 1 {
+            hash ^= ZOBRIST_SIDE;
+        }
+
+        // Castling rights
+        for i in 0..4 {
+            if board.castling[i] {
+                hash ^= ZOBRIST_CASTLING[i];
+            }
+        }
+
+        // En passant
+        if board.ep_square >= 0 {
+            hash ^= ZOBRIST_EP[board.ep_square % 8];
+        }
+
+        return hash;
+    }
+}
+
+// Incremental hash update (faster than full recompute)
+fn update_hash(hash: u64, piece: i32, sq: i32) -> u64 {
+    return hash ^ ZOBRIST_KEYS[piece * 64 + sq];
+}
+
+// ============================================================================
+// TENSOR CONVERSION (For Neural Network Input)
+// ============================================================================
+
+// Convert to 12x8x8 tensor for neural network input
+fn to_tensor_8x8(board: Board) -> tensor<f32, (12, 8, 8)> {
+    on(gpu0) {
+        let mut result = tensor.zeros[f32, (12, 8, 8)];  // FIX: Made mutable
+
+        for piece_type in 0..12 {
+            let mut bb = board.pieces[piece_type];  // FIX: Made mutable
+            while bb != 0 {
+                let sq = trailing_zeros(bb);
+                let rank = sq / 8;
+                let file = sq % 8;
+                result[piece_type, rank, file] = 1.0;
+                bb &= bb - 1;
+            }
+        }
+
+        return result;
+    }
+}
+
+// Batch conversion for parallel evaluation
+fn to_tensor_batch(boards: Vec<Board>) -> tensor<f32, (B, 12, 8, 8)> {
+    on(gpu0) {
+        let batch_size = boards.len();
+        let mut result = tensor.zeros[f32, (batch_size, 12, 8, 8)];  // FIX: Made mutable
+
+        for b in 0..batch_size {
+            let board = boards[b];
+            for piece_type in 0..12 {
+                let mut bb = board.pieces[piece_type];  // FIX: Made mutable
+                while bb != 0 {
+                    let sq = trailing_zeros(bb);
+                    let rank = sq / 8;
+                    let file = sq % 8;
+                    result[b, piece_type, rank, file] = 1.0;
+                    bb &= bb - 1;
+                }
+            }
+        }
+
+        return result;
+    }
+}
+
+// ============================================================================
+// DRAW DETECTION (Critical for draw-seeking engine!)
+// ============================================================================
+
+// Check if position can claim draw
+fn can_claim_draw(board: Board, history: &[u64]) -> (bool, str) {
+    // 50-move rule
+    if board.halfmove >= 100 {
+        return (true, "fifty_move");
+    }
+
+    // Threefold repetition (we WANT this!)
+    let current_hash = board.hash;
+    let mut count = 1;  // FIX: Made mutable - Current position counts as 1
+    for h in history {
+        if *h == current_hash {
+            count += 1;
+        }
+    }
+    if count >= 3 {
+        return (true, "repetition");
+    }
+
+    // Insufficient material
+    if is_insufficient_material(board) {
+        return (true, "insufficient");
+    }
+
+    return (false, "");
+}
+
+// Check for insufficient material
+fn is_insufficient_material(board: Board) -> bool {
+    let white_pieces = board.occupancy[0];
+    let black_pieces = board.occupancy[1];
+
+    let white_count = popcount(white_pieces);
+    let black_count = popcount(black_pieces);
+
+    // K vs K
+    if white_count == 1 && black_count == 1 {
+        return true;
+    }
+
+    // K+minor vs K
+    if white_count == 2 && black_count == 1 {
+        let wn = popcount(board.pieces[KNIGHT + WHITE]);
+        let wb = popcount(board.pieces[BISHOP + WHITE]);
+        if wn == 1 || wb == 1 {
+            return true;
+        }
+    }
+
+    if white_count == 1 && black_count == 2 {
+        let bn = popcount(board.pieces[KNIGHT + BLACK]);
+        let bb = popcount(board.pieces[BISHOP + BLACK]);
+        if bn == 1 || bb == 1 {
+            return true;
+        }
+    }
+
+    // K+N+N vs K (cannot force mate)
+    if white_count == 3 && black_count == 1 {
+        if popcount(board.pieces[KNIGHT + WHITE]) == 2 {
+            return true;
+        }
+    }
+
+    if white_count == 1 && black_count == 3 {
+        if popcount(board.pieces[KNIGHT + BLACK]) == 2 {
+            return true;
+        }
+    }
+
+    // K+B vs K+B (same colored bishops)
+    if white_count == 2 && black_count == 2 {
+        let wb = board.pieces[BISHOP + WHITE];
+        let bb = board.pieces[BISHOP + BLACK];
+        if popcount(wb) == 1 && popcount(bb) == 1 {
+            let wb_sq = trailing_zeros(wb);
+            let bb_sq = trailing_zeros(bb);
+            let wb_color = (wb_sq / 8 + wb_sq % 8) % 2;
+            let bb_color = (bb_sq / 8 + bb_sq % 8) % 2;
+            if wb_color == bb_color {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// MOVE GENERATION
+// ============================================================================
+
+fn generate_moves(board: Board) -> Vec<Move> {
+    let moves = Vec.new();
+    let us = board.side_to_move;
+    let them = 1 - us;
+    let our_pieces = board.occupancy[us];
+    let their_pieces = board.occupancy[them];
+    let all_pieces = our_pieces | their_pieces;
+    let offset = if us == 0 { 0 } else { 6 };
+
+    // Generate moves for each piece type
+    generate_pawn_moves(&moves, board, us, all_pieces, their_pieces);
+    generate_knight_moves(&moves, board, us, our_pieces, their_pieces);
+    generate_bishop_moves(&moves, board, us, our_pieces, all_pieces);
+    generate_rook_moves(&moves, board, us, our_pieces, all_pieces);
+    generate_queen_moves(&moves, board, us, our_pieces, all_pieces);
+    generate_king_moves(&moves, board, us, our_pieces, their_pieces);
+    generate_castling_moves(&moves, board, us, all_pieces);
+
+    return moves;
+}
+
+fn generate_captures(board: Board) -> Vec<Move> {
+    // Only generate capture moves (for quiescence search)
+    let moves = generate_moves(board);
+    return moves.filter(|m| is_capture(*m));
+}
+
+// ============================================================================
+// MAKE/UNMAKE MOVE
+// ============================================================================
+
+fn make_move(board: Board, m: Move) -> Board {
+    let mut new_board = board.clone();  // FIX: Made mutable
+    let from = move_from(m);
+    let to = move_to(m);
+    let piece = move_piece(m);
+    let capture = move_capture(m);
+    let promo = move_promo(m);
+
+    // Update piece positions
+    new_board.pieces[piece] &= ~(1 << from);
+    if promo != 0 {
+        new_board.pieces[promo] |= 1 << to;
+    } else {
+        new_board.pieces[piece] |= 1 << to;
+    }
+
+    // Remove captured piece
+    if capture != 0 {
+        new_board.pieces[capture] &= ~(1 << to);
+    }
+
+    // Update occupancy
+    for color in 0..2 {
+        new_board.occupancy[color] = 0;
+        for p in 0..6 {
+            new_board.occupancy[color] |= new_board.pieces[p + color * 6];
+        }
+    }
+
+    // Update game state
+    new_board.side_to_move = 1 - board.side_to_move;
+    new_board.halfmove = if capture != 0 || piece % 6 == PAWN { 0 } else { board.halfmove + 1 };
+    if board.side_to_move == 1 {
+        new_board.fullmove += 1;
+    }
+
+    // Update hash
+    new_board.hash = zobrist_hash(new_board);
+
+    // Add to history for repetition detection
+    new_board.history = board.history.clone();
+    new_board.history.push(board.hash);
+
+    return new_board;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn popcount(x: u64) -> i32 {
+    return __builtin_popcountll(x);
+}
+
+fn trailing_zeros(x: u64) -> i32 {
+    return __builtin_ctzll(x);
+}
+
+fn is_in_check(board: Board) -> bool {
+    let us = board.side_to_move;
+    let king_bb = board.pieces[KING + us * 6];
+    let king_sq = trailing_zeros(king_bb);
+    return is_square_attacked(board, king_sq, 1 - us);
+}
+
+fn is_square_attacked(board: Board, sq: i32, by_side: i32) -> bool {
+    // Check attacks from all enemy piece types
+    let offset = by_side * 6;
+
+    // Pawn attacks
+    let pawn_attacks = if by_side == 0 {
+        pawn_attack_mask_white(sq)
+    } else {
+        pawn_attack_mask_black(sq)
+    };
+    if (pawn_attacks & board.pieces[PAWN + offset]) != 0 {
+        return true;
+    }
+
+    // Knight attacks
+    if (knight_attack_mask(sq) & board.pieces[KNIGHT + offset]) != 0 {
+        return true;
+    }
+
+    // King attacks
+    if (king_attack_mask(sq) & board.pieces[KING + offset]) != 0 {
+        return true;
+    }
+
+    // Sliding pieces (bishop, rook, queen)
+    let all_pieces = board.occupancy[0] | board.occupancy[1];
+    let bishop_queen = board.pieces[BISHOP + offset] | board.pieces[QUEEN + offset];
+    if (bishop_attacks(sq, all_pieces) & bishop_queen) != 0 {
+        return true;
+    }
+
+    let rook_queen = board.pieces[ROOK + offset] | board.pieces[QUEEN + offset];
+    if (rook_attacks(sq, all_pieces) & rook_queen) != 0 {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// MATERIAL CALCULATION
+// ============================================================================
+
+const PAWN_VALUE: i32 = 100;
+const KNIGHT_VALUE: i32 = 320;
+const BISHOP_VALUE: i32 = 330;
+const ROOK_VALUE: i32 = 500;
+const QUEEN_VALUE: i32 = 900;
+
+fn count_material(board: Board, color: i32) -> i32 {
+    let offset = if color == WHITE { 0 } else { 6 };
+    return popcount(board.pieces[PAWN + offset]) * PAWN_VALUE +
+           popcount(board.pieces[KNIGHT + offset]) * KNIGHT_VALUE +
+           popcount(board.pieces[BISHOP + offset]) * BISHOP_VALUE +
+           popcount(board.pieces[ROOK + offset]) * ROOK_VALUE +
+           popcount(board.pieces[QUEEN + offset]) * QUEEN_VALUE;
+}
+
+fn total_material(board: Board) -> i32 {
+    return count_material(board, WHITE) + count_material(board, BLACK / 6);
+}
+
+fn material_balance(board: Board) -> i32 {
+    return count_material(board, WHITE) - count_material(board, BLACK / 6);
+}

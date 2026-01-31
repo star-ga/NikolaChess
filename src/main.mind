@@ -1,0 +1,454 @@
+// NikolaChess - Main Entry Point
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// High-Performance Chess Engine Built on MIND
+//
+// Features:
+// - HalfKA NNUE evaluation with activity features
+// - Transformer-based root move reranking
+// - ABDADA parallel search for multi-core scaling
+// - Late Move Reductions with NNUE-adaptive tuning
+// - Draw-focused search for fortress play
+
+import std.io;
+import std.time;
+import std.cuda;
+
+// Import all modules
+import board;
+import draw_eval;
+import search;
+import opening_book;
+import endgame;
+import uci;
+
+// Import optimization modules
+import halfka;
+import transformer;
+import abdada;
+import lmr;
+
+// ============================================================================
+// ENGINE INFO
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// ============================================================================
+
+const ENGINE_NAME: str = "NikolaChess";
+const ENGINE_VERSION: str = "3.19.0-fortress";
+const ENGINE_AUTHOR: str = "STARGA, Inc.";
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+fn main() {
+    print_banner();
+
+    // Initialize CUDA
+    if !cuda.init() {
+        println("Warning: CUDA not available, using CPU fallback");
+    } else {
+        let gpu_info = cuda.get_device_info(0);
+        println("GPU: {} ({} MB)", gpu_info.name, gpu_info.memory_mb);
+    }
+
+    // Initialize engine components
+    // FIX: Ensure directories exist before loading/saving
+    if !io.exists("./models") {
+        io.create_dir("./models");
+    }
+    if !io.exists("./book") {
+        io.create_dir("./book");
+    }
+    if !io.exists("./syzygy") {
+        io.create_dir("./syzygy");
+        println("Note: Created ./syzygy directory (add tablebase files for endgame support)");
+    }
+
+    println("Loading neural network...");
+    let net = load_network_or_create("./models/draw_net.mind");
+
+    println("Loading opening book...");
+    let mut book = load_book("./book/draw_book.bin");  // FIX: Made mutable
+    if book.entries.len() == 0 {
+        println("No book found, creating default draw book...");
+        book = create_opening_book();
+        save_book(&book, "./book/draw_book.bin");
+    }
+    println("Book: {} positions loaded", book.entries.len());
+
+    println("Loading tablebases...");
+    let mut tb = create_tablebase("./syzygy");  // FIX: Made mutable for tb_init
+    if tb_init(&mut tb) {
+        println("Tablebase: {} pieces max", tb.max_pieces);
+    } else {
+        println("Warning: No tablebases found");
+    }
+
+    // Create search engine
+    let search_engine = create_search(net, book, tb);
+
+    // Create UCI engine
+    let uci_engine = UCIEngine {
+        name: ENGINE_NAME,
+        author: ENGINE_AUTHOR,
+        search: search_engine,
+        board: starting_position(),
+        draw_mode: true,
+        draw_threshold: 990,
+        contempt: 0,
+        max_depth: 64,
+        hash_size: 256,
+        running: true,
+        searching: false,
+    };
+
+    println("");
+    println("Engine ready. Type 'uci' to start.");
+    println("");
+
+    // Start UCI loop
+    uci_loop(&mut uci_engine);
+
+    println("Goodbye!");
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+fn load_network_or_create(path: str) -> DrawNetwork {
+    if io.exists(path) {
+        return load_network(path);
+    } else {
+        println("No trained model found, creating new network...");
+        let net = create_draw_network();
+        // Initialize with random weights
+        return net;
+    }
+}
+
+fn print_banner() {
+    println("=========================================================");
+    println("");
+    println("  _   _ _ _         _        _____ _                   ");
+    println(" | \\ | (_) | _____ | | __ _ / ____| |                  ");
+    println(" |  \\| | | |/ / _ \\| |/ _` | |    | |__   ___  ___ ___ ");
+    println(" | . ` | |   < (_) | | (_| | |    | '_ \\ / _ \\/ __/ __|");
+    println(" | |\\  | | |\\ \\___/| | (_| | |____| | | |  __/\\__ \\__ \\");
+    println(" |_| \\_|_|_| \\_\\   |_|\\__,_|\\_____|_| |_|\\___||___/___/");
+    println("");
+    println("                  FORTRESS");
+    println("           The Unbeatable Engine");
+    println("              Version {}", ENGINE_VERSION);
+    println("");
+    println("=========================================================");
+    println("");
+    println(" Copyright (c) 2025 STARGA, Inc. All rights reserved.");
+    println(" PROPRIETARY AND CONFIDENTIAL");
+    println("");
+    println(" Goal: NEVER LOSE - Draw or Win Only");
+    println(" Built on MIND - GPU-Accelerated Language");
+    println("");
+    println(" Features:");
+    println("   - HalfKA NNUE Evaluation");
+    println("   - Transformer Root Reranking");
+    println("   - ABDADA Parallel Search");
+    println("   - Adaptive Late Move Reductions");
+    println("");
+    println("=========================================================");
+    println("");
+}
+
+// ============================================================================
+// BENCHMARK MODE
+// ============================================================================
+
+fn benchmark(positions: Vec<str>, depth: i32) {
+    println("Running benchmark on {} positions at depth {}...", positions.len(), depth);
+    println("");
+
+    let mut total_nodes: i64 = 0;  // FIX: Made mutable
+    let mut total_time: i64 = 0;   // FIX: Made mutable
+
+    // FIX: Ensure syzygy directory exists
+    if !io.exists("./syzygy") {
+        io.create_dir("./syzygy");
+    }
+
+    let net = create_draw_network();
+    let book = create_opening_book();
+    let mut tb = create_tablebase("./syzygy");  // FIX: Made mutable for tb_init
+    tb_init(&mut tb);  // FIX: Initialize tablebase
+    let mut search_engine = create_search(net, book, tb);  // FIX: Made mutable
+
+    for (i, fen) in positions.iter().enumerate() {
+        let board = from_fen(fen);
+        println("Position {}: {}", i + 1, fen);
+
+        let start = time.now_ms();
+        let result = search(&mut search_engine, board, depth, 60000);
+        let elapsed = time.now_ms() - start;
+
+        total_nodes += result.nodes;
+        total_time += elapsed;
+
+        println("  Best: {} Draw: {:.1}% Nodes: {} Time: {}ms",
+                move_to_uci(result.best_move),
+                result.draw_score * 100.0,
+                result.nodes,
+                elapsed);
+        println("");
+    }
+
+    let nps = if total_time > 0 { (total_nodes * 1000) / total_time } else { 0 };
+    println("=========================================================");
+    println("Total: {} nodes in {}ms ({} nps)", total_nodes, total_time, nps);
+    println("=========================================================");
+}
+
+// ============================================================================
+// TRAINING MODE
+// ============================================================================
+
+fn train(data_path: str, epochs: i32, learning_rate: f32) {
+    println("Training draw network...");
+    println("Data: {}", data_path);
+    println("Epochs: {}", epochs);
+    println("Learning rate: {}", learning_rate);
+    println("");
+
+    // Load or create network
+    let net = load_network_or_create("./models/draw_net.mind");
+
+    // Load training data
+    // Format: FEN, draw_label (1.0 for draw, 0.0 for loss)
+    let data = load_training_data(data_path);
+
+    println("Loaded {} training positions", data.len());
+    println("");
+
+    for epoch in 0..epochs {
+        let mut total_loss = 0.0;
+        let mut batch_count = 0;
+        let batch_size = 64;
+
+        for batch_start in (0..data.len()).step_by(batch_size) {
+            let batch_end = min(batch_start + batch_size, data.len());
+            let batch = &data[batch_start..batch_end];
+
+            // Prepare batch tensors
+            let boards = tensor.zeros[f32, (batch.len(), 16, 8, 8)];
+            let features = tensor.zeros[f32, (batch.len(), NUM_FEATURES)];
+            let labels = tensor.zeros[f32, (batch.len(),)];
+
+            for (i, (fen, label)) in batch.iter().enumerate() {
+                let board = from_fen(fen);
+                let bt = to_tensor_16ch(board);
+                let ft = features_to_tensor(extract_features(board));
+
+                boards[i] = bt;
+                features[i] = ft;
+                labels[i] = *label;
+            }
+
+            // Train step - accumulate loss
+            let batch_loss = train_draw_network(net, boards, features, labels, learning_rate);
+            total_loss += batch_loss;
+            batch_count += 1;
+        }
+
+        let avg_loss = if batch_count > 0 { total_loss / batch_count as f32 } else { 0.0 };
+        println("Epoch {}/{} complete - avg loss: {:.4}", epoch + 1, epochs, avg_loss);
+    }
+
+    // Save trained model
+    save_network(net, "./models/draw_net.mind");
+    println("");
+    println("Model saved to ./models/draw_net.mind");
+}
+
+fn load_training_data(path: str) -> Vec<(str, f32)> {
+    let data = Vec.new();
+
+    if !io.exists(path) {
+        return data;
+    }
+
+    let file = io.open(path, "r");
+    while let Some(line) = file.read_line() {
+        let parts = line.trim().split(",");
+        if parts.len() >= 2 {
+            let fen = parts[0].trim();
+            let label = parts[1].trim().parse::<f32>().unwrap_or(0.5);
+            data.push((fen.to_string(), label));
+        }
+    }
+    file.close();
+
+    return data;
+}
+
+fn min(a: i32, b: i32) -> i32 {
+    if a < b { a } else { b }
+}
+
+// ============================================================================
+// SELF-PLAY MODE
+// ============================================================================
+
+fn selfplay(games: i32, output_path: str) {
+    println("Starting self-play for {} games...", games);
+    println("Output: {}", output_path);
+    println("");
+
+    // FIX: Ensure syzygy directory exists
+    if !io.exists("./syzygy") {
+        io.create_dir("./syzygy");
+    }
+
+    let net = load_network_or_create("./models/draw_net.mind");
+    let book = create_opening_book();
+    let mut tb = create_tablebase("./syzygy");  // FIX: Made mutable for tb_init
+    tb_init(&mut tb);  // FIX: Initialize tablebase
+    let mut search_engine = create_search(net, book, tb);  // FIX: Made mutable for &mut borrow
+
+    let results = io.open(output_path, "w");
+    let mut draws = 0;         // FIX: Made mutable
+    let mut white_wins = 0;    // FIX: Made mutable
+    let mut black_wins = 0;    // FIX: Made mutable
+
+    for game in 0..games {
+        let mut board = starting_position();  // FIX: Made mutable
+        let mut positions = Vec.new();        // FIX: Made mutable
+        let mut moves_played = 0;             // FIX: Made mutable
+
+        while moves_played < 200 {
+            // Check for game end
+            let (can_draw, _) = can_claim_draw(board, &board.history);
+            if can_draw {
+                draws += 1;
+                // Label all positions as draw
+                for fen in positions.iter() {
+                    results.write(format!("{},1.0\n", fen));
+                }
+                break;
+            }
+
+            let moves = generate_moves(board);
+            if moves.is_empty() {
+                if is_in_check(board) {
+                    // Checkmate
+                    if board.side_to_move == 0 {
+                        black_wins += 1;
+                    } else {
+                        white_wins += 1;
+                    }
+                    // Label positions as loss for losing side
+                    for (i, fen) in positions.iter().enumerate() {
+                        let label = if i % 2 == board.side_to_move { 0.0 } else { 1.0 };
+                        results.write(format!("{},{}\n", fen, label));
+                    }
+                } else {
+                    // Stalemate
+                    draws += 1;
+                    for fen in positions.iter() {
+                        results.write(format!("{},1.0\n", fen));
+                    }
+                }
+                break;
+            }
+
+            // Save position
+            positions.push(board_to_fen(board));
+
+            // Search for best move
+            let result = search(&mut search_engine, board, 8, 1000);
+            board = make_move(board, result.best_move);
+            moves_played += 1;
+        }
+
+        if moves_played >= 200 {
+            // Long game - count as draw
+            draws += 1;
+            for fen in positions.iter() {
+                results.write(format!("{},1.0\n", fen));
+            }
+        }
+
+        if (game + 1) % 10 == 0 {
+            println("Game {}/{}: W={} D={} B={}",
+                    game + 1, games, white_wins, draws, black_wins);
+        }
+    }
+
+    results.close();
+    println("");
+    println("Self-play complete!");
+    println("Results: White {} - Draw {} - Black {}", white_wins, draws, black_wins);
+    println("Draw rate: {:.1}%", (draws as f32 / games as f32) * 100.0);
+}
+
+fn board_to_fen(board: Board) -> str {
+    // Convert board to FEN string
+    let mut fen = "";              // FIX: Made mutable
+    let pieces_chars = "PNBRQKpnbrqk";
+
+    for rank in (0..8).rev() {
+        let mut empty = 0;         // FIX: Made mutable
+        for file in 0..8 {
+            let sq = rank * 8 + file;
+            let mut found = false; // FIX: Made mutable
+
+            for p in 0..12 {
+                if (board.pieces[p] & (1 << sq)) != 0 {
+                    if empty > 0 {
+                        fen = format!("{}{}", fen, empty);
+                        empty = 0;
+                    }
+                    fen = format!("{}{}", fen, pieces_chars.chars()[p]);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                empty += 1;
+            }
+        }
+
+        if empty > 0 {
+            fen = format!("{}{}", fen, empty);
+        }
+
+        if rank > 0 {
+            fen = format!("{}/", fen);
+        }
+    }
+
+    // Side to move
+    fen = format!("{} {}", fen, if board.side_to_move == 0 { "w" } else { "b" });
+
+    // Castling
+    let mut castling = "";  // FIX: Made mutable
+    if board.castling[0] { castling = format!("{}K", castling); }
+    if board.castling[1] { castling = format!("{}Q", castling); }
+    if board.castling[2] { castling = format!("{}k", castling); }
+    if board.castling[3] { castling = format!("{}q", castling); }
+    if castling.is_empty() { castling = "-"; }
+    fen = format!("{} {}", fen, castling);
+
+    // En passant
+    if board.ep_square >= 0 {
+        let file = ('a' as i32 + board.ep_square % 8) as char;
+        let rank = ('1' as i32 + board.ep_square / 8) as char;
+        fen = format!("{} {}{}", fen, file, rank);
+    } else {
+        fen = format!("{} -", fen);
+    }
+
+    // Halfmove and fullmove
+    fen = format!("{} {} {}", fen, board.halfmove, board.fullmove);
+
+    return fen;
+}

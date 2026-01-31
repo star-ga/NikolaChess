@@ -1,0 +1,240 @@
+// Training Data Generation - Pure Mind Implementation
+// Generates labeled positions from PGN games
+
+use std::fs;
+use std::io;
+
+const SHARD_SIZE: usize = 1_000_000;  // Positions per shard
+
+struct LabeledPosition {
+    fen: str,
+    eval: i16,           // Centipawns
+    result: f32,         // 1.0 = white win, 0.5 = draw, 0.0 = black win
+    ply: u16,            // Move number
+    best_move: str,      // Best move in UCI format
+}
+
+struct ShardWriter {
+    output_dir: str,
+    shard_num: u32,
+    positions: Vec<LabeledPosition>,
+}
+
+impl ShardWriter {
+    fn new(output_dir: str) -> Self {
+        fs::create_dir_all(output_dir);
+        ShardWriter {
+            output_dir: output_dir,
+            shard_num: 0,
+            positions: Vec::with_capacity(SHARD_SIZE),
+        }
+    }
+
+    fn add(&mut self, pos: LabeledPosition) {
+        self.positions.push(pos);
+        if self.positions.len() >= SHARD_SIZE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.positions.is_empty() {
+            return;
+        }
+
+        let path = format!("{}/shard_{:04}.shard", self.output_dir, self.shard_num);
+        let mut file = fs::File::create(path).unwrap();
+
+        // Write header
+        file.write_u32(0x53485244);  // "SHRD" magic
+        file.write_u32(1);            // Version
+        file.write_u32(self.positions.len() as u32);
+
+        // Write positions
+        for pos in &self.positions {
+            write_position(&mut file, pos);
+        }
+
+        println!("Wrote shard {} ({} positions)", self.shard_num, self.positions.len());
+        self.shard_num += 1;
+        self.positions.clear();
+    }
+}
+
+fn write_position(file: &mut fs::File, pos: &LabeledPosition) {
+    // Encode FEN compactly
+    let board = Board::from_fen(&pos.fen);
+    let packed = board.pack();  // 32 bytes packed representation
+
+    file.write(&packed);
+    file.write_i16(pos.eval);
+    file.write_f32(pos.result);
+    file.write_u16(pos.ply);
+    file.write_str(&pos.best_move);
+}
+
+// Parse PGN and generate training data
+pub fn generate_from_pgn(pgn_path: str, output_dir: str, min_elo: u32) {
+    println!("Generating training data from {}", pgn_path);
+    println!("Output: {}", output_dir);
+    println!("Min Elo: {}", min_elo);
+
+    let mut writer = ShardWriter::new(output_dir);
+    let mut games_processed = 0u64;
+    let mut positions_generated = 0u64;
+
+    let file = fs::File::open(pgn_path).unwrap();
+    let reader = io::BufReader::new(file);
+
+    for game in PgnParser::new(reader) {
+        // Filter by Elo
+        let white_elo = game.header("WhiteElo").parse().unwrap_or(0);
+        let black_elo = game.header("BlackElo").parse().unwrap_or(0);
+
+        if white_elo < min_elo || black_elo < min_elo {
+            continue;
+        }
+
+        // Get game result
+        let result = match game.header("Result") {
+            "1-0" => 1.0f32,
+            "0-1" => 0.0f32,
+            "1/2-1/2" => 0.5f32,
+            _ => continue,  // Skip incomplete games
+        };
+
+        // Replay game and extract positions
+        let mut board = Board::startpos();
+        let engine = Engine::new();
+
+        for (ply, mv) in game.moves().enumerate() {
+            // Skip opening (first 8 moves)
+            if ply < 16 {
+                board.make_move(mv);
+                continue;
+            }
+
+            // Get engine evaluation
+            let search = engine.search(&board, SearchParams {
+                depth: Some(12),
+                movetime: None,
+                nodes: None,
+            });
+
+            // Skip positions with extreme evaluations (likely decided)
+            if search.score.abs() > 1000 {
+                board.make_move(mv);
+                continue;
+            }
+
+            let pos = LabeledPosition {
+                fen: board.to_fen(),
+                eval: search.score as i16,
+                result: result,
+                ply: ply as u16,
+                best_move: search.best_move.to_uci(),
+            };
+
+            writer.add(pos);
+            positions_generated += 1;
+
+            board.make_move(mv);
+        }
+
+        games_processed += 1;
+        if games_processed % 1000 == 0 {
+            println!("Processed {} games, {} positions", games_processed, positions_generated);
+        }
+    }
+
+    writer.flush();
+    println!("Done! {} games, {} positions", games_processed, positions_generated);
+}
+
+// Download Lichess database
+pub fn download_lichess(year: u32, month: u32, output_path: str) {
+    let url = format!(
+        "https://database.lichess.org/standard/lichess_db_standard_rated_{:04}-{:02}.pgn.zst",
+        year, month
+    );
+
+    println!("Downloading {}", url);
+
+    let response = std::net::http::get(url);
+    let decompressed = std::compress::zstd::decompress(response.body());
+
+    fs::write(output_path, decompressed);
+    println!("Saved to {}", output_path);
+}
+
+// Download Syzygy tablebases
+pub fn download_syzygy(pieces: u32, output_dir: str) {
+    let base_url = "https://tablebase.lichess.ovh/tables/standard";
+
+    println!("Downloading {}-man Syzygy tablebases to {}", pieces, output_dir);
+    fs::create_dir_all(output_dir);
+
+    let tables = get_tablebase_list(pieces);
+
+    for (i, table) in tables.iter().enumerate() {
+        print!("\r[{}/{}] {}...", i + 1, tables.len(), table);
+
+        let rtbw_url = format!("{}/{}.rtbw", base_url, table);
+        let rtbz_url = format!("{}/{}.rtbz", base_url, table);
+
+        let rtbw = std::net::http::get(rtbw_url);
+        let rtbz = std::net::http::get(rtbz_url);
+
+        fs::write(format!("{}/{}.rtbw", output_dir, table), rtbw.body());
+        fs::write(format!("{}/{}.rtbz", output_dir, table), rtbz.body());
+    }
+
+    println!("\nDone!");
+}
+
+fn get_tablebase_list(pieces: u32) -> Vec<str> {
+    // Returns list of tablebase names for given piece count
+    match pieces {
+        3 => vec!["KBvK", "KNvK", "KPvK", "KQvK", "KRvK"],
+        4 => vec!["KBBvK", "KBNvK", "KBPvK", "KBvKB", "KBvKN", "KBvKP",
+                  "KNNvK", "KNPvK", "KNvKN", "KNvKP", "KPPvK", "KPvKP",
+                  "KQBvK", "KQNvK", "KQPvK", "KQvKB", "KQvKN", "KQvKP",
+                  "KQvKQ", "KQvKR", "KRBvK", "KRNvK", "KRPvK", "KRRvK",
+                  "KRvKB", "KRvKN", "KRvKP", "KRvKR"],
+        5 | 6 | 7 | 8 => vec![],  // Too many to list, fetch from server
+        _ => vec![],
+    }
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    if args.len() < 2 {
+        println!("Usage:");
+        println!("  data_gen pgn <input.pgn> <output_dir> [min_elo]");
+        println!("  data_gen lichess <year> <month> <output.pgn>");
+        println!("  data_gen syzygy <pieces> <output_dir>");
+        return;
+    }
+
+    match args[1].as_str() {
+        "pgn" => {
+            let input = args.get(2).expect("Input PGN required");
+            let output = args.get(3).expect("Output dir required");
+            let min_elo = args.get(4).map(|s| s.parse().unwrap_or(2000)).unwrap_or(2000);
+            generate_from_pgn(input, output, min_elo);
+        }
+        "lichess" => {
+            let year = args.get(2).expect("Year required").parse().unwrap();
+            let month = args.get(3).expect("Month required").parse().unwrap();
+            let output = args.get(4).expect("Output path required");
+            download_lichess(year, month, output);
+        }
+        "syzygy" => {
+            let pieces = args.get(2).expect("Pieces required").parse().unwrap();
+            let output = args.get(3).expect("Output dir required");
+            download_syzygy(pieces, output);
+        }
+        _ => println!("Unknown command: {}", args[1]),
+    }
+}

@@ -1,0 +1,1090 @@
+// NikolaChess - Move Generation for 64-bit Packed Moves
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+
+import std.tensor;
+import move64.*;
+
+// ============================================================================
+// ATTACK TABLES (Pre-computed)
+// ============================================================================
+
+// Knight attack table (64 squares)
+const KNIGHT_ATTACKS: tensor<u64, (64,)> = init_knight_attacks();
+
+// King attack table (64 squares)
+const KING_ATTACKS: tensor<u64, (64,)> = init_king_attacks();
+
+// Pawn attack tables (64 squares x 2 colors)
+const PAWN_ATTACKS_WHITE: tensor<u64, (64,)> = init_pawn_attacks_white();
+const PAWN_ATTACKS_BLACK: tensor<u64, (64,)> = init_pawn_attacks_black();
+
+// Sliding piece masks and magic numbers
+const ROOK_MASKS: tensor<u64, (64,)> = init_rook_masks();
+const BISHOP_MASKS: tensor<u64, (64,)> = init_bishop_masks();
+const ROOK_MAGICS: tensor<u64, (64,)> = init_rook_magics();
+const BISHOP_MAGICS: tensor<u64, (64,)> = init_bishop_magics();
+const ROOK_SHIFTS: tensor<i32, (64,)> = init_rook_shifts();
+const BISHOP_SHIFTS: tensor<i32, (64,)> = init_bishop_shifts();
+
+// Attack lookup tables (magic bitboards)
+static ROOK_ATTACKS: tensor<u64, (64, 4096)> = tensor.zeros[u64, (64, 4096)];
+static BISHOP_ATTACKS: tensor<u64, (64, 512)> = tensor.zeros[u64, (64, 512)];
+
+// ============================================================================
+// INITIALIZATION FUNCTIONS
+// ============================================================================
+
+fn init_knight_attacks() -> tensor<u64, (64,)> {
+    let attacks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        let mut bb: u64 = 0;
+        let r = sq / 8;
+        let f = sq % 8;
+
+        // All 8 knight moves
+        if r >= 2 && f >= 1 { bb |= 1u64 << (sq - 17); }
+        if r >= 2 && f <= 6 { bb |= 1u64 << (sq - 15); }
+        if r >= 1 && f >= 2 { bb |= 1u64 << (sq - 10); }
+        if r >= 1 && f <= 5 { bb |= 1u64 << (sq - 6); }
+        if r <= 6 && f >= 2 { bb |= 1u64 << (sq + 6); }
+        if r <= 6 && f <= 5 { bb |= 1u64 << (sq + 10); }
+        if r <= 5 && f >= 1 { bb |= 1u64 << (sq + 15); }
+        if r <= 5 && f <= 6 { bb |= 1u64 << (sq + 17); }
+
+        attacks[sq] = bb;
+    }
+    return attacks;
+}
+
+fn init_king_attacks() -> tensor<u64, (64,)> {
+    let attacks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        let mut bb: u64 = 0;
+        let r = sq / 8;
+        let f = sq % 8;
+
+        // All 8 king moves
+        if r > 0 { bb |= 1u64 << (sq - 8); }
+        if r < 7 { bb |= 1u64 << (sq + 8); }
+        if f > 0 { bb |= 1u64 << (sq - 1); }
+        if f < 7 { bb |= 1u64 << (sq + 1); }
+        if r > 0 && f > 0 { bb |= 1u64 << (sq - 9); }
+        if r > 0 && f < 7 { bb |= 1u64 << (sq - 7); }
+        if r < 7 && f > 0 { bb |= 1u64 << (sq + 7); }
+        if r < 7 && f < 7 { bb |= 1u64 << (sq + 9); }
+
+        attacks[sq] = bb;
+    }
+    return attacks;
+}
+
+fn init_pawn_attacks_white() -> tensor<u64, (64,)> {
+    let attacks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        let mut bb: u64 = 0;
+        let r = sq / 8;
+        let f = sq % 8;
+
+        // White pawn attacks (diagonally up)
+        if r < 7 && f > 0 { bb |= 1u64 << (sq + 7); }
+        if r < 7 && f < 7 { bb |= 1u64 << (sq + 9); }
+
+        attacks[sq] = bb;
+    }
+    return attacks;
+}
+
+fn init_pawn_attacks_black() -> tensor<u64, (64,)> {
+    let attacks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        let mut bb: u64 = 0;
+        let r = sq / 8;
+        let f = sq % 8;
+
+        // Black pawn attacks (diagonally down)
+        if r > 0 && f > 0 { bb |= 1u64 << (sq - 9); }
+        if r > 0 && f < 7 { bb |= 1u64 << (sq - 7); }
+
+        attacks[sq] = bb;
+    }
+    return attacks;
+}
+
+fn init_rook_masks() -> tensor<u64, (64,)> {
+    let masks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        masks[sq] = rook_mask(sq);
+    }
+    return masks;
+}
+
+fn init_bishop_masks() -> tensor<u64, (64,)> {
+    let masks = tensor.zeros[u64, (64,)];
+    for sq in 0..64 {
+        masks[sq] = bishop_mask(sq);
+    }
+    return masks;
+}
+
+fn rook_mask(sq: i32) -> u64 {
+    let r = sq / 8;
+    let f = sq % 8;
+    let mut mask: u64 = 0;
+
+    // Horizontal (exclude edges)
+    for i in 1..7 {
+        if i != f { mask |= 1u64 << (r * 8 + i); }
+    }
+    // Vertical (exclude edges)
+    for i in 1..7 {
+        if i != r { mask |= 1u64 << (i * 8 + f); }
+    }
+    return mask;
+}
+
+fn bishop_mask(sq: i32) -> u64 {
+    let r = sq / 8;
+    let f = sq % 8;
+    let mut mask: u64 = 0;
+
+    // Diagonals (exclude edges)
+    for d in 1..7 {
+        if r + d < 7 && f + d < 7 { mask |= 1u64 << ((r + d) * 8 + (f + d)); }
+        if r + d < 7 && f - d > 0 { mask |= 1u64 << ((r + d) * 8 + (f - d)); }
+        if r - d > 0 && f + d < 7 { mask |= 1u64 << ((r - d) * 8 + (f + d)); }
+        if r - d > 0 && f - d > 0 { mask |= 1u64 << ((r - d) * 8 + (f - d)); }
+    }
+    return mask;
+}
+
+// Placeholder for magic number initialization
+fn init_rook_magics() -> tensor<u64, (64,)> {
+    // Pre-computed magic numbers for rook attacks
+    return tensor.zeros[u64, (64,)]; // Would be filled with actual magics
+}
+
+fn init_bishop_magics() -> tensor<u64, (64,)> {
+    // Pre-computed magic numbers for bishop attacks
+    return tensor.zeros[u64, (64,)]; // Would be filled with actual magics
+}
+
+fn init_rook_shifts() -> tensor<i32, (64,)> {
+    return tensor.zeros[i32, (64,)]; // Would be filled with shift values
+}
+
+fn init_bishop_shifts() -> tensor<i32, (64,)> {
+    return tensor.zeros[i32, (64,)]; // Would be filled with shift values
+}
+
+// ============================================================================
+// SLIDING PIECE ATTACKS (Ray-based fallback - correct, swap to magics later)
+// ============================================================================
+//
+// Simple ray tracing: for each direction, find nearest blocker using bitscan.
+// Slower than magic bitboards but guaranteed correct for perft validation.
+// Once perft passes, replace with proper magic initialization.
+
+#[inline]
+fn rook_attacks_bb(sq: i32, occ: u64) -> u64 {
+    return ray_attacks_north(sq, occ)
+         | ray_attacks_south(sq, occ)
+         | ray_attacks_east(sq, occ)
+         | ray_attacks_west(sq, occ);
+}
+
+#[inline]
+fn bishop_attacks_bb(sq: i32, occ: u64) -> u64 {
+    return ray_attacks_ne(sq, occ)
+         | ray_attacks_nw(sq, occ)
+         | ray_attacks_se(sq, occ)
+         | ray_attacks_sw(sq, occ);
+}
+
+#[inline]
+fn queen_attacks_bb(sq: i32, occ: u64) -> u64 {
+    return rook_attacks_bb(sq, occ) | bishop_attacks_bb(sq, occ);
+}
+
+// ============================================================================
+// RAY ATTACK GENERATORS (one per direction)
+// ============================================================================
+
+// North (+8 per step)
+#[inline]
+fn ray_attacks_north(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut s = sq + 8;
+    while s <= 63 {
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }  // Hit blocker
+        s += 8;
+    }
+    return attacks;
+}
+
+// South (-8 per step)
+#[inline]
+fn ray_attacks_south(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut s = sq - 8;
+    while s >= 0 {
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        s -= 8;
+    }
+    return attacks;
+}
+
+// East (+1, but stop at file h)
+#[inline]
+fn ray_attacks_east(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let r = sq / 8;
+    let mut f = (sq % 8) + 1;
+    while f <= 7 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        f += 1;
+    }
+    return attacks;
+}
+
+// West (-1, but stop at file a)
+#[inline]
+fn ray_attacks_west(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let r = sq / 8;
+    let mut f = (sq % 8) - 1;
+    while f >= 0 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        f -= 1;
+    }
+    return attacks;
+}
+
+// Northeast (+9, but stop at rank 8 or file h)
+#[inline]
+fn ray_attacks_ne(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut r = (sq / 8) + 1;
+    let mut f = (sq % 8) + 1;
+    while r <= 7 && f <= 7 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        r += 1;
+        f += 1;
+    }
+    return attacks;
+}
+
+// Northwest (+7, but stop at rank 8 or file a)
+#[inline]
+fn ray_attacks_nw(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut r = (sq / 8) + 1;
+    let mut f = (sq % 8) - 1;
+    while r <= 7 && f >= 0 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        r += 1;
+        f -= 1;
+    }
+    return attacks;
+}
+
+// Southeast (-7, but stop at rank 1 or file h)
+#[inline]
+fn ray_attacks_se(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut r = (sq / 8) - 1;
+    let mut f = (sq % 8) + 1;
+    while r >= 0 && f <= 7 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        r -= 1;
+        f += 1;
+    }
+    return attacks;
+}
+
+// Southwest (-9, but stop at rank 1 or file a)
+#[inline]
+fn ray_attacks_sw(sq: i32, occ: u64) -> u64 {
+    let mut attacks: u64 = 0;
+    let mut r = (sq / 8) - 1;
+    let mut f = (sq % 8) - 1;
+    while r >= 0 && f >= 0 {
+        let s = r * 8 + f;
+        let bb = 1u64 << s;
+        attacks |= bb;
+        if (occ & bb) != 0 { break; }
+        r -= 1;
+        f -= 1;
+    }
+    return attacks;
+}
+
+// ============================================================================
+// MOVE LIST - Fixed-size array for zero allocation
+// ============================================================================
+
+const MAX_MOVES: i32 = 256;
+
+struct MoveList64 {
+    moves: tensor<Move64, (256,)>,
+    count: i32,
+}
+
+fn movelist_new() -> MoveList64 {
+    return MoveList64 {
+        moves: tensor.zeros[Move64, (256,)],
+        count: 0,
+    };
+}
+
+#[inline]
+fn movelist_push(list: &mut MoveList64, m: Move64) {
+    list.moves[list.count] = m;
+    list.count += 1;
+}
+
+#[inline]
+fn movelist_len(list: &MoveList64) -> i32 {
+    return list.count;
+}
+
+#[inline]
+fn movelist_get(list: &MoveList64, idx: i32) -> Move64 {
+    return list.moves[idx];
+}
+
+// ============================================================================
+// MAIN MOVE GENERATION
+// ============================================================================
+
+fn generate_all_moves(board: &Board64) -> MoveList64 {
+    let mut list = movelist_new();
+    let side = board.side_to_move;
+    let us = side;
+    let them = 1 - side;
+
+    let our_pieces = board.occupancy[us];
+    let their_pieces = board.occupancy[them];
+    let all_pieces = our_pieces | their_pieces;
+    let empty = ~all_pieces;
+
+    // Pre-fetch current state for undo packing
+    let castling = board.castling;
+    let ep = board.ep_square;
+    let hmc = board.halfmove;
+
+    // Generate moves for each piece type
+    gen_pawn_moves(&mut list, board, us, their_pieces, empty, castling, ep, hmc);
+    gen_knight_moves(&mut list, board, us, our_pieces, their_pieces, castling, ep, hmc);
+    gen_bishop_moves(&mut list, board, us, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_rook_moves(&mut list, board, us, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_queen_moves(&mut list, board, us, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_king_moves(&mut list, board, us, our_pieces, their_pieces, castling, ep, hmc);
+    gen_castling_moves(&mut list, board, us, all_pieces, castling, ep, hmc);
+
+    return list;
+}
+
+// ============================================================================
+// PAWN MOVE GENERATION
+// ============================================================================
+
+fn gen_pawn_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    their_pieces: u64,
+    empty: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let pawn_idx = PT_PAWN + us * 6;
+    let mut pawns = board.pieces[pawn_idx];
+
+    let up = if us == 0 { 8 } else { -8 };
+    let up_left = if us == 0 { 7 } else { -9 };
+    let up_right = if us == 0 { 9 } else { -7 };
+    let start_rank = if us == 0 { 1 } else { 6 };
+    let promo_rank = if us == 0 { 7 } else { 0 };
+
+    while pawns != 0 {
+        let from = trailing_zeros(pawns);
+        pawns &= pawns - 1;
+
+        let from_rank = from / 8;
+        let from_file = from % 8;
+
+        // Single push
+        let to = from + up;
+        if to >= 0 && to < 64 && ((1u64 << to) & empty) != 0 {
+            let to_rank = to / 8;
+            if to_rank == promo_rank {
+                // Promotion
+                movelist_push(list, make_promo(from, to, PT_QUEEN, 0, castling, ep, hmc));
+                movelist_push(list, make_promo(from, to, PT_ROOK, 0, castling, ep, hmc));
+                movelist_push(list, make_promo(from, to, PT_BISHOP, 0, castling, ep, hmc));
+                movelist_push(list, make_promo(from, to, PT_KNIGHT, 0, castling, ep, hmc));
+            } else {
+                movelist_push(list, make_quiet(from, to, PT_PAWN, castling, ep, hmc));
+
+                // Double push from start rank
+                if from_rank == start_rank {
+                    let to2 = to + up;
+                    if ((1u64 << to2) & empty) != 0 {
+                        movelist_push(list, make_double_push(from, to2, castling, ep, hmc));
+                    }
+                }
+            }
+        }
+
+        // Captures (left)
+        if from_file > 0 {
+            let cap_to = from + up_left;
+            if cap_to >= 0 && cap_to < 64 {
+                if ((1u64 << cap_to) & their_pieces) != 0 {
+                    let captured = get_piece_at(board, cap_to, 1 - us);
+                    let to_rank = cap_to / 8;
+                    if to_rank == promo_rank {
+                        movelist_push(list, make_promo(from, cap_to, PT_QUEEN, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_ROOK, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_BISHOP, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_KNIGHT, captured, castling, ep, hmc));
+                    } else {
+                        movelist_push(list, make_capture(from, cap_to, PT_PAWN, captured, castling, ep, hmc));
+                    }
+                } else if cap_to == ep && ep >= 0 {
+                    movelist_push(list, make_ep_capture(from, cap_to, castling, ep, hmc));
+                }
+            }
+        }
+
+        // Captures (right)
+        if from_file < 7 {
+            let cap_to = from + up_right;
+            if cap_to >= 0 && cap_to < 64 {
+                if ((1u64 << cap_to) & their_pieces) != 0 {
+                    let captured = get_piece_at(board, cap_to, 1 - us);
+                    let to_rank = cap_to / 8;
+                    if to_rank == promo_rank {
+                        movelist_push(list, make_promo(from, cap_to, PT_QUEEN, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_ROOK, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_BISHOP, captured, castling, ep, hmc));
+                        movelist_push(list, make_promo(from, cap_to, PT_KNIGHT, captured, castling, ep, hmc));
+                    } else {
+                        movelist_push(list, make_capture(from, cap_to, PT_PAWN, captured, castling, ep, hmc));
+                    }
+                } else if cap_to == ep && ep >= 0 {
+                    movelist_push(list, make_ep_capture(from, cap_to, castling, ep, hmc));
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// KNIGHT MOVE GENERATION
+// ============================================================================
+
+fn gen_knight_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let knight_idx = PT_KNIGHT + us * 6;
+    let mut knights = board.pieces[knight_idx];
+
+    while knights != 0 {
+        let from = trailing_zeros(knights);
+        knights &= knights - 1;
+
+        let attacks = KNIGHT_ATTACKS[from] & ~our_pieces;
+        let mut targets = attacks;
+
+        while targets != 0 {
+            let to = trailing_zeros(targets);
+            targets &= targets - 1;
+
+            if ((1u64 << to) & their_pieces) != 0 {
+                let captured = get_piece_at(board, to, 1 - us);
+                movelist_push(list, make_capture(from, to, PT_KNIGHT, captured, castling, ep, hmc));
+            } else {
+                movelist_push(list, make_quiet(from, to, PT_KNIGHT, castling, ep, hmc));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// BISHOP MOVE GENERATION
+// ============================================================================
+
+fn gen_bishop_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    all_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let bishop_idx = PT_BISHOP + us * 6;
+    let mut bishops = board.pieces[bishop_idx];
+
+    while bishops != 0 {
+        let from = trailing_zeros(bishops);
+        bishops &= bishops - 1;
+
+        let attacks = bishop_attacks_bb(from, all_pieces) & ~our_pieces;
+        let mut targets = attacks;
+
+        while targets != 0 {
+            let to = trailing_zeros(targets);
+            targets &= targets - 1;
+
+            if ((1u64 << to) & their_pieces) != 0 {
+                let captured = get_piece_at(board, to, 1 - us);
+                movelist_push(list, make_capture(from, to, PT_BISHOP, captured, castling, ep, hmc));
+            } else {
+                movelist_push(list, make_quiet(from, to, PT_BISHOP, castling, ep, hmc));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ROOK MOVE GENERATION
+// ============================================================================
+
+fn gen_rook_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    all_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let rook_idx = PT_ROOK + us * 6;
+    let mut rooks = board.pieces[rook_idx];
+
+    while rooks != 0 {
+        let from = trailing_zeros(rooks);
+        rooks &= rooks - 1;
+
+        let attacks = rook_attacks_bb(from, all_pieces) & ~our_pieces;
+        let mut targets = attacks;
+
+        while targets != 0 {
+            let to = trailing_zeros(targets);
+            targets &= targets - 1;
+
+            if ((1u64 << to) & their_pieces) != 0 {
+                let captured = get_piece_at(board, to, 1 - us);
+                movelist_push(list, make_capture(from, to, PT_ROOK, captured, castling, ep, hmc));
+            } else {
+                movelist_push(list, make_quiet(from, to, PT_ROOK, castling, ep, hmc));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// QUEEN MOVE GENERATION
+// ============================================================================
+
+fn gen_queen_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    all_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let queen_idx = PT_QUEEN + us * 6;
+    let mut queens = board.pieces[queen_idx];
+
+    while queens != 0 {
+        let from = trailing_zeros(queens);
+        queens &= queens - 1;
+
+        let attacks = queen_attacks_bb(from, all_pieces) & ~our_pieces;
+        let mut targets = attacks;
+
+        while targets != 0 {
+            let to = trailing_zeros(targets);
+            targets &= targets - 1;
+
+            if ((1u64 << to) & their_pieces) != 0 {
+                let captured = get_piece_at(board, to, 1 - us);
+                movelist_push(list, make_capture(from, to, PT_QUEEN, captured, castling, ep, hmc));
+            } else {
+                movelist_push(list, make_quiet(from, to, PT_QUEEN, castling, ep, hmc));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// KING MOVE GENERATION
+// ============================================================================
+
+fn gen_king_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let king_idx = PT_KING + us * 6;
+    let king_bb = board.pieces[king_idx];
+
+    if king_bb == 0 { return; }
+
+    let from = trailing_zeros(king_bb);
+    let attacks = KING_ATTACKS[from] & ~our_pieces;
+    let mut targets = attacks;
+
+    while targets != 0 {
+        let to = trailing_zeros(targets);
+        targets &= targets - 1;
+
+        if ((1u64 << to) & their_pieces) != 0 {
+            let captured = get_piece_at(board, to, 1 - us);
+            movelist_push(list, make_capture(from, to, PT_KING, captured, castling, ep, hmc));
+        } else {
+            movelist_push(list, make_quiet(from, to, PT_KING, castling, ep, hmc));
+        }
+    }
+}
+
+// ============================================================================
+// CASTLING MOVE GENERATION
+// ============================================================================
+
+fn gen_castling_moves(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    all_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let them = 1 - us;
+
+    if us == 0 {
+        // White kingside (e1-g1)
+        if (castling & 0b0001) != 0 {
+            let path_clear = (all_pieces & 0x0000000000000060) == 0;  // f1, g1
+            if path_clear {
+                if !is_square_attacked64(board, 4, them) &&
+                   !is_square_attacked64(board, 5, them) &&
+                   !is_square_attacked64(board, 6, them) {
+                    movelist_push(list, make_castle(4, 6, true, castling, ep, hmc));
+                }
+            }
+        }
+        // White queenside (e1-c1)
+        if (castling & 0b0010) != 0 {
+            let path_clear = (all_pieces & 0x000000000000000E) == 0;  // b1, c1, d1
+            if path_clear {
+                if !is_square_attacked64(board, 4, them) &&
+                   !is_square_attacked64(board, 3, them) &&
+                   !is_square_attacked64(board, 2, them) {
+                    movelist_push(list, make_castle(4, 2, false, castling, ep, hmc));
+                }
+            }
+        }
+    } else {
+        // Black kingside (e8-g8)
+        if (castling & 0b0100) != 0 {
+            let path_clear = (all_pieces & 0x6000000000000000) == 0;  // f8, g8
+            if path_clear {
+                if !is_square_attacked64(board, 60, them) &&
+                   !is_square_attacked64(board, 61, them) &&
+                   !is_square_attacked64(board, 62, them) {
+                    movelist_push(list, make_castle(60, 62, true, castling, ep, hmc));
+                }
+            }
+        }
+        // Black queenside (e8-c8)
+        if (castling & 0b1000) != 0 {
+            let path_clear = (all_pieces & 0x0E00000000000000) == 0;  // b8, c8, d8
+            if path_clear {
+                if !is_square_attacked64(board, 60, them) &&
+                   !is_square_attacked64(board, 59, them) &&
+                   !is_square_attacked64(board, 58, them) {
+                    movelist_push(list, make_castle(60, 58, false, castling, ep, hmc));
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ATTACK DETECTION
+// ============================================================================
+
+fn is_square_attacked64(board: &Board64, sq: i32, by_side: i32) -> bool {
+    let offset = by_side * 6;
+    let all_pieces = board.occupancy[0] | board.occupancy[1];
+
+    // Pawn attacks
+    let pawn_attacks = if by_side == 0 {
+        PAWN_ATTACKS_BLACK[sq]  // Attacked BY white, so check where white pawns would attack FROM
+    } else {
+        PAWN_ATTACKS_WHITE[sq]
+    };
+    if (pawn_attacks & board.pieces[PT_PAWN + offset]) != 0 {
+        return true;
+    }
+
+    // Knight attacks
+    if (KNIGHT_ATTACKS[sq] & board.pieces[PT_KNIGHT + offset]) != 0 {
+        return true;
+    }
+
+    // King attacks
+    if (KING_ATTACKS[sq] & board.pieces[PT_KING + offset]) != 0 {
+        return true;
+    }
+
+    // Bishop/Queen diagonal attacks
+    let bishop_queen = board.pieces[PT_BISHOP + offset] | board.pieces[PT_QUEEN + offset];
+    if (bishop_attacks_bb(sq, all_pieces) & bishop_queen) != 0 {
+        return true;
+    }
+
+    // Rook/Queen straight attacks
+    let rook_queen = board.pieces[PT_ROOK + offset] | board.pieces[PT_QUEEN + offset];
+    if (rook_attacks_bb(sq, all_pieces) & rook_queen) != 0 {
+        return true;
+    }
+
+    return false;
+}
+
+fn is_in_check_impl(board: &Board64, side: i32) -> bool {
+    let king_bb = board.pieces[PT_KING + side * 6];
+    if king_bb == 0 { return false; }
+    let king_sq = trailing_zeros(king_bb);
+    return is_square_attacked64(board, king_sq, 1 - side);
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn get_piece_at(board: &Board64, sq: i32, side: i32) -> i32 {
+    let sq_bb = 1u64 << sq;
+    let offset = side * 6;
+
+    for pt in 0..6 {
+        if (board.pieces[pt + offset] & sq_bb) != 0 {
+            return pt;
+        }
+    }
+    return 0;  // No piece (shouldn't happen if called correctly)
+}
+
+#[inline]
+fn trailing_zeros(x: u64) -> i32 {
+    return __builtin_ctzll(x);
+}
+
+#[inline]
+fn popcount(x: u64) -> i32 {
+    return __builtin_popcountll(x);
+}
+
+// ============================================================================
+// IMPLEMENTATION FOR move64.mind STUBS
+// ============================================================================
+
+// Override the stub in move64.mind
+fn generate_moves64(board: &Board64) -> Vec<Move64> {
+    let list = generate_all_moves(board);
+    let mut result = Vec.new();
+    for i in 0..list.count {
+        result.push(list.moves[i]);
+    }
+    return result;
+}
+
+fn is_in_check64(board: &Board64, side: i32) -> bool {
+    return is_in_check_impl(board, side);
+}
+
+// ============================================================================
+// CAPTURE-ONLY GENERATION (for quiescence search)
+// ============================================================================
+
+fn generate_captures64(board: &Board64) -> MoveList64 {
+    let mut list = movelist_new();
+    let side = board.side_to_move;
+    let us = side;
+    let them = 1 - side;
+
+    let our_pieces = board.occupancy[us];
+    let their_pieces = board.occupancy[them];
+    let all_pieces = our_pieces | their_pieces;
+
+    let castling = board.castling;
+    let ep = board.ep_square;
+    let hmc = board.halfmove;
+
+    // Only generate captures for each piece type
+    gen_pawn_captures(&mut list, board, us, their_pieces, castling, ep, hmc);
+    gen_piece_captures(&mut list, board, us, PT_KNIGHT, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_piece_captures(&mut list, board, us, PT_BISHOP, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_piece_captures(&mut list, board, us, PT_ROOK, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_piece_captures(&mut list, board, us, PT_QUEEN, our_pieces, their_pieces, all_pieces, castling, ep, hmc);
+    gen_king_captures(&mut list, board, us, our_pieces, their_pieces, castling, ep, hmc);
+
+    return list;
+}
+
+fn gen_pawn_captures(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    their_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let pawn_idx = PT_PAWN + us * 6;
+    let mut pawns = board.pieces[pawn_idx];
+
+    let up_left = if us == 0 { 7 } else { -9 };
+    let up_right = if us == 0 { 9 } else { -7 };
+    let promo_rank = if us == 0 { 7 } else { 0 };
+
+    while pawns != 0 {
+        let from = trailing_zeros(pawns);
+        pawns &= pawns - 1;
+
+        let from_file = from % 8;
+
+        // Captures (left)
+        if from_file > 0 {
+            let cap_to = from + up_left;
+            if cap_to >= 0 && cap_to < 64 {
+                if ((1u64 << cap_to) & their_pieces) != 0 {
+                    let captured = get_piece_at(board, cap_to, 1 - us);
+                    let to_rank = cap_to / 8;
+                    if to_rank == promo_rank {
+                        movelist_push(list, make_promo(from, cap_to, PT_QUEEN, captured, castling, ep, hmc));
+                    } else {
+                        movelist_push(list, make_capture(from, cap_to, PT_PAWN, captured, castling, ep, hmc));
+                    }
+                } else if cap_to == ep && ep >= 0 {
+                    movelist_push(list, make_ep_capture(from, cap_to, castling, ep, hmc));
+                }
+            }
+        }
+
+        // Captures (right)
+        if from_file < 7 {
+            let cap_to = from + up_right;
+            if cap_to >= 0 && cap_to < 64 {
+                if ((1u64 << cap_to) & their_pieces) != 0 {
+                    let captured = get_piece_at(board, cap_to, 1 - us);
+                    let to_rank = cap_to / 8;
+                    if to_rank == promo_rank {
+                        movelist_push(list, make_promo(from, cap_to, PT_QUEEN, captured, castling, ep, hmc));
+                    } else {
+                        movelist_push(list, make_capture(from, cap_to, PT_PAWN, captured, castling, ep, hmc));
+                    }
+                } else if cap_to == ep && ep >= 0 {
+                    movelist_push(list, make_ep_capture(from, cap_to, castling, ep, hmc));
+                }
+            }
+        }
+    }
+}
+
+fn gen_piece_captures(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    piece_type: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    all_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let piece_idx = piece_type + us * 6;
+    let mut pieces = board.pieces[piece_idx];
+
+    while pieces != 0 {
+        let from = trailing_zeros(pieces);
+        pieces &= pieces - 1;
+
+        let attacks = match piece_type {
+            PT_KNIGHT => KNIGHT_ATTACKS[from],
+            PT_BISHOP => bishop_attacks_bb(from, all_pieces),
+            PT_ROOK => rook_attacks_bb(from, all_pieces),
+            PT_QUEEN => queen_attacks_bb(from, all_pieces),
+            _ => 0u64,
+        };
+
+        let mut targets = attacks & their_pieces;
+
+        while targets != 0 {
+            let to = trailing_zeros(targets);
+            targets &= targets - 1;
+
+            let captured = get_piece_at(board, to, 1 - us);
+            movelist_push(list, make_capture(from, to, piece_type, captured, castling, ep, hmc));
+        }
+    }
+}
+
+fn gen_king_captures(
+    list: &mut MoveList64,
+    board: &Board64,
+    us: i32,
+    our_pieces: u64,
+    their_pieces: u64,
+    castling: u32,
+    ep: i32,
+    hmc: i32
+) {
+    let king_idx = PT_KING + us * 6;
+    let king_bb = board.pieces[king_idx];
+
+    if king_bb == 0 { return; }
+
+    let from = trailing_zeros(king_bb);
+    let mut targets = KING_ATTACKS[from] & their_pieces;
+
+    while targets != 0 {
+        let to = trailing_zeros(targets);
+        targets &= targets - 1;
+
+        let captured = get_piece_at(board, to, 1 - us);
+        movelist_push(list, make_capture(from, to, PT_KING, captured, castling, ep, hmc));
+    }
+}
+
+// ============================================================================
+// UNIT TESTS
+// ============================================================================
+
+#[test]
+fn test_move64_round_trip() {
+    // Test quiet move
+    let m = make_quiet(12, 28, PT_KNIGHT, 0b1111, 63, 0);
+    assert(m64_from(m) == 12);
+    assert(m64_to(m) == 28);
+    assert(m64_piece(m) == PT_KNIGHT);
+    assert(m64_captured(m) == 0);
+    assert(m64_is_capture(m) == false);
+    assert(m64_prev_castling(m) == 0b1111);
+    assert(m64_prev_ep(m) == 63);
+
+    // Test capture
+    let m2 = make_capture(27, 35, PT_BISHOP, PT_ROOK, 0b1111, 63, 5);
+    assert(m64_from(m2) == 27);
+    assert(m64_to(m2) == 35);
+    assert(m64_piece(m2) == PT_BISHOP);
+    assert(m64_captured(m2) == PT_ROOK);
+    assert(m64_is_capture(m2) == true);
+    assert(m64_prev_hmc(m2) == 5);
+
+    // Test promotion
+    let m3 = make_promo(52, 60, PT_QUEEN, 0, 0b1111, 63, 0);
+    assert(m64_from(m3) == 52);
+    assert(m64_to(m3) == 60);
+    assert(m64_piece(m3) == PT_PAWN);
+    assert(m64_promo(m3) == PT_QUEEN);
+    assert(m64_is_promo(m3) == true);
+
+    // Test en passant
+    let m4 = make_ep_capture(36, 45, 0b1111, 45, 0);
+    assert(m64_is_ep(m4) == true);
+    assert(m64_is_capture(m4) == true);
+
+    // Test castle
+    let m5 = make_castle(4, 6, true, 0b1111, 63, 0);
+    assert(m64_is_castle(m5) == true);
+    assert(m64_is_castle_kingside(m5) == true);
+
+    let m6 = make_castle(4, 2, false, 0b1111, 63, 0);
+    assert(m64_is_castle(m6) == true);
+    assert(m64_is_castle_kingside(m6) == false);
+
+    println("test_move64_round_trip: PASS");
+}
+
+#[test]
+fn test_move32_extraction() {
+    // Verify TT storage works correctly
+    let m = make_capture(12, 28, PT_QUEEN, PT_ROOK, 0b1111, 40, 10);
+    let m32 = m64_move32(m);
+
+    // Reconstruct from TT
+    let m_restored = m64_from_tt(m32, 0b1111, 40, 10);
+
+    assert(m64_from(m_restored) == 12);
+    assert(m64_to(m_restored) == 28);
+    assert(m64_piece(m_restored) == PT_QUEEN);
+    assert(m64_captured(m_restored) == PT_ROOK);
+    assert(m64_is_capture(m_restored) == true);
+
+    println("test_move32_extraction: PASS");
+}
+
+#[test]
+fn test_score_modification() {
+    let m = make_quiet(12, 28, PT_KNIGHT, 0b1111, 63, 0);
+    assert(m64_score(m) == 0);
+
+    let m2 = m64_set_score(m, 12345);
+    assert(m64_score(m2) == 12345);
+
+    // Core move should be unchanged
+    assert(m64_from(m2) == 12);
+    assert(m64_to(m2) == 28);
+    assert(m64_piece(m2) == PT_KNIGHT);
+
+    println("test_score_modification: PASS");
+}

@@ -1,0 +1,407 @@
+// NikolaChess - Late Move Reductions with NNUE-Adaptive Tuning
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Reduces search depth for moves unlikely to be good
+// Adaptive based on NNUE confidence
+// Expected ELO gain: +20-30
+
+import std.math;
+
+// ============================================================================
+// LMR CONFIGURATION
+// ============================================================================
+
+const LMR_MIN_DEPTH: i32 = 3;          // Minimum depth to apply LMR
+const LMR_MIN_MOVE: usize = 3;          // First N moves not reduced
+const LMR_BASE_REDUCTION: i32 = 1;      // Base reduction amount
+const LMR_MAX_REDUCTION: i32 = 6;       // Maximum reduction
+
+// History bonus thresholds
+const HISTORY_GOOD_THRESHOLD: i32 = 5000;
+const HISTORY_BAD_THRESHOLD: i32 = -2000;
+
+// NNUE confidence thresholds
+const NNUE_CONFIDENT_THRESHOLD: i32 = 200;  // Score > 200cp = confident
+const NNUE_UNCERTAIN_THRESHOLD: i32 = 50;   // Score < 50cp = uncertain
+
+// ============================================================================
+// LMR TABLE (Precomputed reductions)
+// ============================================================================
+
+// LMR[depth][move_number] = reduction amount
+static LMR_TABLE: [[i32; 64]; 64] = init_lmr_table();
+
+fn init_lmr_table() -> [[i32; 64]; 64] {
+    let mut table = [[0i32; 64]; 64];
+
+    for depth in 1..64 {
+        for move_num in 1..64 {
+            // Logarithmic reduction formula (Stockfish-style)
+            let reduction = (0.77 + math.ln(depth as f32) * math.ln(move_num as f32) / 2.36) as i32;
+            table[depth][move_num] = reduction.min(LMR_MAX_REDUCTION);
+        }
+    }
+
+    return table;
+}
+
+// ============================================================================
+// ADAPTIVE LMR BASED ON NNUE
+// ============================================================================
+
+// Calculate reduction based on NNUE score confidence
+fn adaptive_lmr_reduction(
+    depth: i32,
+    move_number: usize,
+    nnue_score: i32,
+    is_pv: bool,
+    is_capture: bool,
+    gives_check: bool,
+    history_score: i32
+) -> i32 {
+    // No reduction for early moves
+    if move_number < LMR_MIN_MOVE {
+        return 0;
+    }
+
+    // No reduction for shallow depths
+    if depth < LMR_MIN_DEPTH {
+        return 0;
+    }
+
+    // No reduction for tactical moves
+    if is_capture || gives_check {
+        return 0;
+    }
+
+    // Get base reduction from table
+    let d = (depth as usize).min(63);
+    let m = move_number.min(63);
+    let mut reduction = LMR_TABLE[d][m];
+
+    // ========================================
+    // NNUE-ADAPTIVE MODIFICATIONS
+    // ========================================
+
+    // If NNUE is confident (large score difference), reduce more
+    let score_abs = nnue_score.abs();
+    if score_abs > NNUE_CONFIDENT_THRESHOLD {
+        // We're clearly winning or losing - later moves less likely to change outcome
+        reduction += 1;
+    } else if score_abs < NNUE_UNCERTAIN_THRESHOLD {
+        // Position is unclear - be more careful
+        reduction = (reduction - 1).max(0);
+    }
+
+    // ========================================
+    // HISTORY-BASED MODIFICATIONS
+    // ========================================
+
+    // Good history: reduce less
+    if history_score > HISTORY_GOOD_THRESHOLD {
+        reduction = (reduction - 1).max(0);
+    }
+
+    // Bad history: reduce more
+    if history_score < HISTORY_BAD_THRESHOLD {
+        reduction += 1;
+    }
+
+    // ========================================
+    // PV NODE MODIFICATIONS
+    // ========================================
+
+    // PV nodes: reduce less (more important to search fully)
+    if is_pv {
+        reduction = (reduction - 1).max(0);
+    }
+
+    // Don't reduce more than depth - 1 (need at least 1 ply search)
+    reduction = reduction.min(depth - 1);
+
+    return reduction.max(0);
+}
+
+// ============================================================================
+// HISTORY HEURISTIC
+// ============================================================================
+
+struct HistoryTable {
+    // [piece][to_square] for quiet moves
+    table: [[i32; 64]; 12],
+    // Counter move table: [prev_piece][prev_to]
+    counter_moves: [[Option<Move>; 64]; 12],
+}
+
+fn create_history() -> HistoryTable {
+    return HistoryTable {
+        table: [[0i32; 64]; 12],
+        counter_moves: [[None; 64]; 12],
+    };
+}
+
+// Update history after a beta cutoff
+fn update_history(
+    history: &mut HistoryTable,
+    piece: i32,
+    to_sq: i32,
+    depth: i32,
+    is_good: bool
+) {
+    let bonus = depth * depth;
+    let idx = piece as usize;
+    let sq = to_sq as usize;
+
+    if is_good {
+        // Gravity: scale down existing value and add bonus
+        history.table[idx][sq] = (history.table[idx][sq] * 512 + bonus * 512) / 513;
+        // Clamp to prevent overflow
+        history.table[idx][sq] = history.table[idx][sq].clamp(-32000, 32000);
+    } else {
+        // Negative bonus for moves that didn't cause cutoff
+        history.table[idx][sq] = (history.table[idx][sq] * 512 - bonus * 256) / 513;
+        history.table[idx][sq] = history.table[idx][sq].clamp(-32000, 32000);
+    }
+}
+
+// Get history score for a move
+fn get_history_score(history: &HistoryTable, piece: i32, to_sq: i32) -> i32 {
+    return history.table[piece as usize][to_sq as usize];
+}
+
+// Update counter move
+fn update_counter_move(
+    history: &mut HistoryTable,
+    prev_piece: i32,
+    prev_to: i32,
+    counter: Move
+) {
+    history.counter_moves[prev_piece as usize][prev_to as usize] = Some(counter);
+}
+
+// Get counter move
+fn get_counter_move(history: &HistoryTable, prev_piece: i32, prev_to: i32) -> Option<Move> {
+    return history.counter_moves[prev_piece as usize][prev_to as usize];
+}
+
+// Clear history (new game)
+fn clear_history(history: &mut HistoryTable) {
+    for i in 0..12 {
+        for j in 0..64 {
+            history.table[i][j] = 0;
+            history.counter_moves[i][j] = None;
+        }
+    }
+}
+
+// Age history (new search)
+fn age_history(history: &mut HistoryTable) {
+    for i in 0..12 {
+        for j in 0..64 {
+            history.table[i][j] /= 2;
+        }
+    }
+}
+
+// ============================================================================
+// KILLER MOVES
+// ============================================================================
+
+const MAX_PLY: usize = 128;
+const NUM_KILLERS: usize = 2;
+
+struct KillerTable {
+    killers: [[Option<Move>; NUM_KILLERS]; MAX_PLY],
+}
+
+fn create_killers() -> KillerTable {
+    return KillerTable {
+        killers: [[None; NUM_KILLERS]; MAX_PLY],
+    };
+}
+
+// Store killer move
+fn store_killer(killers: &mut KillerTable, ply: usize, mv: Move) {
+    if ply >= MAX_PLY {
+        return;
+    }
+
+    // Don't store if already first killer
+    if killers.killers[ply][0] == Some(mv) {
+        return;
+    }
+
+    // Shift and insert
+    killers.killers[ply][1] = killers.killers[ply][0];
+    killers.killers[ply][0] = Some(mv);
+}
+
+// Check if move is a killer
+fn is_killer(killers: &KillerTable, ply: usize, mv: Move) -> bool {
+    if ply >= MAX_PLY {
+        return false;
+    }
+    return killers.killers[ply][0] == Some(mv) || killers.killers[ply][1] == Some(mv);
+}
+
+// Get killer moves for ordering
+fn get_killers(killers: &KillerTable, ply: usize) -> (Option<Move>, Option<Move>) {
+    if ply >= MAX_PLY {
+        return (None, None);
+    }
+    return (killers.killers[ply][0], killers.killers[ply][1]);
+}
+
+// Clear killers (new search)
+fn clear_killers(killers: &mut KillerTable) {
+    for i in 0..MAX_PLY {
+        killers.killers[i][0] = None;
+        killers.killers[i][1] = None;
+    }
+}
+
+// ============================================================================
+// MOVE ORDERING SCORE
+// ============================================================================
+
+// Compute move ordering score incorporating LMR-related heuristics
+fn move_ordering_score(
+    mv: Move,
+    board: Board,
+    tt_move: Option<Move>,
+    killers: &KillerTable,
+    history: &HistoryTable,
+    prev_move: Option<Move>,
+    ply: usize
+) -> i32 {
+    // TT move gets highest priority
+    if tt_move == Some(mv) {
+        return 100000;
+    }
+
+    let piece = move_piece(mv);
+    let to_sq = move_to(mv);
+    let mut score = 0;
+
+    // Captures: MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
+    if is_capture(mv) {
+        let victim = move_capture(mv);
+        let victim_value = piece_value(victim);
+        let attacker_value = piece_value(piece);
+        score += 50000 + victim_value * 10 - attacker_value;
+    }
+
+    // Promotions
+    if is_promotion(mv) {
+        let promo_piece = move_promo(mv);
+        score += 40000 + piece_value(promo_piece);
+    }
+
+    // Killer moves
+    if is_killer(killers, ply, mv) {
+        score += 30000;
+    }
+
+    // Counter move
+    if let Some(prev) = prev_move {
+        let prev_piece = move_piece(prev);
+        let prev_to = move_to(prev);
+        if get_counter_move(history, prev_piece, prev_to) == Some(mv) {
+            score += 25000;
+        }
+    }
+
+    // History score
+    score += get_history_score(history, piece, to_sq);
+
+    return score;
+}
+
+fn piece_value(piece: i32) -> i32 {
+    match piece % 6 {
+        0 => 100,   // Pawn
+        1 => 320,   // Knight
+        2 => 330,   // Bishop
+        3 => 500,   // Rook
+        4 => 900,   // Queen
+        5 => 0,     // King
+        _ => 0,
+    }
+}
+
+fn is_capture(mv: Move) -> bool {
+    return move_capture(mv) != 0;
+}
+
+fn is_promotion(mv: Move) -> bool {
+    return move_promo(mv) != 0;
+}
+
+// ============================================================================
+// FUTILITY PRUNING
+// ============================================================================
+
+const FUTILITY_MARGIN: [i32; 4] = [0, 150, 300, 450];
+
+// Check if futility pruning should skip this move
+fn can_futility_prune(
+    depth: i32,
+    static_eval: i32,
+    alpha: i32,
+    is_capture: bool,
+    gives_check: bool
+) -> bool {
+    // Only at shallow depths
+    if depth > 3 {
+        return false;
+    }
+
+    // Don't prune tactical moves
+    if is_capture || gives_check {
+        return false;
+    }
+
+    // If static eval + margin doesn't reach alpha, prune
+    let margin = FUTILITY_MARGIN[depth as usize];
+    return static_eval + margin <= alpha;
+}
+
+// ============================================================================
+// RAZORING
+// ============================================================================
+
+const RAZORING_MARGIN: [i32; 4] = [0, 150, 300, 450];
+
+// Check if razoring should reduce depth
+fn can_razor(depth: i32, static_eval: i32, alpha: i32, is_pv: bool) -> bool {
+    // Only at shallow depths, non-PV
+    if depth > 3 || is_pv {
+        return false;
+    }
+
+    let margin = RAZORING_MARGIN[depth as usize];
+    return static_eval + margin < alpha;
+}
+
+// ============================================================================
+// REVERSE FUTILITY PRUNING (Static Null Move Pruning)
+// ============================================================================
+
+const REVERSE_FUTILITY_MARGIN: i32 = 120;
+
+// Check if reverse futility can prune
+fn can_reverse_futility(
+    depth: i32,
+    static_eval: i32,
+    beta: i32,
+    in_check: bool
+) -> bool {
+    // Only at shallow depths, not in check
+    if depth > 3 || in_check {
+        return false;
+    }
+
+    let margin = REVERSE_FUTILITY_MARGIN * depth;
+    return static_eval - margin >= beta;
+}

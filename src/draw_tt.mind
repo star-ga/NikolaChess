@@ -1,0 +1,458 @@
+// NikolaChess - WDL-Bounded Transposition Table
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// Two-Bit Draw-Only TT with loss-rejection pruning
+
+import std.tensor;
+import std.cuda;
+import std.mem;
+import std.atomic;
+
+// ============================================================================
+// WDL BOUND ENCODING (2-bit)
+// ============================================================================
+
+// Key insight: We only care about draw bounds, not exact scores
+const WDL_UNKNOWN: u8 = 0;      // Position not yet analyzed
+const WDL_NOT_LOSING: u8 = 1;   // Child cannot be forced loss (>= draw)
+const WDL_NOT_WINNING: u8 = 2;  // Child cannot be forced win (<= draw)
+const WDL_PROVEN_DRAW: u8 = 3;  // Mathematically proven draw
+
+// Flag bits for repetition safety
+const TT_FLAG_REP_SAFE: u8 = 0x01;     // Line can force repetition
+const TT_FLAG_50M_SAFE: u8 = 0x02;     // Line reaches 50-move rule
+const TT_FLAG_FORTRESS: u8 = 0x04;     // Position is fortress
+const TT_FLAG_TB_HIT: u8 = 0x08;       // Tablebase confirmation
+
+// ============================================================================
+// DRAW TT ENTRY - 16 bytes (4 per cache line)
+// ============================================================================
+
+struct DrawTTEntry {
+    key16: u16,         // High 16 bits of hash for verification
+    move16: u16,        // Packed best move (from:6 | to:6 | promo:4)
+    depth8: u8,         // Search depth
+    wdl2: u8,           // WDL bound (lower 2 bits) + extra flags
+    gen8: u8,           // Generation for aging
+    flags8: u8,         // Repetition/fortress flags
+    pad32: u32,         // Padding for alignment
+    full_hash: u64,     // Full hash for collision avoidance
+}
+
+// ============================================================================
+// DRAW TT TABLE
+// ============================================================================
+
+const DRAW_TT_SIZE: i64 = 1 << 26;  // 64M entries = 1GB
+const DRAW_TT_MASK: i64 = DRAW_TT_SIZE - 1;
+
+struct DrawTT {
+    entries: tensor<DrawTTEntry, (DRAW_TT_SIZE,)>,
+    generation: u8,
+    hits: atomic<i64>,
+    probes: atomic<i64>,
+    collisions: atomic<i64>,
+}
+
+fn create_draw_tt() -> DrawTT {
+    return DrawTT {
+        entries: tensor.zeros[DrawTTEntry, (DRAW_TT_SIZE,)],
+        generation: 0,
+        hits: atomic.new(0),
+        probes: atomic.new(0),
+        collisions: atomic.new(0),
+    };
+}
+
+// ============================================================================
+// TT OPERATIONS
+// ============================================================================
+
+fn tt_index(hash: u64) -> i64 {
+    return (hash as i64) & DRAW_TT_MASK;
+}
+
+fn tt_key16(hash: u64) -> u16 {
+    return ((hash >> 48) & 0xFFFF) as u16;
+}
+
+fn pack_move_tt(m: Move) -> u16 {
+    // Use accessor functions, not field access (Move.data is packed u32)
+    return ((move_from(m) & 0x3F) | ((move_to(m) & 0x3F) << 6) | ((move_promo(m) & 0xF) << 12)) as u16;
+}
+
+fn unpack_move_tt(packed: u16, board: Board) -> Move {
+    let from = (packed & 0x3F) as i32;
+    let to = ((packed >> 6) & 0x3F) as i32;
+    let promo = ((packed >> 12) & 0xF) as i32;
+
+    // Find piece on from square
+    let mut piece = 0;  // FIX: Made mutable
+    for p in 0..12 {
+        if (board.pieces[p] & (1 << from)) != 0 {
+            piece = p;
+            break;
+        }
+    }
+
+    // Find capture
+    let mut capture = 0;  // FIX: Made mutable
+    for p in 0..12 {
+        if (board.pieces[p] & (1 << to)) != 0 {
+            capture = p;
+            break;
+        }
+    }
+
+    return create_move(from, to, piece, capture, promo, 0);
+}
+
+// ============================================================================
+// TT PROBE - Loss-Rejecting Logic
+// ============================================================================
+
+struct TTProbeResult {
+    found: bool,
+    entry: DrawTTEntry,
+    wdl: u8,
+    can_use: bool,
+    best_move: Move,
+}
+
+fn tt_probe(tt: &mut DrawTT, hash: u64, depth: i32, board: Board) -> TTProbeResult {
+    tt.probes.fetch_add(1);
+
+    let idx = tt_index(hash);
+    let entry = tt.entries[idx];
+    let key = tt_key16(hash);
+
+    // Check for hit
+    if entry.key16 == key && entry.full_hash == hash {
+        tt.hits.fetch_add(1);
+
+        let wdl = entry.wdl2 & 0x03;
+        let can_use = entry.depth8 >= depth as u8;
+        let best_move = unpack_move_tt(entry.move16, board);
+
+        return TTProbeResult {
+            found: true,
+            entry: entry,
+            wdl: wdl,
+            can_use: can_use,
+            best_move: best_move,
+        };
+    }
+
+    // Check for collision
+    if entry.full_hash != 0 && entry.full_hash != hash {
+        tt.collisions.fetch_add(1);
+    }
+
+    return TTProbeResult {
+        found: false,
+        entry: DrawTTEntry { key16: 0, move16: 0, depth8: 0, wdl2: 0, gen8: 0, flags8: 0, pad32: 0, full_hash: 0 },
+        wdl: WDL_UNKNOWN,
+        can_use: false,
+        best_move: MOVE_NULL,
+    };
+}
+
+// ============================================================================
+// TT STORE
+// ============================================================================
+
+fn tt_store(tt: &mut DrawTT, hash: u64, depth: i32, wdl: u8, best_move: Move, flags: u8) {
+    let idx = tt_index(hash);
+    let existing = tt.entries[idx];
+
+    // Replacement policy:
+    // 1. Always replace if empty
+    // 2. Always replace if same position
+    // 3. Replace if new depth >= old depth
+    // 4. Replace if old entry is from previous generation
+
+    let should_replace =
+        existing.full_hash == 0 ||
+        existing.full_hash == hash ||
+        depth >= existing.depth8 as i32 ||
+        existing.gen8 != tt.generation;
+
+    if should_replace {
+        tt.entries[idx] = DrawTTEntry {
+            key16: tt_key16(hash),
+            move16: pack_move_tt(best_move),
+            depth8: depth as u8,
+            wdl2: wdl,
+            gen8: tt.generation,
+            flags8: flags,
+            pad32: 0,
+            full_hash: hash,
+        };
+    }
+}
+
+// ============================================================================
+// WDL LOGIC
+// ============================================================================
+
+// Combine two WDL bounds (for minimax)
+fn wdl_combine_min(a: u8, b: u8) -> u8 {
+    // For minimizing side: take the "worse" bound
+    if a == WDL_PROVEN_DRAW || b == WDL_PROVEN_DRAW {
+        return WDL_PROVEN_DRAW;
+    }
+    if a == WDL_NOT_WINNING || b == WDL_NOT_WINNING {
+        return WDL_NOT_WINNING;
+    }
+    if a == WDL_NOT_LOSING && b == WDL_NOT_LOSING {
+        return WDL_NOT_LOSING;
+    }
+    return WDL_UNKNOWN;
+}
+
+fn wdl_combine_max(a: u8, b: u8) -> u8 {
+    // For maximizing side: take the "better" bound
+    if a == WDL_PROVEN_DRAW || b == WDL_PROVEN_DRAW {
+        return WDL_PROVEN_DRAW;
+    }
+    if a == WDL_NOT_LOSING || b == WDL_NOT_LOSING {
+        return WDL_NOT_LOSING;
+    }
+    if a == WDL_NOT_WINNING && b == WDL_NOT_WINNING {
+        return WDL_NOT_WINNING;
+    }
+    return WDL_UNKNOWN;
+}
+
+// Can we reject this move because it leads to a loss?
+fn wdl_is_losing(wdl: u8) -> bool {
+    // NOT_WINNING means opponent can force at most a draw
+    // For us, that means we might be losing
+    return wdl == WDL_NOT_WINNING;
+}
+
+// Is this move safe (guaranteed not to lose)?
+fn wdl_is_safe(wdl: u8) -> bool {
+    return wdl == WDL_NOT_LOSING || wdl == WDL_PROVEN_DRAW;
+}
+
+// Is this a proven draw?
+fn wdl_is_draw(wdl: u8) -> bool {
+    return wdl == WDL_PROVEN_DRAW;
+}
+
+// ============================================================================
+// DRAW-SEEKING SEARCH WITH WDL PRUNING
+// ============================================================================
+
+fn wdl_search(
+    tt: &mut DrawTT,
+    board: Board,
+    depth: i32,
+    is_maximizing: bool,
+    history: &[u64]
+) -> (u8, Move) {
+    // Check for immediate draw
+    if is_draw_by_repetition(board, history) {
+        return (WDL_PROVEN_DRAW, MOVE_NULL);
+    }
+
+    if board.halfmove >= 100 {
+        return (WDL_PROVEN_DRAW, MOVE_NULL);
+    }
+
+    if is_insufficient_material(board) {
+        return (WDL_PROVEN_DRAW, MOVE_NULL);
+    }
+
+    // Probe TT
+    let probe = tt_probe(tt, board.hash, depth, board);
+    if probe.found && probe.can_use {
+        // If we have a proven draw or safe bound, use it
+        if wdl_is_draw(probe.wdl) || (wdl_is_safe(probe.wdl) && depth <= 0) {
+            return (probe.wdl, probe.best_move);
+        }
+    }
+
+    // Leaf node
+    if depth <= 0 {
+        // Evaluate for draw probability
+        let draw_prob = evaluate_draw_probability(board);
+        let wdl = if draw_prob >= 0.5 { WDL_NOT_LOSING } else { WDL_UNKNOWN };
+        return (wdl, MOVE_NULL);
+    }
+
+    // Generate moves
+    let moves = generate_moves(board);
+    if moves.is_empty() {
+        if is_in_check(board) {
+            // Checkmate - we lost
+            return (WDL_NOT_WINNING, MOVE_NULL);
+        } else {
+            // Stalemate - draw!
+            return (WDL_PROVEN_DRAW, MOVE_NULL);
+        }
+    }
+
+    // Order moves for draw-seeking
+    let ordered_moves = order_moves_for_draw(moves, board, probe.best_move, history);
+
+    let mut best_wdl = WDL_NOT_WINNING;  // FIX: Made mutable - Assume worst until proven otherwise
+    let mut best_move = ordered_moves[0];  // FIX: Made mutable
+
+    for m in ordered_moves.iter() {
+        let new_board = make_move(board, *m);
+        let mut new_history = history.clone();
+        new_history.push(new_board.hash);
+
+        let (child_wdl, _) = wdl_search(tt, new_board, depth - 1, !is_maximizing, &new_history);
+
+        // Invert WDL from opponent's perspective
+        let our_wdl = wdl_invert(child_wdl);
+
+        // Key insight: REJECT any move that might lose
+        if wdl_is_losing(our_wdl) {
+            continue;  // Skip this move entirely
+        }
+
+        // Update best
+        if is_maximizing {
+            if wdl_better(our_wdl, best_wdl) {
+                best_wdl = our_wdl;
+                best_move = *m;
+            }
+        } else {
+            if wdl_worse(our_wdl, best_wdl) {
+                best_wdl = our_wdl;
+                best_move = *m;
+            }
+        }
+
+        // If we found a proven draw, no need to search further
+        if wdl_is_draw(best_wdl) {
+            break;
+        }
+    }
+
+    // Store in TT
+    let flags = if can_force_repetition(board, best_move, history) { TT_FLAG_REP_SAFE } else { 0 };
+    tt_store(tt, board.hash, depth, best_wdl, best_move, flags);
+
+    return (best_wdl, best_move);
+}
+
+fn wdl_invert(wdl: u8) -> u8 {
+    match wdl {
+        WDL_NOT_LOSING => WDL_NOT_WINNING,
+        WDL_NOT_WINNING => WDL_NOT_LOSING,
+        WDL_PROVEN_DRAW => WDL_PROVEN_DRAW,
+        _ => WDL_UNKNOWN,
+    }
+}
+
+fn wdl_better(a: u8, b: u8) -> bool {
+    // Order: PROVEN_DRAW > NOT_LOSING > UNKNOWN > NOT_WINNING
+    let order = |w: u8| -> i32 {
+        match w {
+            WDL_PROVEN_DRAW => 3,
+            WDL_NOT_LOSING => 2,
+            WDL_UNKNOWN => 1,
+            WDL_NOT_WINNING => 0,
+            _ => -1,
+        }
+    };
+    return order(a) > order(b);
+}
+
+fn wdl_worse(a: u8, b: u8) -> bool {
+    return wdl_better(b, a);
+}
+
+// ============================================================================
+// REPETITION DETECTION
+// ============================================================================
+
+fn is_draw_by_repetition(board: Board, history: &[u64]) -> bool {
+    let mut count = 0;  // FIX: Made mutable
+    for h in history.iter() {
+        if *h == board.hash {
+            count += 1;
+            if count >= 2 {
+                return true;  // Third occurrence = draw
+            }
+        }
+    }
+    return false;
+}
+
+fn can_force_repetition(board: Board, m: Move, history: &[u64]) -> bool {
+    let new_board = make_move(board, m);
+    // Check if this position occurred before
+    for h in history.iter() {
+        if *h == new_board.hash {
+            return true;  // We can repeat!
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// MOVE ORDERING FOR DRAW-SEEKING
+// ============================================================================
+
+fn order_moves_for_draw(moves: Vec<Move>, board: Board, tt_move: Move, history: &[u64]) -> Vec<Move> {
+    let mut scored: Vec<(Move, i32)> = Vec.new();
+
+    for m in moves.iter() {
+        let mut score = 0;  // FIX: Made mutable
+
+        // TT move is highest priority
+        if move_equals(*m, tt_move) {
+            score = 10000;
+        }
+
+        // Repetition moves are GOLD for draw-seeking
+        if can_force_repetition(board, *m, history) {
+            score += 9000;
+        }
+
+        // Captures toward simplification
+        if m.capture != 0 {
+            score += 1000;
+        }
+
+        // Perpetual check potential
+        let new_board = make_move(board, *m);
+        if is_in_check(new_board) {
+            score += 500;
+        }
+
+        scored.push((*m, score));
+    }
+
+    // Sort by score descending
+    scored.sort_by(|a, b| b.1 - a.1);
+
+    return scored.iter().map(|(m, _)| *m).collect();
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn tt_stats(tt: &DrawTT) {
+    let probes = tt.probes.load();
+    let hits = tt.hits.load();
+    let collisions = tt.collisions.load();
+
+    println!("=== WDL Transposition Table Statistics ===");
+    println!("Size: {} entries ({} MB)", DRAW_TT_SIZE, DRAW_TT_SIZE * 16 / (1024 * 1024));
+    println!("Probes: {}", probes);
+    println!("Hits: {} ({:.2}%)", hits, if probes > 0 { (hits as f64 / probes as f64) * 100.0 } else { 0.0 });
+    println!("Collisions: {}", collisions);
+    println!("Generation: {}", tt.generation);
+}
+
+fn tt_new_search(tt: &mut DrawTT) {
+    tt.generation = (tt.generation + 1) % 256;
+}

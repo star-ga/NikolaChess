@@ -1,0 +1,703 @@
+// NikolaChess - Draw Evaluation Neural Network
+// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+// GPU-accelerated draw probability estimation
+// Uses MIND's CUDA backend for RTX acceleration
+
+import std.tensor;
+import std.nn;
+import std.cuda;
+
+// ============================================================================
+// DRAW FEATURES
+// ============================================================================
+
+// Extra features beyond board position
+// These are critical for draw probability estimation
+struct DrawFeatures {
+    // Material features
+    material_balance: f32,       // Normalized to [-1, 1]
+    piece_count: f32,            // Total pieces normalized
+    pawn_count: f32,             // Fewer pawns = more drawish
+
+    // Structural features (9/10 importance)
+    same_colored_bishops: f32,   // 0 = OCB (drawish!), 1 = same color
+    opposite_colored_bishops: f32, // 1 = OCB (very drawish!)
+    blocked_pawns: f32,          // Blocked = fortress potential
+    pawn_symmetry: f32,          // Symmetric = drawish
+
+    // King safety features (7/10 importance)
+    castling_rights: f32,        // More rights = more stable
+    king_distance: f32,          // Closer kings = endgame territory
+    king_safety_balance: f32,    // Equal safety = drawish
+
+    // Dynamic features (8/10 importance)
+    halfmove_clock: f32,         // Higher = closer to 50-move draw
+    repetition_risk: f32,        // Higher = more repetition potential
+    check_frequency: f32,        // More checks = perpetual potential
+
+    // Endgame features
+    fortress_score: f32,         // Detected fortress patterns
+    rook_endgame: f32,           // Rook endgames often draw
+    pawn_endgame: f32,           // Pure pawn endgames
+    tb_distance: f32,            // Distance to tablebase territory
+
+    // Position quality (8/10 importance)
+    perpetual_score: f32,        // Likelihood of perpetual check
+    center_control: f32,         // Balanced = more drawish
+    passed_pawns_diff: f32,      // Equal passed pawns = drawish
+    space_balance: f32,          // Equal space = drawish
+}
+
+const NUM_FEATURES: i32 = 20;
+
+// ============================================================================
+// NEURAL NETWORK ARCHITECTURE
+// CNN + Residual Blocks + Value Head
+// ============================================================================
+
+struct DrawNetwork {
+    // Convolutional layers for board pattern recognition
+    // Input: 12x8x8 (piece planes) + 4x8x8 (meta planes) = 16x8x8
+    conv_input: nn.Conv2d[f32, (16, 256), (3, 3)],
+    bn_input: nn.BatchNorm2d[f32, 256],
+
+    // Residual blocks
+    res_blocks: [ResBlock; 8],
+
+    // Feature integration layer
+    feature_fc: nn.Linear[f32, (NUM_FEATURES, 64)],
+
+    // Value head for draw probability
+    value_conv: nn.Conv2d[f32, (256, 32), (1, 1)],
+    value_bn: nn.BatchNorm2d[f32, 32],
+    value_fc1: nn.Linear[f32, (32 * 8 * 8 + 64, 256)],  // +64 for features
+    value_fc2: nn.Linear[f32, (256, 1)],
+
+    // Policy head for move selection (draw-oriented)
+    policy_conv: nn.Conv2d[f32, (256, 73), (1, 1)],  // 73 = move encoding
+}
+
+struct ResBlock {
+    conv1: nn.Conv2d[f32, (256, 256), (3, 3)],
+    bn1: nn.BatchNorm2d[f32, 256],
+    conv2: nn.Conv2d[f32, (256, 256), (3, 3)],
+    bn2: nn.BatchNorm2d[f32, 256],
+}
+
+fn create_res_block() -> ResBlock {
+    return ResBlock {
+        conv1: nn.Conv2d.init(256, 256, (3, 3), padding=1),
+        bn1: nn.BatchNorm2d.init(256),
+        conv2: nn.Conv2d.init(256, 256, (3, 3), padding=1),
+        bn2: nn.BatchNorm2d.init(256),
+    };
+}
+
+fn create_draw_network() -> DrawNetwork {
+    let mut res_blocks = [];  // FIX: Made mutable
+    for _ in 0..8 {
+        res_blocks.push(create_res_block());
+    }
+
+    return DrawNetwork {
+        conv_input: nn.Conv2d.init(16, 256, (3, 3), padding=1),
+        bn_input: nn.BatchNorm2d.init(256),
+        res_blocks: res_blocks,
+        feature_fc: nn.Linear.init(NUM_FEATURES, 64),
+        value_conv: nn.Conv2d.init(256, 32, (1, 1)),
+        value_bn: nn.BatchNorm2d.init(32),
+        value_fc1: nn.Linear.init(32 * 8 * 8 + 64, 256),
+        value_fc2: nn.Linear.init(256, 1),
+        policy_conv: nn.Conv2d.init(256, 73, (1, 1)),
+    };
+}
+
+// ============================================================================
+// FORWARD PASS
+// ============================================================================
+
+// Forward pass - returns draw probability [0, 1]
+// Higher = more likely to draw = BETTER for us
+fn forward(net: DrawNetwork, board_tensor: tensor<f32, (16, 8, 8)>, features: DrawFeatures) -> f32 {
+    on(gpu0) {
+        let mut x = board_tensor.unsqueeze(0);  // FIX: Made mutable - Add batch dimension
+
+        // Initial convolution
+        x = relu(net.bn_input(net.conv_input(x)));
+
+        // Residual blocks
+        for block in net.res_blocks {
+            let residual = x;
+            x = relu(block.bn1(block.conv1(x)));
+            x = block.bn2(block.conv2(x));
+            x = relu(x + residual);  // Skip connection
+        }
+
+        // Value head
+        let mut v = relu(net.value_bn(net.value_conv(x)));  // FIX: Made mutable
+        v = v.flatten();  // (32 * 8 * 8,) = (2048,)
+
+        // Feature integration
+        let feat_tensor = features_to_tensor(features);
+        let feat_out = relu(net.feature_fc(feat_tensor));  // (64,)
+
+        // Concatenate CNN output with features
+        v = concat(v, feat_out);  // (2048 + 64,) = (2112,)
+
+        // Final value layers
+        v = relu(net.value_fc1(v));
+        v = sigmoid(net.value_fc2(v));  // Output in [0, 1]
+
+        return v.item();
+    }
+}
+
+// Batch evaluation for search efficiency
+fn forward_batch(
+    net: DrawNetwork,
+    boards: tensor<f32, (B, 16, 8, 8)>,
+    features: tensor<f32, (B, NUM_FEATURES)>
+) -> tensor<f32, (B,)> {
+    on(gpu0) {
+        let mut x = boards;  // FIX: Made mutable
+
+        // Initial convolution
+        x = relu(net.bn_input(net.conv_input(x)));
+
+        // Residual blocks
+        for block in net.res_blocks {
+            let residual = x;
+            x = relu(block.bn1(block.conv1(x)));
+            x = block.bn2(block.conv2(x));
+            x = relu(x + residual);
+        }
+
+        // Value head
+        let mut v = relu(net.value_bn(net.value_conv(x)));  // FIX: Made mutable
+        v = v.reshape((B, -1));  // (B, 2048)
+
+        // Feature integration
+        let feat_out = relu(net.feature_fc(features));  // (B, 64)
+
+        // Concatenate
+        v = concat(v, feat_out, axis=1);  // (B, 2112)
+
+        // Final layers
+        v = relu(net.value_fc1(v));
+        v = sigmoid(net.value_fc2(v));
+
+        return v.squeeze(-1);
+    }
+}
+
+// ============================================================================
+// FEATURE EXTRACTION
+// ============================================================================
+
+fn extract_features(board: Board) -> DrawFeatures {
+    let white_material = count_material(board, WHITE);
+    let black_material = count_material(board, BLACK / 6);
+
+    let total_pieces = popcount(board.occupancy[0] | board.occupancy[1]);
+    let pawn_count = popcount(board.pieces[PAWN]) + popcount(board.pieces[PAWN + BLACK]);
+
+    // OCB detection (critical for draw evaluation!)
+    let ocb = detect_opposite_colored_bishops(board);
+
+    return DrawFeatures {
+        // Material
+        material_balance: (white_material - black_material) / 3900.0,
+        piece_count: total_pieces / 32.0,
+        pawn_count: pawn_count / 16.0,
+
+        // Structural
+        same_colored_bishops: if ocb { 0.0 } else { detect_same_colored_bishops(board) },
+        opposite_colored_bishops: if ocb { 1.0 } else { 0.0 },
+        blocked_pawns: count_blocked_pawns(board) / 8.0,
+        pawn_symmetry: calc_pawn_symmetry(board),
+
+        // King safety
+        castling_rights: sum_castling(board) / 4.0,
+        king_distance: calc_king_distance(board) / 14.0,
+        king_safety_balance: calc_king_safety_balance(board),
+
+        // Dynamic
+        halfmove_clock: board.halfmove / 100.0,
+        repetition_risk: calc_repetition_risk(board),
+        check_frequency: 0.0,  // Updated during search
+
+        // Endgame
+        fortress_score: detect_fortress_patterns(board),
+        rook_endgame: is_rook_endgame(board),
+        pawn_endgame: is_pawn_endgame(board),
+        tb_distance: estimate_tb_distance(board),
+
+        // Position quality
+        perpetual_score: estimate_perpetual(board),
+        center_control: calc_center_balance(board),
+        passed_pawns_diff: count_passed_pawns_diff(board) / 8.0,
+        space_balance: calc_space_balance(board),
+    };
+}
+
+fn features_to_tensor(f: DrawFeatures) -> tensor<f32, (NUM_FEATURES,)> {
+    return tensor.from_array([
+        f.material_balance,
+        f.piece_count,
+        f.pawn_count,
+        f.same_colored_bishops,
+        f.opposite_colored_bishops,
+        f.blocked_pawns,
+        f.pawn_symmetry,
+        f.castling_rights,
+        f.king_distance,
+        f.king_safety_balance,
+        f.halfmove_clock,
+        f.repetition_risk,
+        f.check_frequency,
+        f.fortress_score,
+        f.rook_endgame,
+        f.pawn_endgame,
+        f.tb_distance,
+        f.perpetual_score,
+        f.center_control,
+        f.passed_pawns_diff,
+    ]);
+}
+
+// ============================================================================
+// PATTERN DETECTION
+// ============================================================================
+
+// Opposite-colored bishops - VERY drawish!
+fn detect_opposite_colored_bishops(board: Board) -> bool {
+    let wb = board.pieces[BISHOP + WHITE];
+    let bb = board.pieces[BISHOP + BLACK];
+
+    if popcount(wb) != 1 || popcount(bb) != 1 {
+        return false;
+    }
+
+    let wb_sq = trailing_zeros(wb);
+    let bb_sq = trailing_zeros(bb);
+
+    let wb_color = (wb_sq / 8 + wb_sq % 8) % 2;
+    let bb_color = (bb_sq / 8 + bb_sq % 8) % 2;
+
+    return wb_color != bb_color;
+}
+
+fn detect_same_colored_bishops(board: Board) -> f32 {
+    let wb = board.pieces[BISHOP + WHITE];
+    let bb = board.pieces[BISHOP + BLACK];
+
+    if popcount(wb) >= 1 && popcount(bb) >= 1 {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// Fortress detection
+fn detect_fortress_patterns(board: Board) -> f32 {
+    let mut score = 0.0;  // FIX: Made mutable
+
+    // Blocked pawn chains indicate fortress
+    score += count_blocked_pawns(board) * 0.1;
+
+    // Few open files = harder to break through
+    let open_files = count_open_files(board);
+    score += (8 - open_files) * 0.05;
+
+    // Rook on closed file
+    let rooks = board.pieces[ROOK + WHITE] | board.pieces[ROOK + BLACK];
+    let pawns = board.pieces[PAWN + WHITE] | board.pieces[PAWN + BLACK];
+    for file in 0..8 {
+        let file_mask = 0x0101010101010101 << file;
+        if (rooks & file_mask) != 0 && (pawns & file_mask) != 0 {
+            score += 0.1;  // Rook on closed/semi-closed file
+        }
+    }
+
+    // King behind pawn chain
+    // ... additional fortress patterns ...
+
+    return min(score, 1.0);
+}
+
+// Pawn symmetry (higher = more symmetric = more drawish)
+fn calc_pawn_symmetry(board: Board) -> f32 {
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    let mut symmetry = 0.0;  // FIX: Made mutable
+    for file in 0..8 {
+        let file_mask = 0x0101010101010101 << file;
+        let wp_on_file = popcount(wp & file_mask);
+        let bp_on_file = popcount(bp & file_mask);
+        if wp_on_file == bp_on_file {
+            symmetry += 1.0;
+        }
+    }
+    return symmetry / 8.0;
+}
+
+fn count_blocked_pawns(board: Board) -> i32 {
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    // White pawns blocked by black pawns directly in front
+    let blocked_white = popcount(wp & (bp >> 8));
+    // Black pawns blocked by white pawns directly in front
+    let blocked_black = popcount(bp & (wp << 8));
+
+    return blocked_white + blocked_black;
+}
+
+fn count_open_files(board: Board) -> i32 {
+    let pawns = board.pieces[PAWN + WHITE] | board.pieces[PAWN + BLACK];
+    let mut open = 0;  // FIX: Made mutable
+    for file in 0..8 {
+        let file_mask = 0x0101010101010101 << file;
+        if (pawns & file_mask) == 0 {
+            open += 1;
+        }
+    }
+    return open;
+}
+
+fn sum_castling(board: Board) -> f32 {
+    let mut count = 0.0;  // FIX: Made mutable
+    for i in 0..4 {
+        if board.castling[i] {
+            count += 1.0;
+        }
+    }
+    return count;
+}
+
+fn calc_king_distance(board: Board) -> f32 {
+    let wk = trailing_zeros(board.pieces[KING + WHITE]);
+    let bk = trailing_zeros(board.pieces[KING + BLACK]);
+
+    let wk_rank = wk / 8;
+    let wk_file = wk % 8;
+    let bk_rank = bk / 8;
+    let bk_file = bk % 8;
+
+    let rank_dist = abs(wk_rank - bk_rank);
+    let file_dist = abs(wk_file - bk_file);
+
+    return (rank_dist + file_dist) as f32;
+}
+
+fn calc_king_safety_balance(board: Board) -> f32 {
+    // Equal king safety = drawish
+    // Count pawn shields near each king
+    let wk = trailing_zeros(board.pieces[KING + WHITE]);
+    let bk = trailing_zeros(board.pieces[KING + BLACK]);
+
+    let wk_rank = wk / 8;
+    let wk_file = wk % 8;
+    let bk_rank = bk / 8;
+    let bk_file = bk % 8;
+
+    // Count pawns in pawn shield (2 ranks in front of king)
+    let mut wp_near = 0;  // FIX: Made mutable
+    let mut bp_near = 0;  // FIX: Made mutable
+
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    // White king pawn shield (pawns on ranks wk_rank+1, wk_rank+2)
+    for df in -1..2 {
+        let f = wk_file + df;
+        if f >= 0 && f < 8 {
+            for dr in 1..3 {
+                let r = wk_rank + dr;
+                if r >= 0 && r < 8 {
+                    let sq = r * 8 + f;
+                    if (wp & (1u64 << sq)) != 0 {
+                        wp_near += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Black king pawn shield (pawns on ranks bk_rank-1, bk_rank-2)
+    for df in -1..2 {
+        let f = bk_file + df;
+        if f >= 0 && f < 8 {
+            for dr in 1..3 {
+                let r = bk_rank - dr;
+                if r >= 0 && r < 8 {
+                    let sq = r * 8 + f;
+                    if (bp & (1u64 << sq)) != 0 {
+                        bp_near += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Balance: 0.5 = equal, >0.5 = white safer, <0.5 = black safer
+    let max_shield = 6.0;  // Maximum pawns in shield (3 files x 2 ranks)
+    let w_safety = wp_near as f32 / max_shield;
+    let b_safety = bp_near as f32 / max_shield;
+
+    return 0.5 + (w_safety - b_safety) * 0.25;
+}
+
+fn calc_repetition_risk(board: Board) -> f32 {
+    // Higher if we've seen similar positions
+    let mut count = 0;  // FIX: Made mutable
+    let current_hash = board.hash;
+    for h in board.history {
+        if h == current_hash {
+            count += 1;
+        }
+    }
+    return min(count as f32 / 2.0, 1.0);
+}
+
+fn is_rook_endgame(board: Board) -> f32 {
+    let total = popcount(board.occupancy[0] | board.occupancy[1]);
+    let rooks = popcount(board.pieces[ROOK + WHITE] | board.pieces[ROOK + BLACK]);
+    let pawns = popcount(board.pieces[PAWN + WHITE] | board.pieces[PAWN + BLACK]);
+
+    // Kings + rooks + pawns only
+    if total == 2 + rooks + pawns && rooks >= 2 {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+fn is_pawn_endgame(board: Board) -> f32 {
+    let total = popcount(board.occupancy[0] | board.occupancy[1]);
+    let pawns = popcount(board.pieces[PAWN + WHITE] | board.pieces[PAWN + BLACK]);
+
+    // Kings + pawns only
+    if total == 2 + pawns {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+fn estimate_tb_distance(board: Board) -> f32 {
+    // How many pieces away from 7-man tablebase
+    let total = popcount(board.occupancy[0] | board.occupancy[1]);
+    if total <= 7 {
+        return 1.0;  // Already in tablebase territory
+    }
+    return max(0.0, 1.0 - (total - 7) * 0.1);
+}
+
+fn estimate_perpetual(board: Board) -> f32 {
+    // Simplified perpetual check estimation
+    let queens = board.pieces[QUEEN + WHITE] | board.pieces[QUEEN + BLACK];
+    let rooks = board.pieces[ROOK + WHITE] | board.pieces[ROOK + BLACK];
+
+    // More queens/rooks = more perpetual potential
+    return min((popcount(queens) + popcount(rooks) * 0.5) / 4.0, 1.0);
+}
+
+fn calc_center_balance(board: Board) -> f32 {
+    // Control of e4, d4, e5, d5
+    let center_squares = [27, 28, 35, 36];  // d4, e4, d5, e5
+
+    let mut white_control = 0;  // FIX: Made mutable
+    let mut black_control = 0;  // FIX: Made mutable
+
+    // Count pawns occupying center
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    for sq in center_squares {
+        if (wp & (1u64 << sq)) != 0 {
+            white_control += 2;  // Pawn in center is strong
+        }
+        if (bp & (1u64 << sq)) != 0 {
+            black_control += 2;
+        }
+    }
+
+    // Count knights/bishops attacking center
+    let wn = board.pieces[KNIGHT + WHITE];
+    let wb = board.pieces[BISHOP + WHITE];
+    let bn = board.pieces[KNIGHT + BLACK];
+    let bb = board.pieces[BISHOP + BLACK];
+
+    // Simplified: count pieces that could attack center (near center)
+    let extended_center = 0x00003C3C3C3C0000u64;  // c3-f6 area
+    white_control += popcount(wn & extended_center);
+    white_control += popcount(wb & extended_center);
+    black_control += popcount(bn & extended_center);
+    black_control += popcount(bb & extended_center);
+
+    // Balance: 0.5 = equal
+    let total = (white_control + black_control) as f32;
+    if total == 0.0 {
+        return 0.5;
+    }
+    return white_control as f32 / total;
+}
+
+fn count_passed_pawns_diff(board: Board) -> i32 {
+    let wp_passed = count_passed_pawns(board, WHITE);
+    let bp_passed = count_passed_pawns(board, BLACK / 6);
+    return abs(wp_passed - bp_passed);
+}
+
+fn count_passed_pawns(board: Board, color: i32) -> i32 {
+    let our_pawns = if color == WHITE { board.pieces[PAWN] } else { board.pieces[PAWN + BLACK] };
+    let their_pawns = if color == WHITE { board.pieces[PAWN + BLACK] } else { board.pieces[PAWN] };
+
+    let mut passed = 0;  // FIX: Made mutable
+    // ... detect passed pawns ...
+    return passed;
+}
+
+fn calc_space_balance(board: Board) -> f32 {
+    // Space = squares behind pawns that are controlled
+    // White space: ranks 2-4 behind white pawns
+    // Black space: ranks 5-7 behind black pawns
+
+    let wp = board.pieces[PAWN + WHITE];
+    let bp = board.pieces[PAWN + BLACK];
+
+    let mut white_space = 0;  // FIX: Made mutable
+    let mut black_space = 0;  // FIX: Made mutable
+
+    // Count white pawns advanced past rank 4 (controlling space)
+    let white_advanced = wp & 0xFFFFFFFF00000000u64;  // Ranks 5-8
+    white_space += popcount(white_advanced) * 2;
+
+    // Count white pawns on ranks 3-4 (some space control)
+    let white_mid = wp & 0x00000000FFFF0000u64;  // Ranks 3-4
+    white_space += popcount(white_mid);
+
+    // Count black pawns advanced past rank 5 (controlling space)
+    let black_advanced = bp & 0x00000000FFFFFFFFu64;  // Ranks 1-4
+    black_space += popcount(black_advanced) * 2;
+
+    // Count black pawns on ranks 5-6 (some space control)
+    let black_mid = bp & 0x0000FFFF00000000u64;  // Ranks 5-6
+    black_space += popcount(black_mid);
+
+    // Balance: 0.5 = equal
+    let total = (white_space + black_space) as f32;
+    if total == 0.0 {
+        return 0.5;
+    }
+    return white_space as f32 / total;
+}
+
+// ============================================================================
+// EXTENDED BOARD TENSOR (16 channels)
+// ============================================================================
+
+// Create 16-channel input tensor (12 pieces + 4 meta)
+fn to_tensor_16ch(board: Board) -> tensor<f32, (16, 8, 8)> {
+    on(gpu0) {
+        let mut result = tensor.zeros[f32, (16, 8, 8)];  // FIX: Made mutable
+
+        // First 12 channels: piece positions
+        for piece_type in 0..12 {
+            let mut bb = board.pieces[piece_type];  // FIX: Made mutable
+            while bb != 0 {
+                let sq = trailing_zeros(bb);
+                let rank = sq / 8;
+                let file = sq % 8;
+                result[piece_type, rank, file] = 1.0;
+                bb &= bb - 1;
+            }
+        }
+
+        // Channel 12: Castling rights
+        if board.castling[0] { result[12, 0, 7] = 1.0; }  // WK
+        if board.castling[1] { result[12, 0, 0] = 1.0; }  // WQ
+        if board.castling[2] { result[12, 7, 7] = 1.0; }  // BK
+        if board.castling[3] { result[12, 7, 0] = 1.0; }  // BQ
+
+        // Channel 13: En passant
+        if board.ep_square >= 0 {
+            let rank = board.ep_square / 8;
+            let file = board.ep_square % 8;
+            result[13, rank, file] = 1.0;
+        }
+
+        // Channel 14: Side to move (all 1s if black)
+        if board.side_to_move == 1 {
+            for rank in 0..8 {
+                for file in 0..8 {
+                    result[14, rank, file] = 1.0;
+                }
+            }
+        }
+
+        // Channel 15: Halfmove clock (normalized)
+        let hm_val = board.halfmove as f32 / 100.0;
+        for rank in 0..8 {
+            for file in 0..8 {
+                result[15, rank, file] = hm_val;
+            }
+        }
+
+        return result;
+    }
+}
+
+// ============================================================================
+// TRAINING
+// ============================================================================
+
+// Loss function: Heavily penalize losses
+// L = (1 - draw_target)^4
+fn draw_loss(predictions: tensor<f32, (B,)>, labels: tensor<f32, (B,)>) -> tensor<f32, ()> {
+    // labels: 1.0 = draw, 0.5 = uncertain, 0.0 = loss
+    let diff = 1.0 - labels;
+    let penalty = pow(diff, 4.0);  // Heavy penalty for losses
+    let base_loss = nn.binary_cross_entropy(predictions, labels);
+    return base_loss * (1.0 + penalty.mean());
+}
+
+fn train_draw_network(
+    net: diff DrawNetwork,
+    boards: tensor<f32, (N, 16, 8, 8)>,
+    features: tensor<f32, (N, NUM_FEATURES)>,
+    labels: tensor<f32, (N,)>,  // 1.0 = draw, 0.0 = decisive loss
+    learning_rate: f32
+) {
+    on(gpu0) {
+        // Forward pass
+        let predictions = forward_batch(net, boards, features);
+
+        // Draw-focused loss
+        let loss = draw_loss(predictions, labels);
+
+        // Backward pass (autodiff)
+        let grads = backward(loss, net);
+
+        // Update weights with Adam optimizer
+        nn.adam_step(net, grads, learning_rate);
+
+        print("Loss:", loss.item(), "Avg Draw Prob:", predictions.mean().item());
+    }
+}
+
+// ============================================================================
+// MODEL SAVE/LOAD
+// ============================================================================
+
+fn save_network(net: DrawNetwork, path: str) {
+    let state = net.state_dict();
+    tensor.save(state, path);
+}
+
+fn load_network(path: str) -> DrawNetwork {
+    let net = create_draw_network();
+    let state = tensor.load(path);
+    net.load_state_dict(state);
+    return net;
+}
