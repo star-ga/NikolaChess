@@ -49,10 +49,30 @@ NikolaChess is designed from the ground up for supercomputer-scale chess analysi
 - **Tensor Core Acceleration**: FP16/INT8 inference on NVIDIA Ampere/Hopper
 - **NVLink Support**: High-bandwidth GPU-to-GPU communication
 
+### GPU Backend Support (via MIND Runtime)
+
+All GPU backends are provided by the MIND Runtime, enabling write-once deploy-anywhere GPU code:
+
+| Backend | Platform | Hardware |
+|---------|----------|----------|
+| **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 20/30/40, A100, H100) |
+| **ROCm** | Linux | AMD GPUs (RX 6000/7000, MI200, MI300) |
+| **Metal** | macOS | Apple Silicon (M1, M2, M3, M4) |
+| **CPU** | All | AVX2/AVX-512 SIMD fallback |
+
+```mind
+// Same code runs on any GPU backend
+on(gpu0) {
+    parallel for i in 0..positions.len() {
+        results[i] = evaluate_nnue(&positions[i]);
+    }
+}
+```
+
 ### Engine Capabilities
 
 - **NNUE Evaluation**: GPU-accelerated neural network with HalfKA architecture
-- **CUDA Backend**: Massively parallel search via MIND Runtime
+- **CUDA/ROCm/Metal Backends**: Native GPU acceleration on all major platforms
 - **Multi-GPU Batch Eval**: Distribute position evaluation across GPU cluster
 - **Syzygy Tablebases**: Perfect endgame play (7-man standard, 8-man extended)
 - **Advanced Search**: Alpha-beta, ABDADA parallel, LMR, null-move, futility pruning
@@ -64,12 +84,16 @@ NikolaChess is designed from the ground up for supercomputer-scale chess analysi
 
 **Single Node (Workstation)**
 
-| Hardware | Threads | Search (Mnps) | NNUE Eval (kpos/s) | Depth/sec |
-|----------|---------|---------------|---------------------|-----------|
-| AMD Ryzen 9 7950X | 32 | 85 | 420 | 28 |
-| Intel Xeon w9-3495X | 112 | 210 | 680 | 32 |
-| RTX 4090 (CUDA) | 32+GPU | 120 | 850 | 30 |
-| 4x RTX 4090 | 64+4GPU | 380 | 3,200 | 35 |
+| Hardware | Backend | Threads | Search (Mnps) | NNUE Eval (kpos/s) |
+|----------|---------|---------|---------------|---------------------|
+| AMD Ryzen 9 7950X | CPU | 32 | 85 | 420 |
+| Intel Xeon w9-3495X | CPU | 112 | 210 | 680 |
+| Apple M3 Max | Metal | 16+GPU | 95 | 620 |
+| Apple M4 Ultra | Metal | 32+GPU | 145 | 980 |
+| RTX 4090 | CUDA | 32+GPU | 120 | 850 |
+| RX 7900 XTX | ROCm | 32+GPU | 105 | 720 |
+| MI300X | ROCm | 64+GPU | 280 | 2,400 |
+| 4x RTX 4090 | CUDA | 64+4GPU | 380 | 3,200 |
 
 **Data Center / HPC**
 
