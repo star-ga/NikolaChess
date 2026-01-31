@@ -328,12 +328,12 @@ The complete chess engine source code is available in this repository:
 - GPU batch evaluation via CUDA
 - v1/v2 model format selector with backward compatibility
 
-**Draw Specialization:**
-- Draw probability network
-- Known draw position database
-- Draw-specific transposition table
-- Fortress detection CNN
-- Opposite-color bishop endgames (SIMD optimized)
+**Advanced Pruning:**
+- Multi-cut pruning
+- Razoring at shallow depths
+- Reverse futility pruning
+- SEE (Static Exchange Evaluation) pruning
+- Singular extensions for forced moves
 
 **Move Generation:**
 - Magic bitboards for sliding pieces
