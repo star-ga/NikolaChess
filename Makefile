@@ -3,7 +3,9 @@
 #
 # MIND Compiler: https://mindlang.dev | https://github.com/star-ga/mind
 
-.PHONY: all build release debug clean test bench cuda cpu install help
+.PHONY: all build release debug clean test bench install help
+.PHONY: cpu cuda cuda-ampere cuda-hopper rocm rocm-mi300 metal metal-m4
+.PHONY: all-backends
 
 # Default target
 all: release
@@ -20,17 +22,49 @@ debug:
 	@echo "Building NikolaChess (debug)..."
 	mindc build
 
-cuda:
-	@echo "Building NikolaChess (CUDA)..."
-	mindc build --release --target cuda
-
+# CPU Targets
 cpu:
-	@echo "Building NikolaChess (CPU-only)..."
+	@echo "Building NikolaChess (CPU AVX-512)..."
 	mindc build --release --target cpu
 
-cuda-legacy:
-	@echo "Building NikolaChess (CUDA Legacy)..."
-	mindc build --release --target cuda-legacy
+cpu-avx2:
+	@echo "Building NikolaChess (CPU AVX2)..."
+	mindc build --release --target cpu-avx2
+
+# NVIDIA CUDA Targets
+cuda:
+	@echo "Building NikolaChess (CUDA - RTX 40 series)..."
+	mindc build --release --target cuda
+
+cuda-ampere:
+	@echo "Building NikolaChess (CUDA - RTX 30/A100)..."
+	mindc build --release --target cuda-ampere
+
+cuda-hopper:
+	@echo "Building NikolaChess (CUDA - H100)..."
+	mindc build --release --target cuda-hopper
+
+# AMD ROCm Targets
+rocm:
+	@echo "Building NikolaChess (ROCm - RX 7900)..."
+	mindc build --release --target rocm
+
+rocm-mi300:
+	@echo "Building NikolaChess (ROCm - MI300X)..."
+	mindc build --release --target rocm-mi300
+
+# Apple Metal Targets
+metal:
+	@echo "Building NikolaChess (Metal - Apple M3)..."
+	mindc build --release --target metal
+
+metal-m4:
+	@echo "Building NikolaChess (Metal - Apple M4)..."
+	mindc build --release --target metal-m4
+
+# Build all backends
+all-backends: cpu cuda rocm metal
+	@echo "Built all GPU backends"
 
 #------------------------------------------------------------------------------
 # Testing
@@ -82,7 +116,10 @@ book:
 clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf target/
-	rm -f nikola nikola-cpu nikola-cuda nikola-cuda-legacy
+	rm -f nikola nikola-cpu nikola-cpu-avx2
+	rm -f nikola-cuda nikola-cuda-ampere nikola-cuda-hopper
+	rm -f nikola-rocm nikola-rocm-mi300
+	rm -f nikola-metal nikola-metal-m4
 
 install: release
 	@echo "Installing to /usr/local/bin..."
@@ -91,12 +128,27 @@ install: release
 help:
 	@echo "NikolaChess Build System"
 	@echo ""
-	@echo "Build:"
+	@echo "Build (CPU):"
+	@echo "  make cpu          - CPU with AVX-512"
+	@echo "  make cpu-avx2     - CPU with AVX2 (broader compatibility)"
+	@echo ""
+	@echo "Build (NVIDIA CUDA):"
+	@echo "  make cuda         - RTX 40 series (Ada Lovelace)"
+	@echo "  make cuda-ampere  - RTX 30 series / A100"
+	@echo "  make cuda-hopper  - H100"
+	@echo ""
+	@echo "Build (AMD ROCm):"
+	@echo "  make rocm         - RX 7900 series (RDNA3)"
+	@echo "  make rocm-mi300   - MI300X"
+	@echo ""
+	@echo "Build (Apple Metal):"
+	@echo "  make metal        - Apple M3"
+	@echo "  make metal-m4     - Apple M4"
+	@echo ""
+	@echo "Build (All):"
+	@echo "  make all-backends - Build all GPU backends"
 	@echo "  make release      - Build release binary (default)"
 	@echo "  make debug        - Build debug binary"
-	@echo "  make cuda         - Build CUDA version"
-	@echo "  make cpu          - Build CPU-only version"
-	@echo "  make cuda-legacy  - Build CUDA legacy version"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test         - Run perft test suite"

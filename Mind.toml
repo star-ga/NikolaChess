@@ -18,29 +18,77 @@ output = "nikola"
 optimization = "aggressive"
 
 [features]
-default = ["cuda", "simd", "syzygy"]
+default = ["simd", "syzygy"]
 cuda = []
+rocm = []
+metal = []
 simd = []
 syzygy = []
 lichess = []
+
+# ============================================================================
+# CPU Targets
+# ============================================================================
 
 [targets.cpu]
 backend = "cpu"
 simd = "avx512"
 output = "nikola-cpu"
 
+[targets.cpu-avx2]
+backend = "cpu"
+simd = "avx2"
+output = "nikola-cpu-avx2"
+
+# ============================================================================
+# NVIDIA CUDA Targets
+# ============================================================================
+
 [targets.cuda]
 backend = "cuda"
-compute = "sm_89"  # RTX 40 series
+compute = "sm_89"  # RTX 40 series, Ada Lovelace
 output = "nikola-cuda"
 
-[targets.cuda-legacy]
+[targets.cuda-ampere]
 backend = "cuda"
-compute = "sm_75"  # RTX 20 series
-output = "nikola-cuda-legacy"
+compute = "sm_86"  # RTX 30 series, A100
+output = "nikola-cuda-ampere"
+
+[targets.cuda-hopper]
+backend = "cuda"
+compute = "sm_90"  # H100
+output = "nikola-cuda-hopper"
+
+# ============================================================================
+# AMD ROCm Targets
+# ============================================================================
+
+[targets.rocm]
+backend = "rocm"
+arch = "gfx1100"  # RX 7900 series, RDNA3
+output = "nikola-rocm"
+
+[targets.rocm-mi300]
+backend = "rocm"
+arch = "gfx942"  # MI300X
+output = "nikola-rocm-mi300"
+
+# ============================================================================
+# Apple Metal Targets
+# ============================================================================
+
+[targets.metal]
+backend = "metal"
+arch = "apple-m3"
+output = "nikola-metal"
+
+[targets.metal-m4]
+backend = "metal"
+arch = "apple-m4"
+output = "nikola-metal-m4"
 
 [dependencies]
-runtime = { version = "1.0", features = ["tensor", "cuda"], git = "https://github.com/star-ga/mind" }
+runtime = { version = "1.0", features = ["tensor", "cuda", "rocm", "metal"], git = "https://github.com/star-ga/mind" }
 
 [profile.release]
 opt-level = 3
