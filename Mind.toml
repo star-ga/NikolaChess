@@ -65,6 +65,11 @@ backend = "cuda"
 compute = "sm_100"  # Blackwell B200/B300
 output = "nikola-cuda-blackwell"
 
+[targets.cuda-rubin]
+backend = "cuda"
+compute = "sm_110"  # Vera Rubin (2026)
+output = "nikola-cuda-rubin"
+
 # ============================================================================
 # AMD ROCm Targets
 # ============================================================================

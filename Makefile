@@ -65,6 +65,10 @@ cuda-blackwell:
 	@echo "Building NikolaChess (CUDA - Blackwell B200/B300)..."
 	mindc build --release --target cuda-blackwell
 
+cuda-rubin:
+	@echo "Building NikolaChess (CUDA - Vera Rubin)..."
+	mindc build --release --target cuda-rubin
+
 # AMD ROCm Targets
 rocm:
 	@echo "Building NikolaChess (ROCm - RX 7900)..."
@@ -163,6 +167,7 @@ help:
 	@echo "  make cuda-ampere    - RTX 30 series / A100"
 	@echo "  make cuda-hopper    - H100"
 	@echo "  make cuda-blackwell - Blackwell B200/B300"
+	@echo "  make cuda-rubin     - Vera Rubin (2026)"
 	@echo ""
 	@echo "Build (AMD ROCm):"
 	@echo "  make rocm         - RX 7900 series (RDNA3)"

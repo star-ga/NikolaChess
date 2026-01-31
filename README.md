@@ -55,7 +55,7 @@ All GPU backends are provided by the **MIND Runtime** - a proprietary high-perfo
 
 | Backend | Platform | Hardware |
 |---------|----------|----------|
-| **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 30/40, A100, H100, Blackwell B200/B300) |
+| **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 30/40, A100, H100, Blackwell, Vera Rubin) |
 | **ROCm** | Linux | AMD GPUs (RX 7000, MI200, MI300X) |
 | **Metal** | macOS | Apple Silicon (M1, M2, M3, M4) |
 | **WebGPU** | Browser, All | Cross-platform web deployment |
