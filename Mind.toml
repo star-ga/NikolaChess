@@ -22,6 +22,7 @@ default = ["simd", "syzygy"]
 cuda = []
 rocm = []
 metal = []
+webgpu = []
 simd = []
 syzygy = []
 lichess = []
@@ -87,8 +88,18 @@ backend = "metal"
 arch = "apple-m4"
 output = "nikola-metal-m4"
 
+# ============================================================================
+# WebGPU Target (Browser / Cross-platform)
+# ============================================================================
+
+[targets.webgpu]
+backend = "webgpu"
+output = "nikola-webgpu"
+
 [dependencies]
-runtime = { version = "1.0", features = ["tensor", "cuda", "rocm", "metal"], git = "https://github.com/star-ga/mind" }
+# MIND Runtime provides GPU backends (CUDA, ROCm, Metal, WebGPU)
+# Runtime source is proprietary - distributed as compiled library
+runtime = { version = "1.0", features = ["tensor", "cuda", "rocm", "metal", "webgpu"] }
 
 [profile.release]
 opt-level = 3

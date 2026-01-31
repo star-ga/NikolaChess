@@ -51,23 +51,26 @@ NikolaChess is designed from the ground up for supercomputer-scale chess analysi
 
 ### GPU Backend Support (via MIND Runtime)
 
-All GPU backends are provided by the MIND Runtime, enabling write-once deploy-anywhere GPU code:
+All GPU backends are provided by the **MIND Runtime** - a proprietary high-performance compute library that enables write-once deploy-anywhere GPU code:
 
 | Backend | Platform | Hardware |
 |---------|----------|----------|
 | **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 20/30/40, A100, H100) |
 | **ROCm** | Linux | AMD GPUs (RX 6000/7000, MI200, MI300) |
 | **Metal** | macOS | Apple Silicon (M1, M2, M3, M4) |
+| **WebGPU** | Browser, All | Cross-platform web deployment |
 | **CPU** | All | AVX2/AVX-512 SIMD fallback |
 
 ```mind
-// Same code runs on any GPU backend
+// Same code runs on any GPU backend - MIND Runtime handles the translation
 on(gpu0) {
     parallel for i in 0..positions.len() {
         results[i] = evaluate_nnue(&positions[i]);
     }
 }
 ```
+
+*Note: MIND Runtime is distributed as a compiled library with the MIND compiler.*
 
 ### Engine Capabilities
 

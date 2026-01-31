@@ -4,7 +4,7 @@
 # MIND Compiler: https://mindlang.dev | https://github.com/star-ga/mind
 
 .PHONY: all build release debug clean test bench install help
-.PHONY: cpu cuda cuda-ampere cuda-hopper rocm rocm-mi300 metal metal-m4
+.PHONY: cpu cuda cuda-ampere cuda-hopper rocm rocm-mi300 metal metal-m4 webgpu
 .PHONY: all-backends
 
 # Default target
@@ -62,8 +62,13 @@ metal-m4:
 	@echo "Building NikolaChess (Metal - Apple M4)..."
 	mindc build --release --target metal-m4
 
+# WebGPU Target (Browser/Cross-platform)
+webgpu:
+	@echo "Building NikolaChess (WebGPU)..."
+	mindc build --release --target webgpu
+
 # Build all backends
-all-backends: cpu cuda rocm metal
+all-backends: cpu cuda rocm metal webgpu
 	@echo "Built all GPU backends"
 
 #------------------------------------------------------------------------------
@@ -144,6 +149,9 @@ help:
 	@echo "Build (Apple Metal):"
 	@echo "  make metal        - Apple M3"
 	@echo "  make metal-m4     - Apple M4"
+	@echo ""
+	@echo "Build (WebGPU):"
+	@echo "  make webgpu       - Browser/cross-platform"
 	@echo ""
 	@echo "Build (All):"
 	@echo "  make all-backends - Build all GPU backends"
