@@ -5,10 +5,27 @@
 
 .PHONY: all build release debug clean test bench install help
 .PHONY: cpu cuda cuda-ampere cuda-hopper rocm rocm-mi300 metal metal-m4 webgpu
-.PHONY: all-backends
+.PHONY: all-backends setup check-mindc
 
 # Default target
-all: release
+all: check-mindc release
+
+#------------------------------------------------------------------------------
+# Setup & Dependencies
+#------------------------------------------------------------------------------
+
+# Auto-download MIND compiler if not installed
+check-mindc:
+	@command -v mindc >/dev/null 2>&1 || { \
+		echo "MIND compiler not found. Running setup..."; \
+		chmod +x scripts/setup.sh && ./scripts/setup.sh; \
+	}
+
+# Full setup (compiler + runtime libraries)
+setup:
+	@echo "Setting up NikolaChess development environment..."
+	@chmod +x scripts/setup.sh
+	./scripts/setup.sh
 
 #------------------------------------------------------------------------------
 # Build Targets
@@ -43,6 +60,10 @@ cuda-ampere:
 cuda-hopper:
 	@echo "Building NikolaChess (CUDA - H100)..."
 	mindc build --release --target cuda-hopper
+
+cuda-blackwell:
+	@echo "Building NikolaChess (CUDA - Blackwell B200/B300)..."
+	mindc build --release --target cuda-blackwell
 
 # AMD ROCm Targets
 rocm:
@@ -138,9 +159,10 @@ help:
 	@echo "  make cpu-avx2     - CPU with AVX2 (broader compatibility)"
 	@echo ""
 	@echo "Build (NVIDIA CUDA):"
-	@echo "  make cuda         - RTX 40 series (Ada Lovelace)"
-	@echo "  make cuda-ampere  - RTX 30 series / A100"
-	@echo "  make cuda-hopper  - H100"
+	@echo "  make cuda           - RTX 40 series (Ada Lovelace)"
+	@echo "  make cuda-ampere    - RTX 30 series / A100"
+	@echo "  make cuda-hopper    - H100"
+	@echo "  make cuda-blackwell - Blackwell B200/B300"
 	@echo ""
 	@echo "Build (AMD ROCm):"
 	@echo "  make rocm         - RX 7900 series (RDNA3)"
@@ -168,6 +190,9 @@ help:
 	@echo "  make syzygy-6     - Download 6-man tablebases"
 	@echo "  make syzygy-7     - Download 7-man tablebases"
 	@echo "  make datagen      - Generate training data"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make setup        - Download MIND compiler and runtime libraries"
 	@echo ""
 	@echo "Utility:"
 	@echo "  make clean        - Remove build artifacts"

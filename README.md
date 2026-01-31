@@ -55,8 +55,8 @@ All GPU backends are provided by the **MIND Runtime** - a proprietary high-perfo
 
 | Backend | Platform | Hardware |
 |---------|----------|----------|
-| **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 20/30/40, A100, H100) |
-| **ROCm** | Linux | AMD GPUs (RX 6000/7000, MI200, MI300) |
+| **CUDA** | Linux, Windows | NVIDIA GPUs (RTX 30/40, A100, H100, Blackwell B200/B300) |
+| **ROCm** | Linux | AMD GPUs (RX 7000, MI200, MI300X) |
 | **Metal** | macOS | Apple Silicon (M1, M2, M3, M4) |
 | **WebGPU** | Browser, All | Cross-platform web deployment |
 | **CPU** | All | AVX2/AVX-512 SIMD fallback |
@@ -155,10 +155,10 @@ NikolaChess/
 │   │   ├── tensor_board.mind     - Board tensor representations
 │   │   └── training.mind         - GPU training pipeline
 │   │
-│   ├── Draw Specialization
-│   │   ├── draw_eval.mind        - Draw probability network
-│   │   ├── draw_db.mind          - Known draw position database
-│   │   ├── draw_tt.mind          - Draw-specific transposition table
+│   ├── Deep Evaluation
+│   │   ├── deep_eval.mind        - Deep neural network (20 residual blocks)
+│   │   ├── endgame_db.mind       - Endgame position database
+│   │   ├── wdl_tt.mind           - WDL-bounded transposition table
 │   │   ├── fortress_conv.mind    - Fortress detection CNN
 │   │   └── ocb_simd.mind         - Opposite-color bishop endgames (SIMD)
 │   │
@@ -258,21 +258,25 @@ Download from [Releases](https://github.com/star-ga/NikolaChess/releases):
 
 ## Building from Source
 
-Requires the MIND compiler (`mindc`) from [mindlang.dev](https://mindlang.dev) or [GitHub](https://github.com/star-ga/mind):
+The build system automatically downloads the MIND compiler if not installed:
 
 ```bash
 # Clone NikolaChess
 git clone https://github.com/star-ga/NikolaChess.git
 cd NikolaChess
 
-# Build with MIND compiler
-mindc build --release
+# Auto-setup (downloads MIND compiler + runtime libraries)
+make setup
 
-# Or use Makefile
+# Build (will auto-download compiler if needed)
 make release        # Build release binary
-make cuda           # Build CUDA version
+make cuda           # Build CUDA version (NVIDIA)
+make metal          # Build Metal version (Apple Silicon)
+make rocm           # Build ROCm version (AMD)
 make cpu            # Build CPU-only version
 ```
+
+Manual installation: [mindlang.dev](https://mindlang.dev) | [GitHub](https://github.com/star-ga/mind)
 
 ### Build Targets
 
@@ -405,15 +409,18 @@ NikolaChess implements state-of-the-art chess engine techniques with novel optim
 - Continuation history (1-ply, 2-ply, 4-ply)
 
 **Evaluation (NNUE + Deep Network):**
-- HalfKA architecture (45,056 features per perspective)
+- HalfKAv2 architecture (45,056 features per perspective)
+- **Trained on 1B+ positions** from high-quality games
 - Incremental accumulator updates (sub-100 cycle updates)
 - SCReLU activation (Squared Clipped ReLU)
 - WDL head (Win/Draw/Loss) for better endgame scaling
+- Deep residual network (384 filters, 20 blocks, SE attention)
 - Dual perspective evaluation (king-relative features)
 - GPU batch evaluation via CUDA (1M+ positions/sec)
 - v1/v2 model format selector with backward compatibility
 - Quantized int8/int16 inference for CPU
 - AVX2/AVX-512 SIMD vectorization
+- **SPRT-verified** at 3200+ Elo
 
 **Move Ordering (Critical for Pruning):**
 - TT move priority
@@ -449,6 +456,13 @@ NikolaChess implements state-of-the-art chess engine techniques with novel optim
 - Compile-time dimension checking for tensors
 - Hardware intrinsics exposed as language primitives
 
+**Opening Book:**
+- **100M+ positions** from grandmaster games
+- Polyglot format support
+- Custom .nkbook format with weighted move selection
+- Dynamic book depth based on position complexity
+- Anti-computer book lines
+
 **Integration:**
 - UCI protocol (Universal Chess Interface)
 - Opening book support (polyglot + custom .nkbook format)
@@ -457,6 +471,13 @@ NikolaChess implements state-of-the-art chess engine techniques with novel optim
 - Pondering (think during opponent's time)
 - Multi-PV analysis mode
 - Aggressive time management optimized for online play
+
+**Infrastructure (HPC Builds):**
+- CUDA 12.x with cuBLAS, cuDNN 9.x
+- NVLink 5.0 for multi-GPU communication
+- Infiniband NDR800 for cluster builds
+- MPI-based distributed hash table
+- NUMA-aware memory allocation
 
 ---
 

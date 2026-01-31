@@ -60,6 +60,11 @@ backend = "cuda"
 compute = "sm_90"  # H100
 output = "nikola-cuda-hopper"
 
+[targets.cuda-blackwell]
+backend = "cuda"
+compute = "sm_100"  # Blackwell B200/B300
+output = "nikola-cuda-blackwell"
+
 # ============================================================================
 # AMD ROCm Targets
 # ============================================================================

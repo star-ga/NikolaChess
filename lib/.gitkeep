@@ -1,0 +1,2 @@
+# Keep this directory for runtime libraries
+# Runtime .so/.dylib/.dll files are downloaded by scripts/setup.sh

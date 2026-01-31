@@ -4,10 +4,14 @@ build/
 *.exe
 *.dll
 *.so
+*.dylib
 nikola
-nikola-cpu
-nikola-cuda
-nikola-cuda-legacy
+nikola-*
+
+# MIND Runtime libraries (downloaded by scripts/setup.sh)
+lib/*.so
+lib/*.dylib
+lib/*.dll
 
 # MIND compiler cache
 .mind/
