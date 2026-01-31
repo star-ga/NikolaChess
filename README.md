@@ -71,7 +71,9 @@ NikolaChess is designed from the ground up for supercomputer-scale chess analysi
 
 | Metric | Value |
 |--------|-------|
-| Estimated Elo | 3500+ (supercomputer mode) |
+| Estimated Elo (single GPU) | 3550+ |
+| Estimated Elo (multi-GPU) | 3650+ |
+| Estimated Elo (HPC cluster) | 3800+ |
 | Tablebase Coverage | 7-man (140GB) / 8-man (16TB) |
 | Max Threads | 4096 |
 | Max GPUs | 256 |
