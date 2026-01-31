@@ -307,11 +307,48 @@ The complete chess engine source code is available in this repository:
 - **12 tool files** in `tools/` - Development utilities
 - **100% Pure MIND** - No Rust, No Python, No C++
 
-This demonstrates:
-- GPU acceleration patterns with CUDA via MIND
-- Neural network evaluation with NNUE/HalfKA
-- Parallel search with ABDADA algorithm
-- Modern chess engine architecture
+### Algorithms & Techniques
+
+**Search:**
+- Alpha-beta pruning with negamax framework
+- Principal Variation Search (PVS)
+- Aspiration windows with iterative deepening
+- Late Move Reductions (LMR) - adaptive
+- Null-move pruning
+- Futility pruning
+- Quiescence search for tactical stability
+- ABDADA parallel search algorithm
+- Transposition tables with Zobrist hashing
+
+**Evaluation (NNUE):**
+- HalfKA neural network architecture (45,056 features)
+- Incremental accumulator updates
+- SCReLU activation (Squared Clipped ReLU)
+- WDL head (Win/Draw/Loss probabilities)
+- GPU batch evaluation via CUDA
+- v1/v2 model format selector with backward compatibility
+
+**Draw Specialization:**
+- Draw probability network
+- Known draw position database
+- Draw-specific transposition table
+- Fortress detection CNN
+- Opposite-color bishop endgames (SIMD optimized)
+
+**Move Generation:**
+- Magic bitboards for sliding pieces
+- 16-bit compact move encoding
+- Legal move generation with pin detection
+
+**Endgame:**
+- Syzygy tablebase probing (7-man standard, 8-man extended)
+- Specialized endgame evaluation patterns
+
+**Integration:**
+- UCI protocol (Universal Chess Interface)
+- Opening book support (polyglot format)
+- Lichess API bot integration
+- Aggressive time management for online play
 
 ---
 
