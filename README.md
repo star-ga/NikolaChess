@@ -319,17 +319,17 @@ This demonstrates:
 
 **Source Code**: Apache License 2.0 - See [LICENSE](LICENSE)
 
-**MIND Compiler**: [mindlang.dev](https://mindlang.dev) | [GitHub](https://github.com/star-ga/mind)
-
 ---
 
 ## About STARGA
 
 STARGA, Inc. develops next-generation programming languages and AI systems.
 
-**Website**: [star.ga](https://star.ga)
-**MIND Language**: [mindlang.dev](https://mindlang.dev) | [GitHub](https://github.com/star-ga/mind)
-**Contact**: info@star.ga
+| | |
+|---|---|
+| **Website** | [star.ga](https://star.ga) |
+| **MIND Language** | [mindlang.dev](https://mindlang.dev) \| [GitHub](https://github.com/star-ga/mind) |
+| **Contact** | info@star.ga |
 
 ---
 
