@@ -77,27 +77,73 @@ fn update_accumulator(acc: &mut Accumulator, added: &[Feature], removed: &[Featu
 
 ## Model File Format (.nknn)
 
-```
-Header (48 bytes):
-  - Magic: 0x4E4B4E4E ("NKNN")
-  - Version: u32
-  - Architecture: 16 bytes ("HalfKA")
-  - Feature size: u32
-  - L1 size: u32
-  - L2 size: u32
-  - L3 size: u32
-  - Quantization: 8 bytes
+NikolaChess supports two model format versions with automatic detection.
 
-Weights (variable):
-  - Feature transformer weights: int16[]
-  - Feature transformer biases: int16[]
-  - L1 weights: int8[]
-  - L1 biases: int32[]
-  - L2 weights: int8[]
-  - L2 biases: int32[]
-  - Output weights: int8[]
+### Version Selector
+
+```mind
+fn load_model(path: str) -> NNUEModel {
+    let header = read_header(path);
+    match header.version {
+        1 => load_v1(path),  // Legacy format
+        2 => load_v2(path),  // Current format with extended features
+        _ => panic!("Unsupported model version: {}", header.version),
+    }
+}
+```
+
+### Format v1 (Legacy)
+
+```
+Header (32 bytes):
+  - Magic: 0x4E4B4E4E ("NKNN")
+  - Version: u32 (1)
+  - Architecture: 16 bytes ("HalfKP")
+  - Feature size: u32 (40960)
+  - L1 size: u32 (256)
+
+Weights:
+  - Feature transformer: int16[40960 × 256]
+  - L1: int8[512 × 32]
+  - Output: int8[32 × 1]
+```
+
+### Format v2 (Current)
+
+```
+Header (64 bytes):
+  - Magic: 0x4E4B4E4E ("NKNN")
+  - Version: u32 (2)
+  - Architecture: 16 bytes ("HalfKA")
+  - Feature size: u32 (45056)
+  - L1 size: u32 (1024)
+  - L2 size: u32 (16)
+  - L3 size: u32 (32)
+  - Quantization: 8 bytes ("int16/8")
+  - Flags: u32 (activity features, etc.)
+  - Reserved: 12 bytes
+
+Weights:
+  - Feature transformer weights: int16[45056 × 1024 × 2]
+  - Feature transformer biases: int16[1024 × 2]
+  - L1 weights: int8[2048 × 16]
+  - L1 biases: int32[16]
+  - L2 weights: int8[16 × 32]
+  - L2 biases: int32[32]
+  - Output weights: int8[32 × 1]
   - Output bias: int32
 ```
+
+### Version Differences
+
+| Feature | v1 | v2 |
+|---------|----|----|
+| Architecture | HalfKP | HalfKA |
+| Feature count | 40,960 | 45,056 |
+| Activity features | No | Yes |
+| L1 size | 256 | 1024 |
+| Hidden layers | 1 | 2 |
+| Quantization info | Implicit | Explicit |
 
 ## Training
 
