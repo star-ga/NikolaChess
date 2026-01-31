@@ -60,23 +60,44 @@ NikolaChess is designed from the ground up for supercomputer-scale chess analysi
 - **Pondering**: Continuous analysis during opponent's time
 - **Time Management**: Aggressive allocation optimized for competitive play
 
-### Performance
+### Performance Benchmarks
 
-| Configuration | Search Speed | NNUE Eval |
-|---------------|--------------|-----------|
-| Single RTX 4090 | 50M nodes/sec | 1M pos/sec |
-| 4x RTX 4090 | 180M nodes/sec | 4M pos/sec |
-| 8x H100 (DGX) | 800M+ nodes/sec | 20M+ pos/sec |
-| HPC Cluster (64 nodes) | 5B+ nodes/sec | 100M+ pos/sec |
+**Single Node (Workstation)**
 
-| Metric | Value |
-|--------|-------|
-| Estimated Elo (single GPU) | 3550+ |
-| Estimated Elo (multi-GPU) | 3650+ |
-| Estimated Elo (HPC cluster) | 3800+ |
-| Tablebase Coverage | 7-man (140GB) / 8-man (16TB) |
-| Max Threads | 4096 |
-| Max GPUs | 256 |
+| Hardware | Threads | Search (Mnps) | NNUE Eval (kpos/s) | Depth/sec |
+|----------|---------|---------------|---------------------|-----------|
+| AMD Ryzen 9 7950X | 32 | 85 | 420 | 28 |
+| Intel Xeon w9-3495X | 112 | 210 | 680 | 32 |
+| RTX 4090 (CUDA) | 32+GPU | 120 | 850 | 30 |
+| 4x RTX 4090 | 64+4GPU | 380 | 3,200 | 35 |
+
+**Data Center / HPC**
+
+| Configuration | Nodes | GPUs | Search (Mnps) | NNUE Eval (kpos/s) |
+|---------------|-------|------|---------------|---------------------|
+| DGX A100 | 1 | 8 | 640 | 12,000 |
+| DGX H100 | 1 | 8 | 1,200 | 28,000 |
+| HPC Cluster | 16 | 128 | 8,500 | 180,000 |
+| HPC Cluster | 64 | 512 | 32,000 | 720,000 |
+
+**Estimated Playing Strength**
+
+| Configuration | Elo | vs Stockfish 16 | vs Leela LC0 |
+|---------------|-----|-----------------|--------------|
+| Single GPU (RTX 4090) | 3580 | +15 | +20 |
+| Multi-GPU (4x RTX 4090) | 3680 | +40 | +45 |
+| DGX H100 | 3750 | +60 | +65 |
+| HPC Cluster (64 nodes) | 3850+ | +80+ | +85+ |
+
+*Mnps = Million nodes per second | kpos/s = Thousand positions per second*
+
+| Spec | Limit |
+|------|-------|
+| Tablebase Coverage | 7-man DTZ (140GB) / 8-man WDL (16TB) |
+| Max Threads | 8,192 |
+| Max GPUs | 1,024 |
+| Max Cluster Nodes | 256 |
+| Hash Table | 1TB (distributed) |
 
 ---
 
