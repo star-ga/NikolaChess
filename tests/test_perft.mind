@@ -1,0 +1,114 @@
+// Perft Unit Tests - Pure Mind Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+struct PerftTest {
+    name: str,
+    fen: str,
+    depth: u32,
+    expected: u64,
+}
+
+const PERFT_TESTS: &[PerftTest] = &[
+    PerftTest { name: "startpos d1", fen: "startpos", depth: 1, expected: 20 },
+    PerftTest { name: "startpos d2", fen: "startpos", depth: 2, expected: 400 },
+    PerftTest { name: "startpos d3", fen: "startpos", depth: 3, expected: 8902 },
+    PerftTest { name: "startpos d4", fen: "startpos", depth: 4, expected: 197281 },
+    PerftTest { name: "startpos d5", fen: "startpos", depth: 5, expected: 4865609 },
+
+    PerftTest {
+        name: "kiwipete d1",
+        fen: "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -",
+        depth: 1, expected: 48
+    },
+    PerftTest {
+        name: "kiwipete d2",
+        fen: "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -",
+        depth: 2, expected: 2039
+    },
+    PerftTest {
+        name: "kiwipete d3",
+        fen: "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -",
+        depth: 3, expected: 97862
+    },
+
+    PerftTest {
+        name: "position 3 d1",
+        fen: "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -",
+        depth: 1, expected: 14
+    },
+    PerftTest {
+        name: "position 3 d5",
+        fen: "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -",
+        depth: 5, expected: 674624
+    },
+
+    PerftTest {
+        name: "promotion d1",
+        fen: "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - -",
+        depth: 1, expected: 24
+    },
+    PerftTest {
+        name: "promotion d2",
+        fen: "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - -",
+        depth: 2, expected: 496
+    },
+];
+
+fn perft(board: &Board, depth: u32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = board.legal_moves();
+    if depth == 1 {
+        return moves.len() as u64;
+    }
+
+    let mut nodes = 0u64;
+    for mv in moves {
+        let mut new_board = board.clone();
+        new_board.make_move(mv);
+        nodes += perft(&new_board, depth - 1);
+    }
+    nodes
+}
+
+fn run_perft_tests() {
+    println!("Perft Unit Test Suite");
+    println!("═".repeat(50));
+    println!();
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for test in PERFT_TESTS {
+        let board = if test.fen == "startpos" {
+            Board::startpos()
+        } else {
+            Board::from_fen(test.fen).unwrap()
+        };
+
+        let result = perft(&board, test.depth);
+        let status = if result == test.expected { "✓" } else { "✗" };
+
+        if result == test.expected {
+            passed += 1;
+            println!("{} {}: {} nodes", status, test.name, result);
+        } else {
+            failed += 1;
+            println!("{} {}: got {}, expected {}", status, test.name, result, test.expected);
+        }
+    }
+
+    println!();
+    println!("═".repeat(50));
+    println!("Results: {} passed, {} failed", passed, failed);
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+pub fn main() {
+    run_perft_tests();
+}

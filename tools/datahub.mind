@@ -1,0 +1,113 @@
+// Data Hub - Pure Mind Implementation
+// Manages training data, shards, and model artifacts
+
+use std::fs;
+use std::net::http;
+
+struct DataHub {
+    base_dir: str,
+    shards_dir: str,
+    models_dir: str,
+    books_dir: str,
+}
+
+impl DataHub {
+    fn new(base: str) -> Self {
+        let hub = DataHub {
+            base_dir: base.to_string(),
+            shards_dir: format!("{}/shards", base),
+            models_dir: format!("{}/models", base),
+            books_dir: format!("{}/books", base),
+        };
+        fs::create_dir_all(&hub.shards_dir);
+        fs::create_dir_all(&hub.models_dir);
+        fs::create_dir_all(&hub.books_dir);
+        hub
+    }
+
+    fn list_shards(&self) -> Vec<str> {
+        fs::read_dir(&self.shards_dir)
+            .filter(|p| p.ends_with(".shard"))
+            .collect()
+    }
+
+    fn list_models(&self) -> Vec<str> {
+        fs::read_dir(&self.models_dir)
+            .filter(|p| p.ends_with(".nknn"))
+            .collect()
+    }
+
+    fn convert_shards_to_csv(&self, output: str) {
+        println!("Converting shards to CSV: {}", output);
+        let mut file = fs::File::create(output).unwrap();
+        file.write_str("fen,eval,result,ply,best_move\n");
+
+        for shard_path in self.list_shards() {
+            let shard = load_shard(&shard_path);
+            for pos in shard {
+                file.write_str(&format!("{},{},{},{},{}\n",
+                    pos.fen, pos.eval, pos.result, pos.ply, pos.best_move));
+            }
+        }
+        println!("Done!");
+    }
+
+    fn download_lichess_db(&self, year: u32, month: u32) {
+        let url = format!(
+            "https://database.lichess.org/standard/lichess_db_standard_rated_{:04}-{:02}.pgn.zst",
+            year, month);
+        let output = format!("{}/lichess_{:04}-{:02}.pgn", self.base_dir, year, month);
+
+        println!("Downloading {} to {}", url, output);
+        let resp = http::get(url);
+        let data = std::compress::zstd::decompress(resp.body());
+        fs::write(output, data);
+        println!("Done!");
+    }
+
+    fn download_gm_games(&self) {
+        let sources = [
+            "https://www.pgnmentor.com/players/Carlsen.pgn",
+            "https://www.pgnmentor.com/players/Caruana.pgn",
+            "https://www.pgnmentor.com/players/Nakamura.pgn",
+        ];
+
+        for url in sources {
+            let name = url.split('/').last().unwrap();
+            let output = format!("{}/{}", self.base_dir, name);
+            println!("Downloading {}...", name);
+            let data = http::get(url).body();
+            fs::write(output, data);
+        }
+        println!("Done!");
+    }
+}
+
+fn load_shard(path: str) -> Vec<LabeledPosition> {
+    let data = fs::read(path).unwrap();
+    // Parse shard format
+    Vec::new()
+}
+
+pub fn main() {
+    let args = std::env::args();
+    let hub = DataHub::new(args.get(2).unwrap_or("data"));
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("list") => {
+            println!("Shards: {:?}", hub.list_shards());
+            println!("Models: {:?}", hub.list_models());
+        }
+        Some("csv") => {
+            let output = args.get(3).unwrap_or("data.csv");
+            hub.convert_shards_to_csv(output);
+        }
+        Some("lichess") => {
+            let year = args.get(3).map(|s| s.parse().unwrap_or(2024)).unwrap_or(2024);
+            let month = args.get(4).map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+            hub.download_lichess_db(year, month);
+        }
+        Some("gm") => hub.download_gm_games(),
+        _ => println!("Usage: datahub <list|csv|lichess|gm> [args]"),
+    }
+}

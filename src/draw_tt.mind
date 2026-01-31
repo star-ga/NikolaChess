@@ -1,5 +1,5 @@
 // NikolaChess - WDL-Bounded Transposition Table
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 // Two-Bit Draw-Only TT with loss-rejection pruning
 

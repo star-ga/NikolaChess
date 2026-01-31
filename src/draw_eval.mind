@@ -1,5 +1,5 @@
 // NikolaChess - Draw Evaluation Neural Network
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 // GPU-accelerated draw probability estimation
 // Uses MIND's CUDA backend for RTX acceleration

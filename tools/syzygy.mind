@@ -1,0 +1,70 @@
+// Syzygy Tablebase Tools - Pure Mind Implementation
+
+use std::fs;
+use std::net::http;
+
+const LICHESS_TB_URL: str = "https://tablebase.lichess.ovh/tables/standard";
+
+pub fn download_syzygy(pieces: u32, output_dir: str) {
+    println!("Downloading {}-man Syzygy tablebases", pieces);
+    fs::create_dir_all(output_dir);
+
+    let tables = match pieces {
+        3 => ["KBvK", "KNvK", "KPvK", "KQvK", "KRvK"],
+        4 => ["KBBvK", "KBNvK", "KBPvK", "KNNvK", "KNPvK", "KPPvK",
+              "KQBvK", "KQNvK", "KQPvK", "KQvKB", "KQvKN", "KQvKP",
+              "KRBvK", "KRNvK", "KRPvK", "KRRvK", "KRvKB", "KRvKN"],
+        5 | 6 | 7 => fetch_table_list(pieces),
+        _ => return println!("Unsupported piece count"),
+    };
+
+    for (i, table) in tables.iter().enumerate() {
+        print!("\r[{}/{}] {}...", i + 1, tables.len(), table);
+        download_table(table, output_dir);
+    }
+    println!("\nDone!");
+}
+
+fn download_table(name: str, dir: str) {
+    for ext in ["rtbw", "rtbz"] {
+        let url = format!("{}/{}.{}", LICHESS_TB_URL, name, ext);
+        let path = format!("{}/{}.{}", dir, name, ext);
+        let data = http::get(url).body();
+        fs::write(path, data);
+    }
+}
+
+fn fetch_table_list(pieces: u32) -> Vec<str> {
+    let url = format!("{}/index.json", LICHESS_TB_URL);
+    let json = http::get(url).json();
+    json.iter()
+        .filter(|t| count_pieces(t) == pieces)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn count_pieces(name: str) -> u32 {
+    name.chars().filter(|c| c.is_uppercase()).count() as u32
+}
+
+pub fn setup_tb_server(tb_path: str, port: u16) {
+    println!("Starting tablebase server on port {}", port);
+    // Implementation for local TB server
+}
+
+pub fn main() {
+    let args = std::env::args();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("download") => {
+            let pieces = args.get(2).map(|s| s.parse().unwrap_or(6)).unwrap_or(6);
+            let dir = args.get(3).unwrap_or("syzygy");
+            download_syzygy(pieces, dir);
+        }
+        Some("server") => {
+            let path = args.get(2).unwrap_or("syzygy");
+            let port = args.get(3).map(|s| s.parse().unwrap_or(7000)).unwrap_or(7000);
+            setup_tb_server(path, port);
+        }
+        _ => println!("Usage: syzygy download <pieces> <dir>\n       syzygy server <path> <port>"),
+    }
+}

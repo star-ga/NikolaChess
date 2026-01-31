@@ -1,5 +1,5 @@
 // NikolaChess - Move Generation for 64-bit Packed Moves
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 
 import std.tensor;

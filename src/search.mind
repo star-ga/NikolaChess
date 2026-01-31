@@ -1,5 +1,5 @@
 // NikolaChess - Draw-First Search with Advanced Optimizations
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 // Search algorithm optimized for finding draws, not wins
 // Key insight: Repetitions are GOOD, not bad!
@@ -209,7 +209,7 @@ fn tt_store(tt: &mut TranspositionTable, hash: u64, depth: i32, draw_score: f32,
 
 // ============================================================================
 // DRAW-FIRST SEARCH ENGINE
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 struct DrawSearch {
@@ -270,7 +270,7 @@ fn create_search_with_threads(net: DrawNetwork, book: OpeningBook, tb: Tablebase
 
 // ============================================================================
 // MAIN SEARCH FUNCTION
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 fn search(s: &mut DrawSearch, board: Board, depth: i32, time_ms: i64) -> SearchResult {
@@ -383,7 +383,7 @@ fn search(s: &mut DrawSearch, board: Board, depth: i32, time_ms: i64) -> SearchR
 
 // ============================================================================
 // TRANSFORMER ROOT RERANKING (advanced)
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 fn rerank_root_with_transformer(s: &mut DrawSearch, board: Board, result: &mut SearchResult) {
@@ -467,7 +467,7 @@ fn refresh_accumulator(acc: &mut HalfKAAccumulator, weights: &HalfKAWeights, boa
 
 // ============================================================================
 // DRAW-FOCUSED NEGAMAX WITH ALPHA-BETA + LMR
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 // Maximum ply depth to prevent stack overflow
@@ -679,7 +679,7 @@ fn draw_negamax(
 
     // ========================================
     // MAIN SEARCH LOOP WITH LMR (advanced)
-    // Copyright (c) 2025 STARGA, Inc. All rights reserved.
+    // Copyright (c) 2026 STARGA, Inc. All rights reserved.
     // ========================================
 
     let mut best_score: f32 = -1.0;  // Start below valid range (0-1) so any move improves
@@ -831,7 +831,7 @@ fn draw_negamax(
 
 // ============================================================================
 // QUIESCENCE SEARCH
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 fn quiescence(s: &mut DrawSearch, board: Board, mut alpha: f32, beta: f32) -> f32 {
@@ -865,7 +865,7 @@ fn quiescence(s: &mut DrawSearch, board: Board, mut alpha: f32, beta: f32) -> f3
 
 // ============================================================================
 // NNUE/HALFKA EVALUATION (advanced)
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 fn evaluate_position(s: &mut DrawSearch, board: Board) -> f32 {
@@ -898,7 +898,7 @@ fn sigmoid(x: f32) -> f32 {
 
 // ============================================================================
 // MOVE ORDERING (Draw-Seeking Priority + LMR Heuristics)
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // ============================================================================
 
 fn order_moves_for_draw(

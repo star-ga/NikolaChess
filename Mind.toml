@@ -1,0 +1,52 @@
+# NikolaChess - MIND Project Configuration
+# Copyright (c) 2026 STARGA, Inc. All rights reserved.
+#
+# MIND Compiler: https://mindlang.dev | https://github.com/star-ga/mind
+
+[package]
+name = "nikolachess"
+version = "3.20.0"
+authors = ["STARGA, Inc. <info@star.ga>"]
+description = "Supercomputer Chess Engine - 100% MIND"
+license = "Apache-2.0"
+repository = "https://github.com/star-ga/NikolaChess"
+homepage = "https://star.ga"
+
+[build]
+entry = "src/main.mind"
+output = "nikola"
+optimization = "aggressive"
+
+[features]
+default = ["cuda", "simd", "syzygy"]
+cuda = []
+simd = []
+syzygy = []
+lichess = []
+
+[targets.cpu]
+backend = "cpu"
+simd = "avx512"
+output = "nikola-cpu"
+
+[targets.cuda]
+backend = "cuda"
+compute = "sm_89"  # RTX 40 series
+output = "nikola-cuda"
+
+[targets.cuda-legacy]
+backend = "cuda"
+compute = "sm_75"  # RTX 20 series
+output = "nikola-cuda-legacy"
+
+[dependencies]
+runtime = { version = "1.0", features = ["tensor", "cuda"], git = "https://github.com/star-ga/mind" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,34 @@
+// NikolaChess - Module Exports
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+// Core modules
+pub mod board;
+pub mod move64;
+pub mod movegen64;
+
+// Search modules
+pub mod search;
+pub mod abdada;
+pub mod lmr;
+
+// Evaluation modules
+pub mod nnue;
+pub mod halfka;
+pub mod transformer;
+pub mod tensor_board;
+pub mod endgame;
+
+// Draw specialization
+pub mod draw_eval;
+pub mod draw_db;
+pub mod draw_tt;
+pub mod fortress_conv;
+pub mod ocb_simd;
+
+// Training
+pub mod training;
+
+// Integration
+pub mod uci;
+pub mod opening_book;
+pub mod lichess_bot;

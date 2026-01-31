@@ -1,5 +1,5 @@
 // NikolaChess - Transformer Head for Root Move Reranking
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 //
 // Uses lightweight 2-layer transformer to rerank root moves

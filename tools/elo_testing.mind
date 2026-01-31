@@ -1,0 +1,380 @@
+// Elo Testing Suite - Pure Mind Implementation
+// Self-play and engine-vs-engine testing
+
+use std::time;
+use std::thread;
+use std::process;
+
+const DEFAULT_GAMES: u32 = 100;
+const DEFAULT_DEPTH: u32 = 8;
+const TIME_CONTROL_MS: u64 = 60000;  // 1 minute per side
+
+struct MatchResult {
+    wins: u32,
+    draws: u32,
+    losses: u32,
+    white_wins: u32,
+    black_wins: u32,
+}
+
+impl MatchResult {
+    fn new() -> Self {
+        MatchResult { wins: 0, draws: 0, losses: 0, white_wins: 0, black_wins: 0 }
+    }
+
+    fn total(&self) -> u32 {
+        self.wins + self.draws + self.losses
+    }
+
+    fn score(&self) -> f64 {
+        let total = self.total() as f64;
+        if total == 0.0 { return 0.5; }
+        (self.wins as f64 + self.draws as f64 * 0.5) / total
+    }
+
+    fn elo_diff(&self) -> f64 {
+        let score = self.score();
+        if score <= 0.0 || score >= 1.0 { return 0.0; }
+        -400.0 * (1.0 / score - 1.0).log10()
+    }
+
+    fn error_margin(&self) -> f64 {
+        let n = self.total() as f64;
+        if n < 2.0 { return 999.0; }
+        let p = self.score();
+        1.96 * (p * (1.0 - p) / n).sqrt() * 400.0
+    }
+}
+
+struct UciEngine {
+    path: str,
+    process: process::Child,
+    name: str,
+}
+
+impl UciEngine {
+    fn new(path: str) -> Self {
+        let mut proc = process::Command::new(path)
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::piped())
+            .spawn()
+            .expect("Failed to start engine");
+
+        let mut engine = UciEngine {
+            path: path.to_string(),
+            process: proc,
+            name: "Unknown".to_string(),
+        };
+
+        engine.send("uci");
+        engine.wait_for("uciok");
+        engine.send("isready");
+        engine.wait_for("readyok");
+
+        engine
+    }
+
+    fn send(&mut self, cmd: str) {
+        writeln!(self.process.stdin.as_mut().unwrap(), "{}", cmd);
+    }
+
+    fn read_line(&mut self) -> str {
+        let mut line = String::new();
+        self.process.stdout.as_mut().unwrap().read_line(&mut line);
+        line.trim().to_string()
+    }
+
+    fn wait_for(&mut self, token: str) -> str {
+        loop {
+            let line = self.read_line();
+            if line.contains(token) {
+                return line;
+            }
+        }
+    }
+
+    fn go_depth(&mut self, depth: u32) -> str {
+        self.send(&format!("go depth {}", depth));
+        let result = self.wait_for("bestmove");
+        result.split_whitespace().nth(1).unwrap_or("0000").to_string()
+    }
+
+    fn go_time(&mut self, wtime: u64, btime: u64) -> str {
+        self.send(&format!("go wtime {} btime {}", wtime, btime));
+        let result = self.wait_for("bestmove");
+        result.split_whitespace().nth(1).unwrap_or("0000").to_string()
+    }
+
+    fn set_position(&mut self, fen: Option<str>, moves: &[str]) {
+        let pos_cmd = match fen {
+            Some(f) => format!("position fen {}", f),
+            None => "position startpos".to_string(),
+        };
+
+        if moves.is_empty() {
+            self.send(&pos_cmd);
+        } else {
+            self.send(&format!("{} moves {}", pos_cmd, moves.join(" ")));
+        }
+    }
+
+    fn quit(&mut self) {
+        self.send("quit");
+        self.process.wait();
+    }
+}
+
+// Self-play Elo estimation
+pub fn self_play_elo(games: u32, depth: u32) {
+    println!("NikolaChess Self-Play Elo Test");
+    println!("Games: {}, Depth: {}", games, depth);
+    println!("─".repeat(50));
+
+    let mut result = MatchResult::new();
+    let engine = Engine::new();
+
+    for game_num in 0..games {
+        let game_result = play_self_game(&engine, depth);
+
+        match game_result {
+            GameResult::WhiteWins => { result.wins += 1; result.white_wins += 1; }
+            GameResult::BlackWins => { result.losses += 1; result.black_wins += 1; }
+            GameResult::Draw => result.draws += 1,
+        }
+
+        if (game_num + 1) % 10 == 0 {
+            println!("Game {}: +{} ={} -{} | Elo: {:.0} ± {:.0}",
+                game_num + 1, result.wins, result.draws, result.losses,
+                result.elo_diff(), result.error_margin());
+        }
+    }
+
+    println!("─".repeat(50));
+    println!("Final: +{} ={} -{}", result.wins, result.draws, result.losses);
+    println!("Score: {:.1}%", result.score() * 100.0);
+    println!("White: +{}, Black: +{}", result.white_wins, result.black_wins);
+    println!("Estimated Elo: {:.0} ± {:.0}", result.elo_diff(), result.error_margin());
+}
+
+fn play_self_game(engine: &Engine, depth: u32) -> GameResult {
+    let mut board = Board::startpos();
+
+    for _ in 0..500 {
+        if board.is_game_over() {
+            break;
+        }
+
+        let result = engine.search(&board, SearchParams {
+            depth: Some(depth),
+            movetime: None,
+            nodes: None,
+        });
+
+        board.make_move(result.best_move);
+    }
+
+    board.game_result()
+}
+
+// Engine vs Engine match
+pub fn engine_match(engine1_path: str, engine2_path: str, games: u32, time_ms: u64) {
+    println!("Engine Match");
+    println!("Engine 1: {}", engine1_path);
+    println!("Engine 2: {}", engine2_path);
+    println!("Games: {}, Time: {}ms each", games, time_ms);
+    println!("─".repeat(60));
+
+    let mut engine1 = UciEngine::new(engine1_path);
+    let mut engine2 = UciEngine::new(engine2_path);
+
+    let mut result = MatchResult::new();
+
+    for game_num in 0..games {
+        // Alternate colors
+        let (white, black) = if game_num % 2 == 0 {
+            (&mut engine1, &mut engine2)
+        } else {
+            (&mut engine2, &mut engine1)
+        };
+
+        let game_result = play_uci_game(white, black, time_ms);
+
+        // Adjust result based on which engine was white
+        let e1_white = game_num % 2 == 0;
+        match (game_result, e1_white) {
+            (GameResult::WhiteWins, true) => result.wins += 1,
+            (GameResult::WhiteWins, false) => result.losses += 1,
+            (GameResult::BlackWins, true) => result.losses += 1,
+            (GameResult::BlackWins, false) => result.wins += 1,
+            (GameResult::Draw, _) => result.draws += 1,
+        }
+
+        println!("Game {}: {} | Running: +{} ={} -{} ({:.0} Elo)",
+            game_num + 1,
+            match game_result {
+                GameResult::WhiteWins => "1-0",
+                GameResult::BlackWins => "0-1",
+                GameResult::Draw => "1/2",
+            },
+            result.wins, result.draws, result.losses,
+            result.elo_diff());
+    }
+
+    engine1.quit();
+    engine2.quit();
+
+    println!("─".repeat(60));
+    println!("Final Result: +{} ={} -{}", result.wins, result.draws, result.losses);
+    println!("Engine 1 Elo Difference: {:.0} ± {:.0}", result.elo_diff(), result.error_margin());
+}
+
+fn play_uci_game(white: &mut UciEngine, black: &mut UciEngine, time_ms: u64) -> GameResult {
+    let mut moves: Vec<str> = Vec::new();
+    let mut board = Board::startpos();
+    let mut wtime = time_ms;
+    let mut btime = time_ms;
+
+    for ply in 0..500 {
+        if board.is_game_over() {
+            break;
+        }
+
+        let (engine, our_time) = if ply % 2 == 0 {
+            (white, &mut wtime)
+        } else {
+            (black, &mut btime)
+        };
+
+        engine.set_position(None, &moves);
+
+        let start = time::now();
+        let best_move = engine.go_time(wtime, btime);
+        let elapsed = time::now() - start;
+
+        *our_time = our_time.saturating_sub(elapsed);
+
+        if best_move == "0000" || *our_time == 0 {
+            // Engine failed or flagged
+            return if ply % 2 == 0 {
+                GameResult::BlackWins
+            } else {
+                GameResult::WhiteWins
+            };
+        }
+
+        let mv = Move::from_uci(&best_move, &board);
+        board.make_move(mv);
+        moves.push(best_move);
+    }
+
+    board.game_result()
+}
+
+// A/B Testing for NNUE versions
+pub fn ab_test_nnue(weights_a: str, weights_b: str, games: u32, depth: u32) {
+    println!("NNUE A/B Test");
+    println!("Weights A: {}", weights_a);
+    println!("Weights B: {}", weights_b);
+    println!("Games: {}, Depth: {}", games, depth);
+    println!("─".repeat(50));
+
+    let mut result = MatchResult::new();
+
+    for game_num in 0..games {
+        // Load different weights for each game
+        let (w_a, w_b) = if game_num % 2 == 0 {
+            (weights_a.clone(), weights_b.clone())
+        } else {
+            (weights_b.clone(), weights_a.clone())
+        };
+
+        let engine_a = Engine::with_weights(&w_a);
+        let engine_b = Engine::with_weights(&w_b);
+
+        let game_result = play_ab_game(&engine_a, &engine_b, depth);
+
+        let a_white = game_num % 2 == 0;
+        match (game_result, a_white) {
+            (GameResult::WhiteWins, true) => result.wins += 1,
+            (GameResult::WhiteWins, false) => result.losses += 1,
+            (GameResult::BlackWins, true) => result.losses += 1,
+            (GameResult::BlackWins, false) => result.wins += 1,
+            (GameResult::Draw, _) => result.draws += 1,
+        }
+
+        if (game_num + 1) % 10 == 0 {
+            println!("Game {}: A vs B = +{} ={} -{} ({:.0} Elo)",
+                game_num + 1, result.wins, result.draws, result.losses,
+                result.elo_diff());
+        }
+    }
+
+    println!("─".repeat(50));
+    println!("Weights A vs B: +{} ={} -{}", result.wins, result.draws, result.losses);
+    println!("A is {:.0} ± {:.0} Elo better", result.elo_diff(), result.error_margin());
+
+    if result.elo_diff() > result.error_margin() {
+        println!("Result: Weights A is SIGNIFICANTLY better");
+    } else if result.elo_diff() < -result.error_margin() {
+        println!("Result: Weights B is SIGNIFICANTLY better");
+    } else {
+        println!("Result: No significant difference");
+    }
+}
+
+fn play_ab_game(engine_a: &Engine, engine_b: &Engine, depth: u32) -> GameResult {
+    let mut board = Board::startpos();
+
+    for ply in 0..500 {
+        if board.is_game_over() {
+            break;
+        }
+
+        let engine = if ply % 2 == 0 { engine_a } else { engine_b };
+
+        let result = engine.search(&board, SearchParams {
+            depth: Some(depth),
+            movetime: None,
+            nodes: None,
+        });
+
+        board.make_move(result.best_move);
+    }
+
+    board.game_result()
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    if args.len() < 2 {
+        println!("Usage:");
+        println!("  elo_testing self [games] [depth]");
+        println!("  elo_testing match <engine1> <engine2> [games] [time_ms]");
+        println!("  elo_testing ab <weights_a> <weights_b> [games] [depth]");
+        return;
+    }
+
+    match args[1].as_str() {
+        "self" => {
+            let games = args.get(2).map(|s| s.parse().unwrap_or(DEFAULT_GAMES)).unwrap_or(DEFAULT_GAMES);
+            let depth = args.get(3).map(|s| s.parse().unwrap_or(DEFAULT_DEPTH)).unwrap_or(DEFAULT_DEPTH);
+            self_play_elo(games, depth);
+        }
+        "match" => {
+            let e1 = args.get(2).expect("Engine 1 path required");
+            let e2 = args.get(3).expect("Engine 2 path required");
+            let games = args.get(4).map(|s| s.parse().unwrap_or(DEFAULT_GAMES)).unwrap_or(DEFAULT_GAMES);
+            let time = args.get(5).map(|s| s.parse().unwrap_or(TIME_CONTROL_MS)).unwrap_or(TIME_CONTROL_MS);
+            engine_match(e1, e2, games, time);
+        }
+        "ab" => {
+            let w_a = args.get(2).expect("Weights A path required");
+            let w_b = args.get(3).expect("Weights B path required");
+            let games = args.get(4).map(|s| s.parse().unwrap_or(DEFAULT_GAMES)).unwrap_or(DEFAULT_GAMES);
+            let depth = args.get(5).map(|s| s.parse().unwrap_or(DEFAULT_DEPTH)).unwrap_or(DEFAULT_DEPTH);
+            ab_test_nnue(w_a, w_b, games, depth);
+        }
+        _ => println!("Unknown command: {}", args[1]),
+    }
+}

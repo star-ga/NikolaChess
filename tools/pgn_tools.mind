@@ -1,0 +1,307 @@
+// PGN Tools - Pure Mind Implementation
+// Parse, filter, and analyze PGN game collections
+
+use std::fs;
+use std::io;
+
+struct PgnGame {
+    event: str,
+    site: str,
+    date: str,
+    white: str,
+    black: str,
+    result: str,
+    white_elo: Option<u32>,
+    black_elo: Option<u32>,
+    eco: str,
+    moves: Vec<str>,
+    ply_count: u32,
+}
+
+struct PgnFilter {
+    min_elo: Option<u32>,
+    max_elo: Option<u32>,
+    min_ply: Option<u32>,
+    max_ply: Option<u32>,
+    result: Option<str>,
+    eco_prefix: Option<str>,
+    player: Option<str>,
+}
+
+impl PgnFilter {
+    fn new() -> Self {
+        PgnFilter {
+            min_elo: None,
+            max_elo: None,
+            min_ply: None,
+            max_ply: None,
+            result: None,
+            eco_prefix: None,
+            player: None,
+        }
+    }
+
+    fn matches(&self, game: &PgnGame) -> bool {
+        if let Some(min) = self.min_elo {
+            let elo = game.white_elo.unwrap_or(0).max(game.black_elo.unwrap_or(0));
+            if elo < min { return false; }
+        }
+
+        if let Some(max) = self.max_elo {
+            let elo = game.white_elo.unwrap_or(9999).min(game.black_elo.unwrap_or(9999));
+            if elo > max { return false; }
+        }
+
+        if let Some(min) = self.min_ply {
+            if game.ply_count < min { return false; }
+        }
+
+        if let Some(max) = self.max_ply {
+            if game.ply_count > max { return false; }
+        }
+
+        if let Some(ref r) = self.result {
+            if &game.result != r { return false; }
+        }
+
+        if let Some(ref eco) = self.eco_prefix {
+            if !game.eco.starts_with(eco) { return false; }
+        }
+
+        if let Some(ref player) = self.player {
+            if game.white != *player && game.black != *player { return false; }
+        }
+
+        true
+    }
+}
+
+fn parse_pgn_file(path: str) -> Vec<PgnGame> {
+    let content = fs::read_to_string(path).unwrap();
+    let mut games = Vec::new();
+    let mut current_game = PgnGame::default();
+    let mut in_moves = false;
+    let mut moves_text = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        if line.starts_with('[') && line.ends_with(']') {
+            // Header
+            if in_moves && !moves_text.is_empty() {
+                current_game.moves = parse_moves(&moves_text);
+                current_game.ply_count = current_game.moves.len() as u32;
+                games.push(current_game);
+                current_game = PgnGame::default();
+                moves_text.clear();
+            }
+            in_moves = false;
+
+            let inner = &line[1..line.len()-1];
+            let parts: Vec<&str> = inner.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let key = parts[0];
+                let value = parts[1].trim_matches('"');
+                match key {
+                    "Event" => current_game.event = value.to_string(),
+                    "Site" => current_game.site = value.to_string(),
+                    "Date" => current_game.date = value.to_string(),
+                    "White" => current_game.white = value.to_string(),
+                    "Black" => current_game.black = value.to_string(),
+                    "Result" => current_game.result = value.to_string(),
+                    "WhiteElo" => current_game.white_elo = value.parse().ok(),
+                    "BlackElo" => current_game.black_elo = value.parse().ok(),
+                    "ECO" => current_game.eco = value.to_string(),
+                    _ => {}
+                }
+            }
+        } else if !line.is_empty() {
+            in_moves = true;
+            moves_text.push_str(line);
+            moves_text.push(' ');
+        }
+    }
+
+    // Handle last game
+    if !moves_text.is_empty() {
+        current_game.moves = parse_moves(&moves_text);
+        current_game.ply_count = current_game.moves.len() as u32;
+        games.push(current_game);
+    }
+
+    games
+}
+
+fn parse_moves(text: &str) -> Vec<str> {
+    let mut moves = Vec::new();
+    for token in text.split_whitespace() {
+        // Skip move numbers, results, comments
+        if token.contains('.') || token == "1-0" || token == "0-1" ||
+           token == "1/2-1/2" || token == "*" || token.starts_with('{') {
+            continue;
+        }
+        if !token.is_empty() {
+            moves.push(token.to_string());
+        }
+    }
+    moves
+}
+
+fn filter_pgn(input: str, output: str, filter: &PgnFilter) {
+    println!("Filtering {} -> {}", input, output);
+
+    let games = parse_pgn_file(input);
+    let filtered: Vec<_> = games.iter().filter(|g| filter.matches(g)).collect();
+
+    println!("Matched {}/{} games", filtered.len(), games.len());
+
+    let mut out = fs::File::create(output).unwrap();
+    for game in filtered {
+        write_pgn_game(&mut out, game);
+    }
+}
+
+fn write_pgn_game(out: &mut fs::File, game: &PgnGame) {
+    out.write_str(&format!("[Event \"{}\"]\n", game.event));
+    out.write_str(&format!("[Site \"{}\"]\n", game.site));
+    out.write_str(&format!("[Date \"{}\"]\n", game.date));
+    out.write_str(&format!("[White \"{}\"]\n", game.white));
+    out.write_str(&format!("[Black \"{}\"]\n", game.black));
+    out.write_str(&format!("[Result \"{}\"]\n", game.result));
+    if let Some(elo) = game.white_elo {
+        out.write_str(&format!("[WhiteElo \"{}\"]\n", elo));
+    }
+    if let Some(elo) = game.black_elo {
+        out.write_str(&format!("[BlackElo \"{}\"]\n", elo));
+    }
+    out.write_str(&format!("[ECO \"{}\"]\n", game.eco));
+    out.write_str("\n");
+
+    // Write moves with line wrapping
+    let mut line_len = 0;
+    for (i, mv) in game.moves.iter().enumerate() {
+        let prefix = if i % 2 == 0 {
+            format!("{}. ", i / 2 + 1)
+        } else {
+            String::new()
+        };
+
+        let text = format!("{}{} ", prefix, mv);
+        if line_len + text.len() > 80 {
+            out.write_str("\n");
+            line_len = 0;
+        }
+        out.write_str(&text);
+        line_len += text.len();
+    }
+    out.write_str(&format!("{}\n\n", game.result));
+}
+
+fn analyze_pgn(path: str) {
+    let games = parse_pgn_file(path);
+
+    println!("PGN Analysis: {}", path);
+    println!("─".repeat(50));
+    println!("Total games: {}", games.len());
+
+    let mut total_ply = 0u64;
+    let mut white_wins = 0u32;
+    let mut black_wins = 0u32;
+    let mut draws = 0u32;
+    let mut eco_counts: Map<str, u32> = Map::new();
+
+    for game in &games {
+        total_ply += game.ply_count as u64;
+        match game.result.as_str() {
+            "1-0" => white_wins += 1,
+            "0-1" => black_wins += 1,
+            "1/2-1/2" => draws += 1,
+            _ => {}
+        }
+
+        let eco_prefix = if game.eco.len() >= 1 { &game.eco[0..1] } else { "?" };
+        *eco_counts.entry(eco_prefix.to_string()).or_insert(0) += 1;
+    }
+
+    println!("Average ply: {:.1}", total_ply as f64 / games.len() as f64);
+    println!();
+    println!("Results:");
+    println!("  White wins: {} ({:.1}%)", white_wins, white_wins as f64 * 100.0 / games.len() as f64);
+    println!("  Black wins: {} ({:.1}%)", black_wins, black_wins as f64 * 100.0 / games.len() as f64);
+    println!("  Draws: {} ({:.1}%)", draws, draws as f64 * 100.0 / games.len() as f64);
+    println!();
+    println!("ECO Distribution:");
+    for (eco, count) in eco_counts.iter().sorted() {
+        println!("  {}: {} ({:.1}%)", eco, count, *count as f64 * 100.0 / games.len() as f64);
+    }
+}
+
+fn merge_pgn(files: &[str], output: str) {
+    println!("Merging {} files -> {}", files.len(), output);
+
+    let mut out = fs::File::create(output).unwrap();
+    let mut total = 0u32;
+
+    for path in files {
+        let games = parse_pgn_file(path);
+        for game in &games {
+            write_pgn_game(&mut out, game);
+            total += 1;
+        }
+        println!("  {}: {} games", path, games.len());
+    }
+
+    println!("Total: {} games written", total);
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("filter") => {
+            let input = args.get(2).expect("Input file required");
+            let output = args.get(3).expect("Output file required");
+            let mut filter = PgnFilter::new();
+
+            // Parse filter options
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--min-elo" => { filter.min_elo = args.get(i+1).map(|s| s.parse().ok()).flatten(); i += 2; }
+                    "--max-elo" => { filter.max_elo = args.get(i+1).map(|s| s.parse().ok()).flatten(); i += 2; }
+                    "--min-ply" => { filter.min_ply = args.get(i+1).map(|s| s.parse().ok()).flatten(); i += 2; }
+                    "--max-ply" => { filter.max_ply = args.get(i+1).map(|s| s.parse().ok()).flatten(); i += 2; }
+                    "--result" => { filter.result = args.get(i+1).map(|s| s.to_string()); i += 2; }
+                    "--eco" => { filter.eco_prefix = args.get(i+1).map(|s| s.to_string()); i += 2; }
+                    "--player" => { filter.player = args.get(i+1).map(|s| s.to_string()); i += 2; }
+                    _ => i += 1,
+                }
+            }
+
+            filter_pgn(input, output, &filter);
+        }
+        Some("analyze") => {
+            let path = args.get(2).expect("PGN file required");
+            analyze_pgn(path);
+        }
+        Some("merge") => {
+            let output = args.get(2).expect("Output file required");
+            let files: Vec<_> = args.iter().skip(3).collect();
+            merge_pgn(&files, output);
+        }
+        _ => {
+            println!("Usage:");
+            println!("  pgn_tools filter <input> <output> [options]");
+            println!("    --min-elo N    Minimum Elo rating");
+            println!("    --max-elo N    Maximum Elo rating");
+            println!("    --min-ply N    Minimum game length");
+            println!("    --max-ply N    Maximum game length");
+            println!("    --result R     Filter by result (1-0, 0-1, 1/2-1/2)");
+            println!("    --eco E        ECO prefix filter (e.g., B, C5)");
+            println!("    --player P     Games with player");
+            println!();
+            println!("  pgn_tools analyze <file>");
+            println!("  pgn_tools merge <output> <file1> <file2> ...");
+        }
+    }
+}

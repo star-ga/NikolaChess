@@ -1,0 +1,135 @@
+// Latency Benchmark - Pure Mind Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+use std::time;
+use std::stats;
+
+pub fn measure_search_latency(depth: u32, iterations: u32) {
+    println!("Search Latency Benchmark");
+    println!("Depth: {}, Iterations: {}", depth, iterations);
+    println!("─".repeat(50));
+
+    let engine = Engine::new();
+    let board = Board::startpos();
+    let mut times = Vec::with_capacity(iterations as usize);
+
+    // Warmup
+    for _ in 0..3 {
+        engine.search(&board, SearchParams { depth: Some(depth), ..Default::default() });
+    }
+
+    // Measure
+    for i in 0..iterations {
+        let start = time::now_micros();
+        let _ = engine.search(&board, SearchParams { depth: Some(depth), ..Default::default() });
+        let elapsed = time::now_micros() - start;
+        times.push(elapsed);
+
+        if (i + 1) % 10 == 0 {
+            print!(".");
+        }
+    }
+    println!();
+
+    // Statistics
+    times.sort();
+    let min = times[0];
+    let max = times[times.len() - 1];
+    let median = times[times.len() / 2];
+    let mean = times.iter().sum::<u64>() / times.len() as u64;
+    let p95 = times[(times.len() as f64 * 0.95) as usize];
+    let p99 = times[(times.len() as f64 * 0.99) as usize];
+
+    println!("─".repeat(50));
+    println!("Latency Statistics (microseconds):");
+    println!("  Min:    {:>10}μs", min);
+    println!("  Max:    {:>10}μs", max);
+    println!("  Mean:   {:>10}μs", mean);
+    println!("  Median: {:>10}μs", median);
+    println!("  P95:    {:>10}μs", p95);
+    println!("  P99:    {:>10}μs", p99);
+}
+
+pub fn measure_move_latency(iterations: u32) {
+    println!("Move Generation Latency");
+    println!("Iterations: {}", iterations);
+    println!("─".repeat(50));
+
+    let board = Board::startpos();
+    let mut times = Vec::with_capacity(iterations as usize);
+
+    for _ in 0..iterations {
+        let start = time::now_nanos();
+        let _ = board.legal_moves();
+        let elapsed = time::now_nanos() - start;
+        times.push(elapsed);
+    }
+
+    times.sort();
+    let min = times[0];
+    let max = times[times.len() - 1];
+    let median = times[times.len() / 2];
+    let mean = times.iter().sum::<u64>() / times.len() as u64;
+
+    println!("Move Generation Latency (nanoseconds):");
+    println!("  Min:    {:>10}ns", min);
+    println!("  Max:    {:>10}ns", max);
+    println!("  Mean:   {:>10}ns", mean);
+    println!("  Median: {:>10}ns", median);
+}
+
+pub fn measure_eval_latency(iterations: u32) {
+    println!("NNUE Evaluation Latency");
+    println!("Iterations: {}", iterations);
+    println!("─".repeat(50));
+
+    let engine = Engine::new();
+    let board = Board::startpos();
+    let mut times = Vec::with_capacity(iterations as usize);
+
+    for _ in 0..iterations {
+        let start = time::now_nanos();
+        let _ = engine.evaluate(&board);
+        let elapsed = time::now_nanos() - start;
+        times.push(elapsed);
+    }
+
+    times.sort();
+    let min = times[0];
+    let max = times[times.len() - 1];
+    let median = times[times.len() / 2];
+    let mean = times.iter().sum::<u64>() / times.len() as u64;
+
+    println!("NNUE Eval Latency (nanoseconds):");
+    println!("  Min:    {:>10}ns", min);
+    println!("  Max:    {:>10}ns", max);
+    println!("  Mean:   {:>10}ns", mean);
+    println!("  Median: {:>10}ns", median);
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("search") => {
+            let depth = args.get(2).map(|s| s.parse().unwrap_or(8)).unwrap_or(8);
+            let iters = args.get(3).map(|s| s.parse().unwrap_or(100)).unwrap_or(100);
+            measure_search_latency(depth, iters);
+        }
+        Some("movegen") => {
+            let iters = args.get(2).map(|s| s.parse().unwrap_or(100000)).unwrap_or(100000);
+            measure_move_latency(iters);
+        }
+        Some("eval") => {
+            let iters = args.get(2).map(|s| s.parse().unwrap_or(100000)).unwrap_or(100000);
+            measure_eval_latency(iters);
+        }
+        _ => {
+            measure_search_latency(8, 100);
+            println!();
+            measure_move_latency(100000);
+            println!();
+            measure_eval_latency(100000);
+        }
+    }
+}

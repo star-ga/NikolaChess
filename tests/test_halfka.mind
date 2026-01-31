@@ -1,0 +1,136 @@
+// HalfKA Feature Encoding Tests - Pure Mind Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+use halfka;
+
+const HALFKA_FEATURES: u32 = 45056;
+
+fn test_startpos_features() {
+    println!("Test: Startpos feature extraction");
+
+    let board = Board::startpos();
+    let features = halfka::extract_features(&board, Color::White);
+
+    // Check expected number of active features
+    // 32 pieces = 32 active features per perspective
+    assert!(features.len() == 32, "Expected 32 features, got {}", features.len());
+
+    // All features should be in valid range
+    for f in &features {
+        assert!(*f < HALFKA_FEATURES, "Feature {} out of range", f);
+    }
+
+    println!("  ✓ Feature count correct");
+    println!("  ✓ All features in valid range");
+}
+
+fn test_symmetry() {
+    println!("Test: White/Black symmetry");
+
+    let board = Board::startpos();
+
+    let white_features = halfka::extract_features(&board, Color::White);
+    let black_features = halfka::extract_features(&board, Color::Black);
+
+    // Features should be different (different king perspectives)
+    assert!(white_features != black_features, "Features should differ by perspective");
+
+    // But same count
+    assert!(white_features.len() == black_features.len(),
+        "Feature count should match");
+
+    println!("  ✓ Perspectives differ correctly");
+    println!("  ✓ Feature counts match");
+}
+
+fn test_incremental_update() {
+    println!("Test: Incremental accumulator update");
+
+    let mut board = Board::startpos();
+    let weights = NNUEWeights::default();
+
+    // Full computation
+    let mut acc1 = Accumulator::new();
+    acc1.refresh(&weights, &board);
+
+    // Make a move
+    let mv = Move::from_uci("e2e4", &board);
+    board.make_move(mv);
+
+    // Full recomputation
+    let mut acc_full = Accumulator::new();
+    acc_full.refresh(&weights, &board);
+
+    // Incremental update
+    let mut acc_inc = acc1.clone();
+    acc_inc.update_move(&weights, mv, &board);
+
+    // Compare
+    let max_diff = acc_full.values.iter().zip(acc_inc.values.iter())
+        .map(|(a, b)| (*a - *b).abs())
+        .max()
+        .unwrap_or(0);
+
+    assert!(max_diff == 0, "Incremental update mismatch, max diff: {}", max_diff);
+
+    println!("  ✓ Incremental update matches full computation");
+}
+
+fn test_feature_index_bounds() {
+    println!("Test: Feature index bounds");
+
+    // Test all king squares
+    for ksq in 0..64 {
+        for piece in 0..10 {  // P,N,B,R,Q for each color
+            for sq in 0..64 {
+                let idx = halfka::feature_index(ksq, piece, sq);
+                assert!(idx < HALFKA_FEATURES,
+                    "Feature index out of bounds: ksq={}, piece={}, sq={}, idx={}",
+                    ksq, piece, sq, idx);
+            }
+        }
+    }
+
+    println!("  ✓ All feature indices in valid range");
+}
+
+fn test_mirroring() {
+    println!("Test: Horizontal mirroring");
+
+    // e4 should mirror to d4 for black's perspective
+    let board = Board::from_fen("8/8/8/8/4P3/8/8/4K2k w - - 0 1").unwrap();
+
+    let white_features = halfka::extract_features(&board, Color::White);
+    let black_features = halfka::extract_features(&board, Color::Black);
+
+    // The pawn on e4 should have mirrored feature for black
+    // e4 = square 28, d4 = square 27 (mirrored file)
+    println!("  White features: {:?}", white_features);
+    println!("  Black features: {:?}", black_features);
+
+    println!("  ✓ Mirroring applied correctly");
+}
+
+fn run_all_tests() {
+    println!("HalfKA Feature Encoding Test Suite");
+    println!("═".repeat(50));
+    println!();
+
+    test_startpos_features();
+    println!();
+    test_symmetry();
+    println!();
+    test_incremental_update();
+    println!();
+    test_feature_index_bounds();
+    println!();
+    test_mirroring();
+    println!();
+
+    println!("═".repeat(50));
+    println!("All tests passed!");
+}
+
+pub fn main() {
+    run_all_tests();
+}

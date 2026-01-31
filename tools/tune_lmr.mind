@@ -1,0 +1,189 @@
+// LMR Tuning Tool - Pure Mind Implementation
+// Late Move Reduction parameter optimization
+
+use std::time;
+use std::thread;
+
+const DEFAULT_GAMES: u32 = 500;
+const TUNE_ITERATIONS: u32 = 100;
+
+struct LmrParams {
+    base: f32,
+    divisor: f32,
+    min_depth: u32,
+    min_moves: u32,
+}
+
+impl LmrParams {
+    fn default() -> Self {
+        LmrParams {
+            base: 0.75,
+            divisor: 2.25,
+            min_depth: 3,
+            min_moves: 4,
+        }
+    }
+
+    fn reduction(&self, depth: u32, move_count: u32) -> u32 {
+        if depth < self.min_depth || move_count < self.min_moves {
+            return 0;
+        }
+        let r = self.base + (depth as f32).ln() * (move_count as f32).ln() / self.divisor;
+        r.max(0.0) as u32
+    }
+
+    fn mutate(&self, rng: &mut Random) -> Self {
+        let factor = 0.1;
+        LmrParams {
+            base: self.base + rng.gaussian() * factor,
+            divisor: self.divisor + rng.gaussian() * factor,
+            min_depth: self.min_depth,
+            min_moves: self.min_moves,
+        }
+    }
+}
+
+struct TuneResult {
+    params: LmrParams,
+    elo: f64,
+    error: f64,
+    games: u32,
+}
+
+fn run_spsa_tuning(games_per_iter: u32, iterations: u32) {
+    println!("SPSA LMR Parameter Tuning");
+    println!("Games per iteration: {}", games_per_iter);
+    println!("Iterations: {}", iterations);
+    println!("─".repeat(60));
+
+    let mut best_params = LmrParams::default();
+    let mut best_elo = 0.0;
+    let mut rng = Random::new();
+
+    for iter in 0..iterations {
+        // Generate candidate parameters
+        let candidate = best_params.mutate(&mut rng);
+
+        // Test candidate vs baseline
+        let result = test_params(&candidate, &best_params, games_per_iter);
+
+        println!("Iter {}: base={:.3}, div={:.3} -> {:.1} Elo",
+            iter + 1, candidate.base, candidate.divisor, result.elo);
+
+        if result.elo > 0.0 && result.elo > result.error {
+            println!("  -> New best! Accepting parameters");
+            best_params = candidate;
+            best_elo = result.elo;
+        }
+    }
+
+    println!("─".repeat(60));
+    println!("Final Parameters:");
+    println!("  base: {:.4}", best_params.base);
+    println!("  divisor: {:.4}", best_params.divisor);
+    println!("  min_depth: {}", best_params.min_depth);
+    println!("  min_moves: {}", best_params.min_moves);
+    println!("Estimated Elo gain: {:.1}", best_elo);
+}
+
+fn test_params(candidate: &LmrParams, baseline: &LmrParams, games: u32) -> TuneResult {
+    let engine_a = Engine::with_lmr(candidate);
+    let engine_b = Engine::with_lmr(baseline);
+
+    let mut wins = 0u32;
+    let mut draws = 0u32;
+    let mut losses = 0u32;
+
+    for game_num in 0..games {
+        let (white, black) = if game_num % 2 == 0 {
+            (&engine_a, &engine_b)
+        } else {
+            (&engine_b, &engine_a)
+        };
+
+        let result = play_game(white, black, 8);
+        let a_white = game_num % 2 == 0;
+
+        match (result, a_white) {
+            (GameResult::WhiteWins, true) => wins += 1,
+            (GameResult::WhiteWins, false) => losses += 1,
+            (GameResult::BlackWins, true) => losses += 1,
+            (GameResult::BlackWins, false) => wins += 1,
+            (GameResult::Draw, _) => draws += 1,
+        }
+    }
+
+    let total = (wins + draws + losses) as f64;
+    let score = (wins as f64 + draws as f64 * 0.5) / total;
+    let elo = if score > 0.0 && score < 1.0 {
+        -400.0 * (1.0 / score - 1.0).log10()
+    } else {
+        0.0
+    };
+    let error = 1.96 * (score * (1.0 - score) / total).sqrt() * 400.0;
+
+    TuneResult {
+        params: candidate.clone(),
+        elo,
+        error,
+        games,
+    }
+}
+
+fn play_game(white: &Engine, black: &Engine, depth: u32) -> GameResult {
+    let mut board = Board::startpos();
+
+    for ply in 0..500 {
+        if board.is_game_over() {
+            break;
+        }
+
+        let engine = if ply % 2 == 0 { white } else { black };
+        let mv = engine.search(&board, SearchParams { depth: Some(depth), ..Default::default() });
+        board.make_move(mv.best_move);
+    }
+
+    board.game_result()
+}
+
+fn generate_lmr_table(params: &LmrParams) {
+    println!("LMR Reduction Table (depth x move_count)");
+    println!("Parameters: base={:.3}, divisor={:.3}", params.base, params.divisor);
+    println!();
+
+    print!("     ");
+    for mc in 1..=16 {
+        print!("{:3}", mc);
+    }
+    println!();
+
+    for d in 1..=16 {
+        print!("d{:2}: ", d);
+        for mc in 1..=16 {
+            let r = params.reduction(d, mc);
+            print!("{:3}", r);
+        }
+        println!();
+    }
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("tune") => {
+            let games = args.get(2).map(|s| s.parse().unwrap_or(DEFAULT_GAMES)).unwrap_or(DEFAULT_GAMES);
+            let iters = args.get(3).map(|s| s.parse().unwrap_or(TUNE_ITERATIONS)).unwrap_or(TUNE_ITERATIONS);
+            run_spsa_tuning(games, iters);
+        }
+        Some("table") => {
+            let params = LmrParams::default();
+            generate_lmr_table(&params);
+        }
+        _ => {
+            println!("Usage:");
+            println!("  tune_lmr tune [games] [iterations]");
+            println!("  tune_lmr table");
+        }
+    }
+}

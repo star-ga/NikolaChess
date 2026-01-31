@@ -1,0 +1,110 @@
+// Fortress Benchmark - Pure Mind Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+use std::time;
+
+// Test positions with known fortress draws
+const FORTRESS_POSITIONS: &[(&str, bool)] = &[
+    // (FEN, is_fortress)
+    ("8/8/8/8/8/5k2/4p3/4K3 w - - 0 1", true),      // KP vs K, wrong rook pawn
+    ("8/5k2/8/5B2/5K2/8/8/8 w - - 0 1", false),      // KB vs K, not fortress
+    ("8/8/8/3k4/8/8/3P4/3K4 w - - 0 1", false),      // KP vs K, winning
+    ("8/8/4k3/8/8/8/3BK3/8 w - - 0 1", true),        // KB vs K, wrong color bishop
+    ("6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1", true),   // Blocked pawns
+    ("8/8/8/8/8/1k6/1P6/1K6 w - - 0 1", true),       // Rook pawn, king in front
+];
+
+pub fn run_fortress_benchmark() {
+    println!("Fortress Detection Benchmark");
+    println!("─".repeat(50));
+
+    let engine = Engine::new();
+    let mut correct = 0;
+    let mut total = 0;
+    let mut total_time = 0u64;
+
+    for (fen, expected) in FORTRESS_POSITIONS {
+        let board = Board::from_fen(fen).unwrap();
+
+        let start = time::now();
+        let result = engine.detect_fortress(&board);
+        let elapsed = time::now() - start;
+        total_time += elapsed;
+
+        let correct_str = if result == *expected { "✓" } else { "✗" };
+        if result == *expected {
+            correct += 1;
+        }
+        total += 1;
+
+        println!("{} {} (expected: {}, got: {}, {}μs)",
+            correct_str, fen, expected, result, elapsed);
+    }
+
+    println!("─".repeat(50));
+    println!("Accuracy: {}/{} ({:.1}%)", correct, total,
+        correct as f64 * 100.0 / total as f64);
+    println!("Average time: {}μs", total_time / total as u64);
+}
+
+pub fn run_wdl_benchmark() {
+    println!("WDL Optimization Benchmark");
+    println!("─".repeat(50));
+
+    let positions = generate_random_positions(1000);
+    let engine = Engine::new();
+
+    // Standard eval
+    let start = time::now();
+    let mut standard_evals = Vec::with_capacity(positions.len());
+    for pos in &positions {
+        standard_evals.push(engine.evaluate(pos));
+    }
+    let standard_time = time::now() - start;
+
+    // WDL-optimized eval
+    let start = time::now();
+    let mut wdl_evals = Vec::with_capacity(positions.len());
+    for pos in &positions {
+        wdl_evals.push(engine.evaluate_wdl(pos));
+    }
+    let wdl_time = time::now() - start;
+
+    println!("Standard eval: {}ms ({:.0} pos/sec)",
+        standard_time, positions.len() as f64 * 1000.0 / standard_time as f64);
+    println!("WDL-optimized: {}ms ({:.0} pos/sec)",
+        wdl_time, positions.len() as f64 * 1000.0 / wdl_time as f64);
+    println!("Speedup: {:.2}x", standard_time as f64 / wdl_time as f64);
+}
+
+fn generate_random_positions(count: usize) -> Vec<Board> {
+    let mut positions = Vec::with_capacity(count);
+    let mut board = Board::startpos();
+    let mut rng = Random::new();
+
+    for _ in 0..count {
+        let moves = board.legal_moves();
+        if moves.is_empty() || board.halfmove_clock > 50 {
+            board = Board::startpos();
+        } else {
+            let idx = rng.next() % moves.len();
+            board.make_move(moves[idx]);
+        }
+        positions.push(board.clone());
+    }
+    positions
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("fortress") => run_fortress_benchmark(),
+        Some("wdl") => run_wdl_benchmark(),
+        _ => {
+            run_fortress_benchmark();
+            println!();
+            run_wdl_benchmark();
+        }
+    }
+}

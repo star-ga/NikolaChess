@@ -1,36 +1,52 @@
 # Build outputs
 target/
+build/
 *.exe
 *.dll
 *.so
+nikola
+nikola-cpu
+nikola-cuda
+nikola-cuda-legacy
+
+# MIND compiler cache
+.mind/
+*.mic
 
 # Data files (large)
 *.bin
 *.csv
+*.pgn
+*.zst
 
-# Test files
-test_*.txt
-test_*.bin
+# NNUE model weights
+*.nknn
+*.nnue
 
-# Python
-__pycache__/
-*.pyc
-.env
-
-# Scripts (local)
-*.ps1
-
-# IDE
-.vscode/
-.idea/
-
-# Large data (local only)
+# Syzygy tablebases
+*.rtbw
+*.rtbz
+syzygy/
 syzygy6/
-data/games/
+syzygy7/
 
 # Training artifacts
 checkpoints/
 models/
 runs/
 data/shards/
-*.nknn
+data/games/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+*.local

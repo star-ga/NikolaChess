@@ -1,5 +1,5 @@
 // NikolaChess - Fast Draw Database
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 // GPU-accelerated position database for draw lookups
 // Extends beyond 7-man tablebases to store known draw positions

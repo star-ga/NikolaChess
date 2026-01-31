@@ -1,0 +1,142 @@
+// Search Unit Tests - Pure Mind Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+
+struct MateTest {
+    name: str,
+    fen: str,
+    mate_in: i32,  // Positive = white to mate, negative = black to mate
+}
+
+const MATE_TESTS: &[MateTest] = &[
+    MateTest {
+        name: "Mate in 1 (back rank)",
+        fen: "6k1/5ppp/8/8/8/8/8/4R2K w - - 0 1",
+        mate_in: 1
+    },
+    MateTest {
+        name: "Mate in 1 (queen)",
+        fen: "k7/8/1K6/8/8/8/8/Q7 w - - 0 1",
+        mate_in: 1
+    },
+    MateTest {
+        name: "Mate in 2 (ladder)",
+        fen: "k7/8/8/8/8/8/1R6/RK6 w - - 0 1",
+        mate_in: 2
+    },
+    MateTest {
+        name: "Mate in 2 (smothered)",
+        fen: "r5rk/5Npp/8/8/8/8/8/4K2R w - - 0 1",
+        mate_in: 2
+    },
+    MateTest {
+        name: "Mate in 3",
+        fen: "2r3k1/p4p1p/1p2pPp1/8/2qNn3/P1P5/1P4PP/R2Q1RK1 b - - 0 1",
+        mate_in: -3
+    },
+];
+
+fn test_mate_finding() {
+    println!("Test: Mate finding");
+    println!("─".repeat(50));
+
+    let engine = Engine::new();
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for test in MATE_TESTS {
+        let board = Board::from_fen(test.fen).unwrap();
+        let depth = test.mate_in.abs() * 2 + 1;
+
+        let result = engine.search(&board, SearchParams {
+            depth: Some(depth as u32),
+            ..Default::default()
+        });
+
+        // Check if found mate
+        let found_mate = result.score.abs() > 30000;
+        let found_depth = if found_mate {
+            (32000 - result.score.abs()) / 2 + 1
+        } else {
+            0
+        };
+
+        if found_mate && found_depth == test.mate_in.abs() {
+            println!("✓ {}: Found mate in {}", test.name, found_depth);
+            passed += 1;
+        } else {
+            println!("✗ {}: Expected mate in {}, got score {}",
+                test.name, test.mate_in.abs(), result.score);
+            failed += 1;
+        }
+    }
+
+    println!();
+    println!("Mate tests: {} passed, {} failed", passed, failed);
+}
+
+fn test_tactical_positions() {
+    println!("Test: Tactical positions");
+    println!("─".repeat(50));
+
+    let tactics = [
+        ("Fork", "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4", "Qxf7+"),
+        ("Pin", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4", "Ng5"),
+        ("Skewer", "8/8/8/3k4/8/8/3R4/3K4 w - - 0 1", "Rd8+"),
+    ];
+
+    let engine = Engine::new();
+    let mut passed = 0;
+
+    for (name, fen, expected_move) in tactics {
+        let board = Board::from_fen(fen).unwrap();
+        let result = engine.search(&board, SearchParams {
+            depth: Some(8),
+            ..Default::default()
+        });
+
+        let found = result.best_move.to_uci();
+        if found.starts_with(expected_move) || expected_move.contains(&found[0..4]) {
+            println!("✓ {}: {}", name, found);
+            passed += 1;
+        } else {
+            println!("✗ {}: Expected {}, got {}", name, expected_move, found);
+        }
+    }
+
+    println!();
+    println!("Tactical tests: {}/{} passed", passed, tactics.len());
+}
+
+fn test_draw_detection() {
+    println!("Test: Draw detection");
+    println!("─".repeat(50));
+
+    let draws = [
+        ("Stalemate", "k7/8/1K6/8/8/8/8/8 b - - 0 1"),
+        ("Insufficient (KvK)", "8/8/8/4k3/8/4K3/8/8 w - - 0 1"),
+        ("Insufficient (KBvK)", "8/8/8/4k3/8/4K3/5B2/8 w - - 0 1"),
+    ];
+
+    for (name, fen) in draws {
+        let board = Board::from_fen(fen).unwrap();
+        let is_draw = board.is_draw();
+
+        if is_draw {
+            println!("✓ {}: Correctly identified as draw", name);
+        } else {
+            println!("✗ {}: Should be draw", name);
+        }
+    }
+}
+
+pub fn main() {
+    println!("Search Unit Test Suite");
+    println!("═".repeat(50));
+    println!();
+
+    test_mate_finding();
+    println!();
+    test_tactical_positions();
+    println!();
+    test_draw_detection();
+}

@@ -1,0 +1,102 @@
+// CUDA Benchmarking - Pure Mind Implementation
+
+use runtime::cuda;
+use runtime::tensor;
+use std::time;
+
+pub fn compare_backends() {
+    println!("CUDA vs CPU Benchmark");
+    println!("─".repeat(50));
+
+    let positions = generate_test_positions(10000);
+
+    // CPU benchmark
+    let cpu_start = time::now();
+    let cpu_results = eval_cpu(&positions);
+    let cpu_time = time::now() - cpu_start;
+
+    // GPU benchmark
+    let gpu_start = time::now();
+    let gpu_results = eval_gpu(&positions);
+    let gpu_time = time::now() - gpu_start;
+
+    println!("CPU: {} positions in {}ms ({:.0} pos/sec)",
+        positions.len(), cpu_time, positions.len() as f64 * 1000.0 / cpu_time as f64);
+    println!("GPU: {} positions in {}ms ({:.0} pos/sec)",
+        positions.len(), gpu_time, positions.len() as f64 * 1000.0 / gpu_time as f64);
+    println!("Speedup: {:.1}x", cpu_time as f64 / gpu_time as f64);
+
+    // Verify results match
+    let mut max_diff = 0i32;
+    for i in 0..positions.len() {
+        let diff = (cpu_results[i] - gpu_results[i]).abs();
+        if diff > max_diff { max_diff = diff; }
+    }
+    println!("Max eval difference: {} cp", max_diff);
+}
+
+fn generate_test_positions(count: usize) -> Vec<Board> {
+    let mut positions = Vec::with_capacity(count);
+    let mut board = Board::startpos();
+    let mut rng = std::rand::new();
+
+    for _ in 0..count {
+        let moves = board.legal_moves();
+        if moves.is_empty() {
+            board = Board::startpos();
+        } else {
+            let idx = rng.next() % moves.len();
+            board.make_move(moves[idx]);
+        }
+        positions.push(board.clone());
+    }
+    positions
+}
+
+fn eval_cpu(positions: &[Board]) -> Vec<i32> {
+    let engine = Engine::new();
+    positions.iter().map(|b| engine.evaluate(b)).collect()
+}
+
+fn eval_gpu(positions: &[Board]) -> Vec<i32> {
+    let mut results = vec![0i32; positions.len()];
+    on(cuda::gpu0) {
+        parallel for i in 0..positions.len() {
+            results[i] = gpu_evaluate(&positions[i]);
+        }
+    }
+    results
+}
+
+pub fn profile_forward() {
+    println!("NNUE Forward Pass Profiling");
+    let weights = NNUEWeights::load("model.nknn");
+    let board = Board::startpos();
+    let features = extract_features(&board);
+
+    let iterations = 100000;
+    let start = time::now();
+
+    for _ in 0..iterations {
+        let mut acc = Accumulator::new();
+        acc.refresh(&weights, &features);
+        let _ = forward(&acc, &weights, Color::White);
+    }
+
+    let elapsed = time::now() - start;
+    println!("{} iterations in {}ms", iterations, elapsed);
+    println!("{:.0} evals/sec", iterations as f64 * 1000.0 / elapsed as f64);
+}
+
+pub fn main() {
+    let args = std::env::args();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("compare") => compare_backends(),
+        Some("profile") => profile_forward(),
+        _ => {
+            compare_backends();
+            println!();
+            profile_forward();
+        }
+    }
+}

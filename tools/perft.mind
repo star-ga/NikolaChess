@@ -1,0 +1,255 @@
+// Perft Tool - Pure Mind Implementation
+// Move generation verification and speed testing
+
+use std::time;
+
+struct PerftResult {
+    nodes: u64,
+    captures: u64,
+    en_passant: u64,
+    castles: u64,
+    promotions: u64,
+    checks: u64,
+    checkmates: u64,
+}
+
+impl PerftResult {
+    fn new() -> Self {
+        PerftResult {
+            nodes: 0,
+            captures: 0,
+            en_passant: 0,
+            castles: 0,
+            promotions: 0,
+            checks: 0,
+            checkmates: 0,
+        }
+    }
+
+    fn add(&mut self, other: &PerftResult) {
+        self.nodes += other.nodes;
+        self.captures += other.captures;
+        self.en_passant += other.en_passant;
+        self.castles += other.castles;
+        self.promotions += other.promotions;
+        self.checks += other.checks;
+        self.checkmates += other.checkmates;
+    }
+}
+
+fn perft(board: &Board, depth: u32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = board.legal_moves();
+
+    if depth == 1 {
+        return moves.len() as u64;
+    }
+
+    let mut nodes = 0u64;
+    for mv in moves {
+        let mut new_board = board.clone();
+        new_board.make_move(mv);
+        nodes += perft(&new_board, depth - 1);
+    }
+    nodes
+}
+
+fn perft_detailed(board: &Board, depth: u32) -> PerftResult {
+    let mut result = PerftResult::new();
+
+    if depth == 0 {
+        result.nodes = 1;
+        return result;
+    }
+
+    let moves = board.legal_moves();
+
+    for mv in moves {
+        let mut new_board = board.clone();
+        new_board.make_move(mv);
+
+        let sub_result = perft_detailed(&new_board, depth - 1);
+
+        result.add(&sub_result);
+
+        // Count move types at leaf nodes
+        if depth == 1 {
+            if mv.is_capture() { result.captures += 1; }
+            if mv.is_en_passant() { result.en_passant += 1; }
+            if mv.is_castle() { result.castles += 1; }
+            if mv.is_promotion() { result.promotions += 1; }
+            if new_board.is_check() { result.checks += 1; }
+            if new_board.is_checkmate() { result.checkmates += 1; }
+        }
+    }
+
+    result
+}
+
+fn perft_divide(board: &Board, depth: u32) {
+    let moves = board.legal_moves();
+    let mut total = 0u64;
+
+    println!("Perft divide at depth {}", depth);
+    println!("─".repeat(30));
+
+    for mv in moves {
+        let mut new_board = board.clone();
+        new_board.make_move(mv);
+
+        let nodes = if depth > 1 {
+            perft(&new_board, depth - 1)
+        } else {
+            1
+        };
+
+        println!("{}: {}", mv.to_uci(), nodes);
+        total += nodes;
+    }
+
+    println!("─".repeat(30));
+    println!("Total: {}", total);
+}
+
+fn run_perft_suite() {
+    // Standard test positions
+    let positions = [
+        ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            [20, 400, 8902, 197281, 4865609, 119060324]),
+        ("kiwipete", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -",
+            [48, 2039, 97862, 4085603, 193690690, 8031647685]),
+        ("position3", "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -",
+            [14, 191, 2812, 43238, 674624, 11030083]),
+        ("position4", "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq -",
+            [6, 264, 9467, 422333, 15833292, 706045033]),
+        ("position5", "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ -",
+            [44, 1486, 62379, 2103487, 89941194, 3048196529]),
+    ];
+
+    println!("NikolaChess Perft Test Suite");
+    println!("═".repeat(60));
+
+    let mut all_passed = true;
+
+    for (name, fen, expected) in positions {
+        let board = Board::from_fen(fen).unwrap();
+        println!();
+        println!("Position: {}", name);
+
+        for (depth, &exp) in expected.iter().enumerate().take(5) {
+            let d = (depth + 1) as u32;
+            let start = time::now();
+            let nodes = perft(&board, d);
+            let elapsed = time::now() - start;
+            let nps = if elapsed > 0 { nodes * 1000 / elapsed as u64 } else { 0 };
+
+            let status = if nodes == exp { "OK" } else { "FAIL" };
+            if nodes != exp { all_passed = false; }
+
+            println!("  depth {}: {} nodes ({} expected) [{}ms, {} Mnps] {}",
+                d, nodes, exp, elapsed, nps / 1_000_000, status);
+        }
+    }
+
+    println!();
+    println!("═".repeat(60));
+    if all_passed {
+        println!("All tests PASSED");
+    } else {
+        println!("Some tests FAILED");
+    }
+}
+
+fn bench_movegen() {
+    println!("Move Generation Benchmark");
+    println!("─".repeat(40));
+
+    let board = Board::startpos();
+    let iterations = 1_000_000;
+
+    let start = time::now();
+    for _ in 0..iterations {
+        let _ = board.legal_moves();
+    }
+    let elapsed = time::now() - start;
+
+    println!("Iterations: {}", iterations);
+    println!("Time: {}ms", elapsed);
+    println!("Speed: {:.2}M movegen/sec", iterations as f64 / elapsed as f64 * 1000.0 / 1_000_000.0);
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("run") => {
+            let fen = args.get(2).unwrap_or("startpos");
+            let depth = args.get(3).map(|s| s.parse().unwrap_or(5)).unwrap_or(5);
+
+            let board = if fen == "startpos" {
+                Board::startpos()
+            } else {
+                Board::from_fen(fen).unwrap()
+            };
+
+            println!("Perft at depth {}", depth);
+            let start = time::now();
+            let nodes = perft(&board, depth);
+            let elapsed = time::now() - start;
+            let nps = if elapsed > 0 { nodes * 1000 / elapsed as u64 } else { 0 };
+
+            println!("Nodes: {}", nodes);
+            println!("Time: {}ms", elapsed);
+            println!("NPS: {} ({} Mnps)", nps, nps / 1_000_000);
+        }
+        Some("divide") => {
+            let fen = args.get(2).unwrap_or("startpos");
+            let depth = args.get(3).map(|s| s.parse().unwrap_or(5)).unwrap_or(5);
+
+            let board = if fen == "startpos" {
+                Board::startpos()
+            } else {
+                Board::from_fen(fen).unwrap()
+            };
+
+            perft_divide(&board, depth);
+        }
+        Some("suite") => {
+            run_perft_suite();
+        }
+        Some("bench") => {
+            bench_movegen();
+        }
+        Some("detailed") => {
+            let fen = args.get(2).unwrap_or("startpos");
+            let depth = args.get(3).map(|s| s.parse().unwrap_or(4)).unwrap_or(4);
+
+            let board = if fen == "startpos" {
+                Board::startpos()
+            } else {
+                Board::from_fen(fen).unwrap()
+            };
+
+            let result = perft_detailed(&board, depth);
+            println!("Detailed Perft at depth {}", depth);
+            println!("  Nodes: {}", result.nodes);
+            println!("  Captures: {}", result.captures);
+            println!("  En passant: {}", result.en_passant);
+            println!("  Castles: {}", result.castles);
+            println!("  Promotions: {}", result.promotions);
+            println!("  Checks: {}", result.checks);
+            println!("  Checkmates: {}", result.checkmates);
+        }
+        _ => {
+            println!("Usage:");
+            println!("  perft run [fen] [depth]");
+            println!("  perft divide [fen] [depth]");
+            println!("  perft suite");
+            println!("  perft bench");
+            println!("  perft detailed [fen] [depth]");
+        }
+    }
+}

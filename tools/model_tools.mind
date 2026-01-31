@@ -1,0 +1,237 @@
+// Model Tools - Pure Mind Implementation
+// NNUE model conversion, analysis, and optimization
+
+use std::fs;
+use runtime::tensor;
+
+const NNUE_MAGIC: u32 = 0x4E4B4E4E;  // "NKNN"
+const HALFKA_FEATURES: u32 = 45056;   // 64 * 64 * 11
+const L1_SIZE: u32 = 1024;
+const L2_SIZE: u32 = 16;
+const L3_SIZE: u32 = 32;
+
+struct NNUEHeader {
+    magic: u32,
+    version: u32,
+    arch: str,
+    feature_size: u32,
+    l1_size: u32,
+    l2_size: u32,
+    l3_size: u32,
+    quantization: str,
+}
+
+fn read_nnue_header(path: str) -> NNUEHeader {
+    let data = fs::read(path).unwrap();
+    let magic = u32::from_le_bytes(&data[0..4]);
+
+    if magic != NNUE_MAGIC {
+        panic!("Invalid NNUE file: bad magic number");
+    }
+
+    NNUEHeader {
+        magic,
+        version: u32::from_le_bytes(&data[4..8]),
+        arch: String::from_utf8_lossy(&data[8..24]).trim_end_matches('\0').to_string(),
+        feature_size: u32::from_le_bytes(&data[24..28]),
+        l1_size: u32::from_le_bytes(&data[28..32]),
+        l2_size: u32::from_le_bytes(&data[32..36]),
+        l3_size: u32::from_le_bytes(&data[36..40]),
+        quantization: String::from_utf8_lossy(&data[40..48]).trim_end_matches('\0').to_string(),
+    }
+}
+
+fn analyze_model(path: str) {
+    let header = read_nnue_header(path);
+    let file_size = fs::metadata(path).unwrap().len();
+
+    println!("NNUE Model Analysis: {}", path);
+    println!("─".repeat(50));
+    println!("File size: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1024.0 / 1024.0);
+    println!();
+    println!("Header:");
+    println!("  Magic: 0x{:08X}", header.magic);
+    println!("  Version: {}", header.version);
+    println!("  Architecture: {}", header.arch);
+    println!("  Quantization: {}", header.quantization);
+    println!();
+    println!("Network Structure:");
+    println!("  Input features: {}", header.feature_size);
+    println!("  L1 (hidden): {}", header.l1_size);
+    println!("  L2 (hidden): {}", header.l2_size);
+    println!("  L3 (output): {}", header.l3_size);
+    println!();
+
+    // Calculate parameter counts
+    let ft_params = header.feature_size * header.l1_size * 2;  // * 2 for white/black perspective
+    let l1_params = header.l1_size * 2 * header.l2_size;
+    let l2_params = header.l2_size * header.l3_size;
+    let l3_params = header.l3_size * 1;
+    let total_params = ft_params + l1_params + l2_params + l3_params;
+
+    println!("Parameters:");
+    println!("  Feature transformer: {} ({:.2}M)", ft_params, ft_params as f64 / 1e6);
+    println!("  L1 weights: {}", l1_params);
+    println!("  L2 weights: {}", l2_params);
+    println!("  L3 weights: {}", l3_params);
+    println!("  Total: {} ({:.2}M)", total_params, total_params as f64 / 1e6);
+}
+
+fn convert_pytorch_to_nknn(pytorch_path: str, output_path: str) {
+    println!("Converting PyTorch model to NKNN format");
+    println!("  Input: {}", pytorch_path);
+    println!("  Output: {}", output_path);
+
+    // Load PyTorch checkpoint
+    let checkpoint = tensor::load_pytorch(pytorch_path);
+    let state_dict = checkpoint.get("state_dict").unwrap();
+
+    // Extract weights
+    let ft_weight = state_dict.get("feature_transformer.weight").unwrap();
+    let ft_bias = state_dict.get("feature_transformer.bias").unwrap();
+    let l1_weight = state_dict.get("l1.weight").unwrap();
+    let l1_bias = state_dict.get("l1.bias").unwrap();
+    let l2_weight = state_dict.get("l2.weight").unwrap();
+    let l2_bias = state_dict.get("l2.bias").unwrap();
+    let out_weight = state_dict.get("output.weight").unwrap();
+    let out_bias = state_dict.get("output.bias").unwrap();
+
+    println!("  Feature transformer shape: {:?}", ft_weight.shape());
+    println!("  L1 shape: {:?}", l1_weight.shape());
+    println!("  L2 shape: {:?}", l2_weight.shape());
+
+    // Quantize weights
+    let ft_quant = quantize_weights(&ft_weight, 127);
+    let l1_quant = quantize_weights(&l1_weight, 64);
+    let l2_quant = quantize_weights(&l2_weight, 64);
+    let out_quant = quantize_weights(&out_weight, 127);
+
+    // Write NKNN file
+    let mut file = fs::File::create(output_path).unwrap();
+
+    // Header
+    file.write_u32_le(NNUE_MAGIC);
+    file.write_u32_le(1);  // version
+    file.write_padded_string("HalfKA", 16);
+    file.write_u32_le(HALFKA_FEATURES);
+    file.write_u32_le(L1_SIZE);
+    file.write_u32_le(L2_SIZE);
+    file.write_u32_le(L3_SIZE);
+    file.write_padded_string("int16", 8);
+
+    // Weights
+    file.write_i16_array(&ft_quant);
+    file.write_i16_array(&ft_bias.quantize(127));
+    file.write_i8_array(&l1_quant);
+    file.write_i32_array(&l1_bias.quantize(127 * 64));
+    file.write_i8_array(&l2_quant);
+    file.write_i32_array(&l2_bias.quantize(64 * 64));
+    file.write_i8_array(&out_quant);
+    file.write_i32_array(&out_bias.quantize(64 * 127));
+
+    println!("Conversion complete!");
+    println!("Output size: {} bytes", fs::metadata(output_path).unwrap().len());
+}
+
+fn quantize_weights(tensor: &Tensor, scale: i32) -> Vec<i16> {
+    tensor.data().iter()
+        .map(|x| (x * scale as f32).round().clamp(-32768.0, 32767.0) as i16)
+        .collect()
+}
+
+fn compare_models(model_a: str, model_b: str) {
+    println!("Comparing NNUE models:");
+    println!("  A: {}", model_a);
+    println!("  B: {}", model_b);
+    println!("─".repeat(50));
+
+    let header_a = read_nnue_header(model_a);
+    let header_b = read_nnue_header(model_b);
+
+    // Compare headers
+    if header_a.arch != header_b.arch {
+        println!("WARNING: Different architectures ({} vs {})", header_a.arch, header_b.arch);
+    }
+
+    if header_a.l1_size != header_b.l1_size {
+        println!("Different L1 sizes: {} vs {}", header_a.l1_size, header_b.l1_size);
+    }
+
+    // Load full models and compare weights
+    let data_a = fs::read(model_a).unwrap();
+    let data_b = fs::read(model_b).unwrap();
+
+    if data_a.len() != data_b.len() {
+        println!("Different file sizes: {} vs {} bytes", data_a.len(), data_b.len());
+    }
+
+    // Compare weight distributions
+    let header_size = 48;
+    let weights_a: Vec<i16> = data_a[header_size..].chunks(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let weights_b: Vec<i16> = data_b[header_size..].chunks(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+
+    let mut diff_sum = 0i64;
+    let mut max_diff = 0i16;
+    for (a, b) in weights_a.iter().zip(weights_b.iter()) {
+        let diff = (*a as i32 - *b as i32).abs();
+        diff_sum += diff as i64;
+        max_diff = max_diff.max(diff as i16);
+    }
+
+    let avg_diff = diff_sum as f64 / weights_a.len() as f64;
+
+    println!();
+    println!("Weight Comparison:");
+    println!("  Total weights: {}", weights_a.len());
+    println!("  Average difference: {:.4}", avg_diff);
+    println!("  Maximum difference: {}", max_diff);
+}
+
+fn optimize_model(input: str, output: str, target_size_kb: u32) {
+    println!("Optimizing model for size: {} -> {} KB", input, target_size_kb);
+
+    // This would implement weight pruning/quantization
+    // For now, just copy the file
+    let data = fs::read(input).unwrap();
+    fs::write(output, &data);
+
+    println!("Optimization complete (placeholder - full implementation uses weight pruning)");
+}
+
+pub fn main() {
+    let args = std::env::args();
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("analyze") => {
+            let path = args.get(2).expect("Model path required");
+            analyze_model(path);
+        }
+        Some("convert") => {
+            let input = args.get(2).expect("Input path required");
+            let output = args.get(3).expect("Output path required");
+            convert_pytorch_to_nknn(input, output);
+        }
+        Some("compare") => {
+            let a = args.get(2).expect("Model A path required");
+            let b = args.get(3).expect("Model B path required");
+            compare_models(a, b);
+        }
+        Some("optimize") => {
+            let input = args.get(2).expect("Input path required");
+            let output = args.get(3).expect("Output path required");
+            let size = args.get(4).map(|s| s.parse().unwrap_or(1024)).unwrap_or(1024);
+            optimize_model(input, output, size);
+        }
+        _ => {
+            println!("Usage:");
+            println!("  model_tools analyze <model.nknn>");
+            println!("  model_tools convert <pytorch.pt> <output.nknn>");
+            println!("  model_tools compare <model_a.nknn> <model_b.nknn>");
+            println!("  model_tools optimize <input.nknn> <output.nknn> [size_kb]");
+        }
+    }
+}

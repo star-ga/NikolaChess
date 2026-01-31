@@ -1,5 +1,5 @@
 // NikolaChess - SIMD-Optimized OCB Fortress Detection
-// Copyright (c) 2025 STARGA, Inc. All rights reserved.
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
 // PROPRIETARY AND CONFIDENTIAL
 // AVX2/AVX512 opposite-colored bishop fortress detection
 
