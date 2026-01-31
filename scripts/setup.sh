@@ -194,10 +194,7 @@ install_runtime() {
 
 # Main
 main() {
-    echo ""
-    echo -e "${BLUE}♔ NIKOLA CHESS${NC} · ${GREEN}Supercomputer Chess Engine${NC} · ${CYAN}100% MIND${NC}"
-    echo -e "Copyright (c) 2026 STARGA, Inc."
-    echo ""
+    echo -e "\n${BLUE}♔ NikolaChess${NC} - Supercomputer Chess Engine · Written 100% in Mind Lang\n"
 
     detect_platform
     detect_gpu
