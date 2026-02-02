@@ -91,7 +91,7 @@ jobs:
           path: runtime-build/*.dylib
 
   build-macos-x64:
-    runs-on: macos-13  # Intel runner
+    runs-on: macos-15-large  # Intel runner (x86_64)
     steps:
       - uses: actions/checkout@v4
 
