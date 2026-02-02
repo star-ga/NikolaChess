@@ -4,25 +4,56 @@
  *
  * MAXIMUM local protection - all known anti-debugging, anti-tampering,
  * anti-reversing, and anti-analysis techniques implemented.
- * Supports Linux (x64/arm64) and macOS (x64/arm64).
+ * Supports Linux (x64/arm64), macOS (x64/arm64), and Windows (x64).
  */
 
 #ifndef MIND_PROTECTION_H
 #define MIND_PROTECTION_H
 
-/* Must be before any includes */
-#define _GNU_SOURCE
+/* Platform detection */
+#if defined(_WIN32) || defined(_WIN64)
+    #define MIND_PLATFORM_WINDOWS 1
+#elif defined(__APPLE__)
+    #define MIND_PLATFORM_MACOS 1
+#elif defined(__linux__)
+    #define MIND_PLATFORM_LINUX 1
+#endif
+
+/* Must be before any includes on Unix */
+#if !defined(MIND_PLATFORM_WINDOWS)
+    #define _GNU_SOURCE
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+
+#ifdef MIND_PLATFORM_WINDOWS
+/* Windows includes */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winternl.h>
+#include <tlhelp32.h>
+#include <intrin.h>
+#pragma comment(lib, "ntdll.lib")
+
+/* Windows types */
+typedef HANDLE pthread_t;
+typedef int sig_atomic_t;
+#define sigjmp_buf jmp_buf
+#define sigsetjmp(env, save) setjmp(env)
+#define siglongjmp(env, val) longjmp(env, val)
+
+#else
+/* Unix includes */
 #include <time.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <errno.h>
+#endif
 
-#ifdef __linux__
+#ifdef MIND_PLATFORM_LINUX
 #include <stddef.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
@@ -44,10 +75,11 @@
 #include <pthread.h>
 #endif
 
-#ifdef __APPLE__
+#ifdef MIND_PLATFORM_MACOS
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/task.h>
@@ -111,16 +143,34 @@ static inline void _decode_str(const unsigned char *src, char *dst, size_t len) 
 static volatile int _protection_initialized = 0;
 static volatile uint64_t _code_checksum = 0;
 static volatile uint64_t _last_heartbeat = 0;
-static sigjmp_buf _trap_jmp;
-static volatile sig_atomic_t _trap_triggered = 0;
 static volatile uint64_t _stack_canary = 0;
 static volatile void* _text_base = NULL;
 static volatile size_t _text_size = 0;
-static pthread_t _monitor_thread = 0;
 static volatile int _monitor_running = 0;
 
 /* Polymorphic key - changes at runtime */
 static volatile uint32_t _poly_key = 0x5A5A5A5A;
+
+/* Platform-specific state */
+#ifdef MIND_PLATFORM_WINDOWS
+static HANDLE _monitor_thread = NULL;
+static volatile LONG _trap_triggered = 0;
+#else
+static sigjmp_buf _trap_jmp;
+static volatile sig_atomic_t _trap_triggered = 0;
+static pthread_t _monitor_thread = 0;
+#endif
+
+/* Compiler-specific attributes */
+#ifdef MIND_PLATFORM_WINDOWS
+#define MIND_NOINLINE __declspec(noinline)
+#define MIND_HIDDEN
+#define MIND_CONSTRUCTOR
+#else
+#define MIND_NOINLINE __attribute__((noinline))
+#define MIND_HIDDEN __attribute__((visibility("hidden")))
+#define MIND_CONSTRUCTOR __attribute__((constructor))
+#endif
 
 /*
  * LAYER 1: Anti-Debugging
@@ -839,8 +889,8 @@ static int _check_memory_permissions(void) {
 }
 
 /* 4c. Return address verification (simple CFI) */
-static __attribute__((noinline)) int _check_return_address(void) {
-#if defined(__x86_64__)
+static MIND_NOINLINE int _check_return_address(void) {
+#if defined(__x86_64__) && !defined(MIND_PLATFORM_WINDOWS)
     void *ret_addr = __builtin_return_address(0);
     Dl_info info;
 
@@ -868,6 +918,37 @@ static __attribute__((noinline)) int _check_return_address(void) {
 /*
  * LAYER 5: Background Monitoring Thread
  */
+
+#ifdef MIND_PLATFORM_WINDOWS
+static DWORD WINAPI _monitor_thread_func(LPVOID arg) {
+    (void)arg;
+
+    while (_monitor_running) {
+        /* Periodic integrity checks */
+        int threat = 0;
+
+        threat += _check_tracer_pid() ? 100 : 0;
+        threat += _check_execution_context() ? 100 : 0;
+
+        if (threat >= 100) {
+            ExitProcess(99);
+        }
+
+        /* Sleep 500ms between checks */
+        Sleep(500);
+    }
+
+    return 0;
+}
+
+static void _start_monitor_thread(void) {
+    if (_monitor_thread != NULL) return;
+
+    _monitor_running = 1;
+    _monitor_thread = CreateThread(NULL, 0, _monitor_thread_func, NULL, 0, NULL);
+}
+
+#else /* Unix */
 
 static void* _monitor_thread_func(void *arg) {
     (void)arg;
@@ -903,6 +984,8 @@ static void _start_monitor_thread(void) {
     pthread_create(&_monitor_thread, &attr, _monitor_thread_func, NULL);
     pthread_attr_destroy(&attr);
 }
+
+#endif /* MIND_PLATFORM_WINDOWS */
 
 /*
  * MASTER PROTECTION CHECK
@@ -955,17 +1038,69 @@ static int _protection_check_all(void) {
  * PUBLIC API
  */
 
-__attribute__((constructor, visibility("hidden")))
+/* Get monotonic time in nanoseconds */
+static uint64_t _get_monotonic_time(void) {
+#ifdef MIND_PLATFORM_WINDOWS
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)(counter.QuadPart * 1000000000ULL / freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+#endif
+}
+
+/* Get current process ID */
+static uint32_t _get_process_id(void) {
+#ifdef MIND_PLATFORM_WINDOWS
+    return (uint32_t)GetCurrentProcessId();
+#else
+    return (uint32_t)getpid();
+#endif
+}
+
+#ifdef MIND_PLATFORM_WINDOWS
+/* Windows DLL entry point for initialization */
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    (void)hinstDLL;
+    (void)lpvReserved;
+
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        if (_protection_initialized) return TRUE;
+
+        /* Randomize polymorphic key */
+        _poly_key = (uint32_t)(_get_monotonic_time() ^ _get_process_id());
+
+        /* Initial protection check */
+        int threat_score = _protection_check_all();
+
+        if (threat_score >= 100) {
+            ExitProcess(99);
+        } else if (threat_score >= 50) {
+            ExitProcess(99);
+        }
+
+        /* Start background monitoring thread */
+        _start_monitor_thread();
+
+        _protection_initialized = 1;
+    }
+    return TRUE;
+}
+
+#else /* Unix constructor */
+
+MIND_CONSTRUCTOR MIND_HIDDEN
 static void _protection_init(void) {
     if (_protection_initialized) return;
 
     /* Randomize polymorphic key */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    _poly_key = (uint32_t)(ts.tv_nsec ^ ts.tv_sec ^ getpid());
+    _poly_key = (uint32_t)(_get_monotonic_time() ^ _get_process_id());
 
     /* Store text section info for integrity monitoring */
-#ifdef __linux__
+#ifdef MIND_PLATFORM_LINUX
     Dl_info info;
     if (dladdr((void*)_protection_init, &info)) {
         _text_base = info.dli_fbase;
@@ -984,7 +1119,7 @@ static void _protection_init(void) {
     }
 #endif
 
-#ifdef __APPLE__
+#ifdef MIND_PLATFORM_MACOS
     /* Get Mach-O header for text section */
     const struct mach_header_64 *header = NULL;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -1022,11 +1157,11 @@ static void _protection_init(void) {
     _protection_initialized = 1;
 }
 
+#endif /* MIND_PLATFORM_WINDOWS */
+
 /* Heartbeat - call periodically during execution */
 static inline int mind_protection_heartbeat(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    uint64_t now = _get_monotonic_time();
 
     /* Rate limit checks to every 100ms */
     if (now - _last_heartbeat < 100000000ULL) {
