@@ -41,7 +41,7 @@ static const uint8_t _nikola_key_enc[32] = {
 static const uint8_t _nikola_key_xor = 0x1F;
 
 /* SipHash-2-4 implementation (must match runtime) */
-static inline uint64_t _nikola_rotl64(uint64_t x, int b) {
+static inline uint64_t _nikola_mind_rotl64(uint64_t x, int b) {
     return (x << b) | (x >> (64 - b));
 }
 
@@ -70,10 +70,10 @@ static uint64_t _nikola_siphash(const uint8_t *data, size_t len, const uint8_t k
                      ((uint64_t)data[6] << 48) | ((uint64_t)data[7] << 56);
         v3 ^= m;
         for (int i = 0; i < 2; i++) {
-            v0 += v1; v1 = _nikola_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_rotl64(v0, 32);
-            v2 += v3; v3 = _nikola_rotl64(v3, 16); v3 ^= v2;
-            v0 += v3; v3 = _nikola_rotl64(v3, 21); v3 ^= v0;
-            v2 += v1; v1 = _nikola_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_rotl64(v2, 32);
+            v0 += v1; v1 = _nikola_mind_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_mind_rotl64(v0, 32);
+            v2 += v3; v3 = _nikola_mind_rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = _nikola_mind_rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = _nikola_mind_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_mind_rotl64(v2, 32);
         }
         v0 ^= m;
     }
@@ -92,19 +92,19 @@ static uint64_t _nikola_siphash(const uint8_t *data, size_t len, const uint8_t k
 
     v3 ^= b;
     for (int i = 0; i < 2; i++) {
-        v0 += v1; v1 = _nikola_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_rotl64(v0, 32);
-        v2 += v3; v3 = _nikola_rotl64(v3, 16); v3 ^= v2;
-        v0 += v3; v3 = _nikola_rotl64(v3, 21); v3 ^= v0;
-        v2 += v1; v1 = _nikola_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_rotl64(v2, 32);
+        v0 += v1; v1 = _nikola_mind_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_mind_rotl64(v0, 32);
+        v2 += v3; v3 = _nikola_mind_rotl64(v3, 16); v3 ^= v2;
+        v0 += v3; v3 = _nikola_mind_rotl64(v3, 21); v3 ^= v0;
+        v2 += v1; v1 = _nikola_mind_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_mind_rotl64(v2, 32);
     }
     v0 ^= b;
     v2 ^= 0xff;
 
     for (int i = 0; i < 4; i++) {
-        v0 += v1; v1 = _nikola_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_rotl64(v0, 32);
-        v2 += v3; v3 = _nikola_rotl64(v3, 16); v3 ^= v2;
-        v0 += v3; v3 = _nikola_rotl64(v3, 21); v3 ^= v0;
-        v2 += v1; v1 = _nikola_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_rotl64(v2, 32);
+        v0 += v1; v1 = _nikola_mind_rotl64(v1, 13); v1 ^= v0; v0 = _nikola_mind_rotl64(v0, 32);
+        v2 += v3; v3 = _nikola_mind_rotl64(v3, 16); v3 ^= v2;
+        v0 += v3; v3 = _nikola_mind_rotl64(v3, 21); v3 ^= v0;
+        v2 += v1; v1 = _nikola_mind_rotl64(v1, 17); v1 ^= v2; v2 = _nikola_mind_rotl64(v2, 32);
     }
 
     return v0 ^ v1 ^ v2 ^ v3;
