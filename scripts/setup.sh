@@ -145,52 +145,49 @@ install_mindc() {
     success "MIND compiler installed to $INSTALL_DIR/mindc"
 }
 
-# Download encrypted NikolaChess runtime packages
+# Download runtime libraries for detected backends
 install_runtime() {
-    info "Installing NikolaChess runtime packages..."
+    info "Installing MIND runtime libraries..."
 
     LIB_DIR="$(dirname "$0")/../lib"
     mkdir -p "$LIB_DIR"
 
-    # Download encrypted packages (NOT raw mind-runtime)
-    NIKOLA_PKG_URL="https://nikolachess.com/downloads/v${RUNTIME_VERSION}/packages"
-
     for backend in $BACKENDS; do
         case "$backend" in
             cuda)
-                info "Downloading CUDA package..."
-                PKG_FILE="libnikola_cuda.so"
+                info "Downloading CUDA runtime..."
+                RUNTIME_FILE="libmind_cuda_${PLATFORM}.so"
                 ;;
             rocm)
-                info "Downloading ROCm package..."
-                PKG_FILE="libnikola_rocm.so"
+                info "Downloading ROCm runtime..."
+                RUNTIME_FILE="libmind_rocm_${PLATFORM}.so"
                 ;;
             metal)
-                info "Downloading Metal package..."
-                PKG_FILE="libnikola_metal.dylib"
+                info "Downloading Metal runtime..."
+                RUNTIME_FILE="libmind_metal_${PLATFORM}.dylib"
                 ;;
             webgpu)
-                info "Downloading WebGPU package..."
-                PKG_FILE="libnikola_webgpu.so"
-                [ "$OS" = "darwin" ] && PKG_FILE="libnikola_webgpu.dylib"
+                info "Downloading WebGPU runtime..."
+                RUNTIME_FILE="libmind_webgpu_${PLATFORM}.so"
+                [ "$OS" = "darwin" ] && RUNTIME_FILE="libmind_webgpu_${PLATFORM}.dylib"
                 ;;
             cpu)
-                info "Downloading CPU package..."
-                PKG_FILE="libnikola_cpu.so"
-                [ "$OS" = "darwin" ] && PKG_FILE="libnikola_cpu.dylib"
+                info "Downloading CPU runtime..."
+                RUNTIME_FILE="libmind_cpu_${PLATFORM}.so"
+                [ "$OS" = "darwin" ] && RUNTIME_FILE="libmind_cpu_${PLATFORM}.dylib"
                 ;;
         esac
 
-        DOWNLOAD_URL="${NIKOLA_PKG_URL}/${PKG_FILE}"
+        DOWNLOAD_URL="${RUNTIME_URL}/${RUNTIME_FILE}"
 
         if command -v curl &> /dev/null; then
-            curl -fsSL "$DOWNLOAD_URL" -o "$LIB_DIR/$PKG_FILE" 2>/dev/null || warn "Package not available: $backend"
+            curl -fsSL "$DOWNLOAD_URL" -o "$LIB_DIR/$RUNTIME_FILE" 2>/dev/null || warn "Runtime not available: $backend"
         elif command -v wget &> /dev/null; then
-            wget -q "$DOWNLOAD_URL" -O "$LIB_DIR/$PKG_FILE" 2>/dev/null || warn "Package not available: $backend"
+            wget -q "$DOWNLOAD_URL" -O "$LIB_DIR/$RUNTIME_FILE" 2>/dev/null || warn "Runtime not available: $backend"
         fi
 
-        if [ -f "$LIB_DIR/$PKG_FILE" ] && [ -s "$LIB_DIR/$PKG_FILE" ]; then
-            success "Installed: $PKG_FILE"
+        if [ -f "$LIB_DIR/$RUNTIME_FILE" ]; then
+            success "Installed: $RUNTIME_FILE"
         fi
     done
 }
