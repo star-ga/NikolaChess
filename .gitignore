@@ -54,3 +54,13 @@ Thumbs.db
 # Local config
 .env
 *.local
+
+# Runtime build sources (private - in nikolachess-source repo)
+runtime-build/protection.h
+runtime-build/runtime_cpu.c
+runtime-build/build_macos.sh
+runtime-build/build_windows.bat
+runtime-build/*.so
+runtime-build/*.dylib
+runtime-build/*.dll
+runtime-build/test_*

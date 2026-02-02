@@ -1,0 +1,17 @@
+# Private source files (in nikolachess-source repo)
+protection.h
+runtime_cpu.c
+build_macos.sh
+build_windows.bat
+
+# Compiled binaries
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+
+# Test files
+test_*
+*_test
+*_test.c
