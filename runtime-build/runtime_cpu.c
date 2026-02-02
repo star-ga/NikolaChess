@@ -8,7 +8,14 @@
 
 #include "protection.h"
 
-#ifdef __x86_64__
+#ifdef MIND_PLATFORM_WINDOWS
+#include <io.h>
+#define F_OK 0
+#define R_OK 4
+#define access _access
+#endif
+
+#if defined(__x86_64__) && !defined(MIND_PLATFORM_WINDOWS)
 #include <immintrin.h>
 #endif
 
@@ -19,14 +26,14 @@ int mind_cpu_init(void) {
         return -99;
     }
 
-    #ifdef __x86_64__
-    /* Verify AVX2 support */
+#if defined(__x86_64__) && !defined(MIND_PLATFORM_WINDOWS)
+    /* Verify AVX2 support (Unix only - uses inline asm) */
     unsigned int eax, ebx, ecx, edx;
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
     if (!(ebx & (1 << 5))) {
         /* AVX2 not supported - use scalar */
     }
-    #endif
+#endif
 
     return 0;
 }
@@ -66,7 +73,8 @@ int mind_runtime_execute(const char* entry_path, int argc, char** argv) {
     return 0;
 }
 
-/* Main entry for standalone execution */
+#ifndef MIND_PLATFORM_WINDOWS
+/* Main entry for standalone execution - Unix only */
 int main(int argc, char** argv) {
     const char* entry_path = NULL;
 
@@ -87,3 +95,4 @@ int main(int argc, char** argv) {
 
     return mind_runtime_execute(entry_path, argc, argv);
 }
+#endif
