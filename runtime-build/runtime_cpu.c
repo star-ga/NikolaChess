@@ -37,7 +37,11 @@ void mind_cpu_sync(void) {
 }
 
 /* Entry point - JIT compilation and execution */
+#ifdef MIND_PLATFORM_WINDOWS
+__declspec(dllexport)
+#else
 __attribute__((visibility("default")))
+#endif
 int mind_runtime_execute(const char* entry_path, int argc, char** argv) {
     (void)argc;
     (void)argv;

@@ -258,14 +258,16 @@ static int _check_hardware_breakpoints(void) {
 }
 
 /* 1d. SIGTRAP handler for breakpoint detection */
+#if !defined(MIND_PLATFORM_WINDOWS)
 static void _sigtrap_handler(int sig) {
     (void)sig;
     _trap_triggered = 1;
     siglongjmp(_trap_jmp, 1);
 }
+#endif
 
 static int _check_breakpoint_trap(void) {
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(MIND_PLATFORM_LINUX) || defined(MIND_PLATFORM_MACOS)
     struct sigaction sa, old_sa;
     sa.sa_handler = _sigtrap_handler;
     sigemptyset(&sa.sa_mask);
