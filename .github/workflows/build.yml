@@ -123,16 +123,17 @@ jobs:
         shell: bash
         run: |
           export PATH="$USERPROFILE/.nikolachess/bin:$PATH"
-          mindc --version
-          mindc-build --help | head -5
-          ls -la "$USERPROFILE/.nikolachess/lib/"
+          mindc --version || true
+          mindc-build --help 2>/dev/null | head -5 || true
+          ls -la "$USERPROFILE/.nikolachess/lib/" || true
 
       - name: Build CPU Version
         shell: bash
         run: |
           export PATH="$USERPROFILE/.nikolachess/bin:$PATH"
           export MIND_LIB_PATH="$USERPROFILE/.nikolachess/lib"
-          make release
+          # Run mindc-build directly (make can invoke via WSL on Windows)
+          bash "$USERPROFILE/.nikolachess/bin/mindc-build" --release --verbose
 
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
