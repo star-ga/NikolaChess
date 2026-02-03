@@ -227,16 +227,36 @@ cat >> "$LAUNCHER_SRC" << 'LAUNCHER_EOF'
 }
 LAUNCHER_EOF
 
-# Compile launcher
+# Compile launcher (or create script for Windows)
 CC="${CC:-cc}"
-if [[ "$OS" == "darwin" ]]; then
-    $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" $OPT_FLAGS 2>/dev/null
-else
-    $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" -ldl $OPT_FLAGS 2>/dev/null
-fi
-
-rm -f "$LAUNCHER_SRC"
-chmod +x "$OUTPUT_PATH"
+case "$OS" in
+    darwin)
+        $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" $OPT_FLAGS 2>/dev/null
+        rm -f "$LAUNCHER_SRC"
+        ;;
+    mingw*|msys*|cygwin*)
+        # Windows: try gcc first, fall back to batch launcher
+        OUTPUT_PATH="${OUTPUT_PATH}.exe"
+        if command -v gcc &>/dev/null; then
+            gcc "$LAUNCHER_SRC" -o "$OUTPUT_PATH" $OPT_FLAGS 2>/dev/null
+        fi
+        rm -f "$LAUNCHER_SRC"
+        # Create batch launcher as backup
+        cat > "${OUTPUT_PATH%.exe}.cmd" << BATCH_EOF
+@echo off
+setlocal
+set "MIND_LIB=%MIND_LIB_PATH%"
+if "%MIND_LIB%"=="" set "MIND_LIB=%USERPROFILE%\.nikolachess\lib"
+set "PATH=%MIND_LIB%;%PATH%"
+"%MIND_LIB%\nikola-runtime.exe" %*
+BATCH_EOF
+        ;;
+    *)
+        $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" -ldl $OPT_FLAGS 2>/dev/null
+        rm -f "$LAUNCHER_SRC"
+        ;;
+esac
+chmod +x "$OUTPUT_PATH" 2>/dev/null || true
 
 # Print result
 if [[ "$RELEASE_MODE" == "true" ]]; then
