@@ -149,8 +149,10 @@ fi
 OUTPUT_PATH="$BUILD_DIR/$OUTPUT_NAME"
 [[ "$VERBOSE" == "true" ]] && echo -e "  ${CYAN}Linking${NC} with runtime: $MIND_LIB_PATH"
 
-# Generate launcher binary
-LAUNCHER_SRC=$(mktemp --suffix=.c)
+# Generate launcher binary (portable mktemp)
+LAUNCHER_SRC=$(mktemp -t mindc_launcher_XXXXXX)
+mv "$LAUNCHER_SRC" "$LAUNCHER_SRC.c" 2>/dev/null || true
+LAUNCHER_SRC="$LAUNCHER_SRC.c"
 cat > "$LAUNCHER_SRC" << 'LAUNCHER_EOF'
 #include <stdio.h>
 #include <stdlib.h>
