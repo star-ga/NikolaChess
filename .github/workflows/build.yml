@@ -32,6 +32,7 @@ jobs:
         run: |
           export PATH="$HOME/.nikolachess/bin:$PATH"
           mindc --version
+          mindc-build --help | head -5
           ls -la $HOME/.nikolachess/lib/
 
       - name: Build CPU Version
@@ -61,6 +62,7 @@ jobs:
         run: |
           export PATH="$HOME/.nikolachess/bin:$PATH"
           mindc --version
+          mindc-build --help | head -5
           ls -la $HOME/.nikolachess/lib/
 
       - name: Build CPU Version
@@ -90,6 +92,7 @@ jobs:
         run: |
           export PATH="$HOME/.nikolachess/bin:$PATH"
           mindc --version
+          mindc-build --help | head -5
           ls -la $HOME/.nikolachess/lib/
 
       - name: Build CPU Version
@@ -117,17 +120,18 @@ jobs:
           echo "MIND_LIB_PATH=$env:USERPROFILE\.nikolachess\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify Installation
-        shell: pwsh
+        shell: bash
         run: |
-          $env:PATH = "$env:USERPROFILE\.nikolachess\bin;$env:PATH"
+          export PATH="$USERPROFILE/.nikolachess/bin:$PATH"
           mindc --version
-          Get-ChildItem "$env:USERPROFILE\.nikolachess\lib"
+          mindc-build --help | head -5
+          ls -la "$USERPROFILE/.nikolachess/lib/"
 
       - name: Build CPU Version
-        shell: pwsh
+        shell: bash
         run: |
-          $env:PATH = "$env:USERPROFILE\.nikolachess\bin;$env:PATH"
-          $env:MIND_LIB_PATH = "$env:USERPROFILE\.nikolachess\lib"
+          export PATH="$USERPROFILE/.nikolachess/bin:$PATH"
+          export MIND_LIB_PATH="$USERPROFILE/.nikolachess/lib"
           make release
 
       - name: Upload Windows Artifacts
