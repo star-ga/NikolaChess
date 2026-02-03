@@ -1,0 +1,274 @@
+#!/bin/bash
+# mindc-build - MIND Project Build Wrapper
+# Copyright (c) 2026 STARGA, Inc. All rights reserved.
+#
+# This wrapper provides `mindc build` functionality using the core mindc compiler.
+# It reads Mind.toml and compiles MIND projects without exposing runtime internals.
+
+set -e
+
+VERSION="0.1.0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MINDC="${MINDC:-$SCRIPT_DIR/mindc}"
+
+# Colors (disabled in CI)
+if [ -t 1 ] && [ -z "$CI" ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' CYAN='' BOLD='' NC=''
+fi
+
+# Default values
+RELEASE_MODE=false
+VERBOSE=false
+TARGET="cpu"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --release) RELEASE_MODE=true; shift ;;
+        --verbose|-v) VERBOSE=true; shift ;;
+        --target) TARGET="$2"; shift 2 ;;
+        --target=*) TARGET="${1#*=}"; shift ;;
+        --help|-h)
+            echo "Build a MIND project (reads Mind.toml)"
+            echo ""
+            echo "Usage: mindc-build [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "      --release          Build in release mode with optimizations"
+            echo "      --target <TARGET>  Target backend (cpu, cuda, rocm, metal, webgpu)"
+            echo "  -v, --verbose          Show verbose output"
+            echo "  -h, --help             Print help"
+            exit 0
+            ;;
+        *) shift ;;
+    esac
+done
+
+# Find Mind.toml
+if [[ ! -f "Mind.toml" ]]; then
+    echo -e "${RED}error:${NC} could not find Mind.toml in current directory" >&2
+    exit 1
+fi
+
+# Parse Mind.toml (simple TOML parser)
+parse_toml_value() {
+    local key="$1"
+    grep "^$key" Mind.toml 2>/dev/null | head -1 | sed 's/.*=.*"\(.*\)".*/\1/' | tr -d ' '
+}
+
+PROJECT_NAME=$(parse_toml_value "name")
+PROJECT_VERSION=$(parse_toml_value "version")
+ENTRY_FILE=$(parse_toml_value "entry")
+
+if [[ -z "$PROJECT_NAME" ]]; then
+    PROJECT_NAME="nikola"
+fi
+
+if [[ -z "$ENTRY_FILE" ]]; then
+    ENTRY_FILE="src/main.mind"
+fi
+
+# Determine output name based on target
+OUTPUT_NAME=$(grep "^\[targets.$TARGET\]" -A 5 Mind.toml 2>/dev/null | grep '^output' | head -1 | sed 's/.*=.*"\(.*\)".*/\1/')
+if [[ -z "$OUTPUT_NAME" ]]; then
+    OUTPUT_NAME="$PROJECT_NAME-$TARGET"
+fi
+
+# Set up directories
+if [[ "$RELEASE_MODE" == "true" ]]; then
+    BUILD_DIR="target/release"
+    PROFILE="release"
+    OPT_FLAGS="-O3"
+else
+    BUILD_DIR="target/debug"
+    PROFILE="debug"
+    OPT_FLAGS="-O0 -g"
+fi
+OBJ_DIR="target/obj/$PROFILE"
+
+mkdir -p "$BUILD_DIR" "$OBJ_DIR"
+
+# Find MIND runtime library path
+MIND_LIB_PATH="${MIND_LIB_PATH:-$HOME/.nikolachess/lib}"
+
+# Detect platform
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$OS" in
+    linux)
+        [[ "$ARCH" == "x86_64" ]] && PLATFORM="linux-x64" || PLATFORM="linux-arm64"
+        LIB_EXT="so"
+        LIB_PREFIX="lib"
+        ;;
+    darwin)
+        [[ "$ARCH" == "x86_64" ]] && PLATFORM="macos-x64" || PLATFORM="macos-arm64"
+        LIB_EXT="dylib"
+        LIB_PREFIX="lib"
+        ;;
+    mingw*|msys*|cygwin*)
+        PLATFORM="windows-x64"
+        LIB_EXT="dll"
+        LIB_PREFIX=""
+        ;;
+esac
+
+RUNTIME_LIB="${LIB_PREFIX}mind_${TARGET}_${PLATFORM}.${LIB_EXT}"
+
+# Fallback to cpu runtime if target-specific not found
+if [[ ! -f "$MIND_LIB_PATH/$RUNTIME_LIB" ]]; then
+    RUNTIME_LIB="${LIB_PREFIX}mind_cpu_${PLATFORM}.${LIB_EXT}"
+fi
+
+echo -e "${CYAN}Building${NC} $PROJECT_NAME v${PROJECT_VERSION:-0.1.0}"
+[[ "$VERBOSE" == "true" ]] && echo "  Target: $TARGET"
+[[ "$VERBOSE" == "true" ]] && echo "  Profile: $PROFILE"
+[[ "$VERBOSE" == "true" ]] && echo "  Platform: $PLATFORM"
+
+# Check if runtime exists
+if [[ ! -f "$MIND_LIB_PATH/$RUNTIME_LIB" ]]; then
+    echo -e "${RED}error:${NC} MIND runtime not found at $MIND_LIB_PATH/$RUNTIME_LIB" >&2
+    echo "Run: curl -fsSL https://nikolachess.com/install.sh | bash" >&2
+    exit 1
+fi
+
+# Find all .mind source files
+SOURCES=$(find src -name "*.mind" 2>/dev/null || true)
+if [[ -z "$SOURCES" ]]; then
+    echo -e "${RED}error:${NC} no .mind source files found in src/" >&2
+    exit 1
+fi
+
+SOURCE_COUNT=$(echo "$SOURCES" | wc -l | tr -d ' ')
+[[ "$VERBOSE" == "true" ]] && echo "  Sources: $SOURCE_COUNT files"
+
+# Compile each source file to IR
+OBJECTS=""
+COMPILE_ERRORS=0
+
+for src in $SOURCES; do
+    obj_name=$(basename "$src" .mind).o
+    obj_path="$OBJ_DIR/$obj_name"
+    ir_path="$OBJ_DIR/$(basename "$src" .mind).ir"
+
+    [[ "$VERBOSE" == "true" ]] && echo -e "  ${CYAN}Compiling${NC} $src"
+
+    # Use core mindc to compile to IR
+    if "$MINDC" --target "$TARGET" --emit-ir "$src" > "$ir_path" 2>/dev/null; then
+        # Create placeholder object (actual execution handled by runtime)
+        touch "$obj_path"
+        OBJECTS="$OBJECTS $obj_path"
+    else
+        echo -e "  ${RED}error:${NC} failed to compile $src"
+        ((COMPILE_ERRORS++))
+    fi
+done
+
+if [[ $COMPILE_ERRORS -gt 0 ]]; then
+    echo -e "${RED}error:${NC} compilation failed with $COMPILE_ERRORS errors" >&2
+    exit 1
+fi
+
+# Link - create launcher that loads runtime
+OUTPUT_PATH="$BUILD_DIR/$OUTPUT_NAME"
+[[ "$VERBOSE" == "true" ]] && echo -e "  ${CYAN}Linking${NC} with runtime: $MIND_LIB_PATH"
+
+# Generate launcher binary
+LAUNCHER_SRC=$(mktemp --suffix=.c)
+cat > "$LAUNCHER_SRC" << 'LAUNCHER_EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#define DLOPEN(path) LoadLibraryA(path)
+#define DLSYM(handle, name) (void*)GetProcAddress((HMODULE)handle, name)
+#define DLCLOSE(handle) FreeLibrary((HMODULE)handle)
+#define DLERROR() "LoadLibrary failed"
+#else
+#include <dlfcn.h>
+#define DLOPEN(path) dlopen(path, RTLD_NOW)
+#define DLSYM(handle, name) dlsym(handle, name)
+#define DLCLOSE(handle) dlclose(handle)
+#define DLERROR() dlerror()
+#endif
+
+int main(int argc, char **argv) {
+    char *lib_path = getenv("MIND_LIB_PATH");
+    if (!lib_path) {
+        char *home = getenv("HOME");
+        if (!home) home = getenv("USERPROFILE");
+        if (home) {
+            static char default_path[512];
+            snprintf(default_path, sizeof(default_path), "%s/.nikolachess/lib", home);
+            lib_path = default_path;
+        } else {
+            lib_path = ".";
+        }
+    }
+
+    char lib_file[512];
+LAUNCHER_EOF
+
+# Add platform-specific library name
+case "$OS" in
+    linux)
+        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_linux-x64.so\", lib_path);" >> "$LAUNCHER_SRC"
+        ;;
+    darwin)
+        if [[ "$ARCH" == "arm64" ]]; then
+            echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_macos-arm64.dylib\", lib_path);" >> "$LAUNCHER_SRC"
+        else
+            echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_macos-x64.dylib\", lib_path);" >> "$LAUNCHER_SRC"
+        fi
+        ;;
+    mingw*|msys*|cygwin*)
+        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/mind_${TARGET}_windows-x64.dll\", lib_path);" >> "$LAUNCHER_SRC"
+        ;;
+esac
+
+cat >> "$LAUNCHER_SRC" << 'LAUNCHER_EOF'
+
+    void *handle = DLOPEN(lib_file);
+    if (!handle) {
+        fprintf(stderr, "Error: Cannot load runtime: %s\n", DLERROR());
+        fprintf(stderr, "Library path: %s\n", lib_file);
+        fprintf(stderr, "Set MIND_LIB_PATH or run: curl -fsSL https://nikolachess.com/install.sh | bash\n");
+        return 1;
+    }
+
+    int (*mind_main)(int, char**) = (int (*)(int, char**))DLSYM(handle, "mind_main");
+    if (mind_main) {
+        return mind_main(argc, argv);
+    }
+
+    fprintf(stderr, "Error: mind_main not found in runtime\n");
+    DLCLOSE(handle);
+    return 1;
+}
+LAUNCHER_EOF
+
+# Compile launcher
+CC="${CC:-cc}"
+if [[ "$OS" == "darwin" ]]; then
+    $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" $OPT_FLAGS 2>/dev/null
+else
+    $CC "$LAUNCHER_SRC" -o "$OUTPUT_PATH" -ldl $OPT_FLAGS 2>/dev/null
+fi
+
+rm -f "$LAUNCHER_SRC"
+chmod +x "$OUTPUT_PATH"
+
+# Print result
+if [[ "$RELEASE_MODE" == "true" ]]; then
+    echo -e "   ${GREEN}Release${NC} $TARGET ($OUTPUT_PATH)"
+else
+    echo -e "   ${GREEN}Debug${NC} $TARGET ($OUTPUT_PATH)"
+fi

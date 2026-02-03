@@ -33,64 +33,64 @@ setup:
 
 release:
 	@echo "Building NikolaChess (release)..."
-	mindc build --release --verbose
+	mindc-build --release --verbose
 
 debug:
 	@echo "Building NikolaChess (debug)..."
-	mindc build --verbose
+	mindc-build --verbose
 
 # CPU Targets
 cpu:
 	@echo "Building NikolaChess (CPU AVX-512)..."
-	mindc build --release --target cpu --verbose
+	mindc-build --release --target cpu --verbose
 
 cpu-avx2:
 	@echo "Building NikolaChess (CPU AVX2)..."
-	mindc build --release --target cpu-avx2 --verbose
+	mindc-build --release --target cpu-avx2 --verbose
 
 # NVIDIA CUDA Targets
 cuda:
 	@echo "Building NikolaChess (CUDA - RTX 40 series)..."
-	mindc build --release --target cuda --verbose
+	mindc-build --release --target cuda --verbose
 
 cuda-ampere:
 	@echo "Building NikolaChess (CUDA - RTX 30/A100)..."
-	mindc build --release --target cuda-ampere --verbose
+	mindc-build --release --target cuda-ampere --verbose
 
 cuda-hopper:
 	@echo "Building NikolaChess (CUDA - H100)..."
-	mindc build --release --target cuda-hopper --verbose
+	mindc-build --release --target cuda-hopper --verbose
 
 cuda-blackwell:
 	@echo "Building NikolaChess (CUDA - Blackwell B200/B300)..."
-	mindc build --release --target cuda-blackwell --verbose
+	mindc-build --release --target cuda-blackwell --verbose
 
 cuda-rubin:
 	@echo "Building NikolaChess (CUDA - Vera Rubin)..."
-	mindc build --release --target cuda-rubin --verbose
+	mindc-build --release --target cuda-rubin --verbose
 
 # AMD ROCm Targets
 rocm:
 	@echo "Building NikolaChess (ROCm - RX 7900)..."
-	mindc build --release --target rocm --verbose
+	mindc-build --release --target rocm --verbose
 
 rocm-mi300:
 	@echo "Building NikolaChess (ROCm - MI300X)..."
-	mindc build --release --target rocm-mi300 --verbose
+	mindc-build --release --target rocm-mi300 --verbose
 
 # Apple Metal Targets
 metal:
 	@echo "Building NikolaChess (Metal - Apple M3)..."
-	mindc build --release --target metal --verbose
+	mindc-build --release --target metal --verbose
 
 metal-m4:
 	@echo "Building NikolaChess (Metal - Apple M4)..."
-	mindc build --release --target metal-m4 --verbose
+	mindc-build --release --target metal-m4 --verbose
 
 # WebGPU Target (Browser/Cross-platform)
 webgpu:
 	@echo "Building NikolaChess (WebGPU)..."
-	mindc build --release --target webgpu --verbose
+	mindc-build --release --target webgpu --verbose
 
 # Build all backends
 all-backends: cpu cuda rocm metal webgpu
