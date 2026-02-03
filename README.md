@@ -120,7 +120,7 @@ on(gpu0) {
 
 | Spec | Limit |
 |------|-------|
-| Tablebase Coverage | 7-man DTZ (140GB) / 8-man WDL (16TB) |
+| Tablebase Coverage | 7-man DTZ/WDL (16.7TB) / 8-man WDL (1.6PB) |
 | Max Threads | 8,192 |
 | Max GPUs | 1,024 |
 | Max Cluster Nodes | 256 |
@@ -240,19 +240,43 @@ NikolaChess/
 
 ---
 
-## Downloads
+## Installation
 
-### Pre-built Binaries
+### Quick Install (Recommended)
 
-Download from [Releases](https://github.com/star-ga/NikolaChess/releases):
+**Linux / macOS:**
+```bash
+curl -fsSL https://nikolachess.com/install.sh | bash
+```
 
-| Platform | CUDA | CPU-only |
-|----------|------|----------|
-| **Linux x64** | `nikola-cuda` | `nikola-cpu` |
-| **macOS x64** | - | `nikola-cpu-x64` |
-| **macOS ARM64** | - | `nikola-cpu-arm64` |
-| **macOS Universal** | - | `nikola-cpu-universal` |
-| **Windows x64** | `nikola-cuda.exe` | `nikola-cpu.exe` |
+**Windows (PowerShell):**
+```powershell
+irm https://nikolachess.com/install.ps1 | iex
+```
+
+**Manual:**
+```bash
+git clone https://github.com/star-ga/NikolaChess && cd NikolaChess && make setup
+```
+
+### Downloads
+
+#### Pre-built Binaries
+
+Download from [Releases](https://github.com/star-ga/NikolaChess/releases) or [nikolachess.com/downloads](https://nikolachess.com/downloads):
+
+#### Runtime Libraries
+
+| Platform | CPU | CUDA | ROCm | Metal | oneAPI | WebGPU |
+|----------|-----|------|------|-------|--------|--------|
+| **Linux x64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
+| **Linux ARM64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
+| **macOS x64** | ✓ | - | - | ✓ | - | ✓ |
+| **macOS ARM64** | ✓ | - | - | ✓ | - | ✓ |
+| **Windows x64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
+| **Windows ARM64** | ✓ | - | - | - | - | ✓ |
+
+All runtime libraries available at [nikolachess.com/downloads](https://nikolachess.com/downloads)
 
 ---
 
