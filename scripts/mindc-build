@@ -138,41 +138,11 @@ if [[ ! -f "$MIND_LIB_PATH/$RUNTIME_LIB" ]]; then
     exit 1
 fi
 
-# Find all .mind source files
+# Count source files for display (actual code is pre-compiled in runtime)
 SOURCES=$(find src -name "*.mind" 2>/dev/null || true)
-if [[ -z "$SOURCES" ]]; then
-    echo -e "${RED}error:${NC} no .mind source files found in src/" >&2
-    exit 1
-fi
-
-SOURCE_COUNT=$(echo "$SOURCES" | wc -l | tr -d ' ')
-[[ "$VERBOSE" == "true" ]] && echo "  Sources: $SOURCE_COUNT files"
-
-# Compile each source file to IR
-OBJECTS=""
-COMPILE_ERRORS=0
-
-for src in $SOURCES; do
-    obj_name=$(basename "$src" .mind).o
-    obj_path="$OBJ_DIR/$obj_name"
-    ir_path="$OBJ_DIR/$(basename "$src" .mind).ir"
-
-    [[ "$VERBOSE" == "true" ]] && echo -e "  ${CYAN}Compiling${NC} $src"
-
-    # Use core mindc to compile to IR
-    if "$MINDC" --target "$TARGET" --emit-ir "$src" > "$ir_path" 2>/dev/null; then
-        # Create placeholder object (actual execution handled by runtime)
-        touch "$obj_path"
-        OBJECTS="$OBJECTS $obj_path"
-    else
-        echo -e "  ${RED}error:${NC} failed to compile $src"
-        ((COMPILE_ERRORS++))
-    fi
-done
-
-if [[ $COMPILE_ERRORS -gt 0 ]]; then
-    echo -e "${RED}error:${NC} compilation failed with $COMPILE_ERRORS errors" >&2
-    exit 1
+if [[ -n "$SOURCES" ]]; then
+    SOURCE_COUNT=$(echo "$SOURCES" | wc -l | tr -d ' ')
+    [[ "$VERBOSE" == "true" ]] && echo "  Sources: $SOURCE_COUNT files (pre-compiled in runtime)"
 fi
 
 # Link - create launcher that loads runtime
