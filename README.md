@@ -267,14 +267,14 @@ Download from [Releases](https://github.com/star-ga/NikolaChess/releases) or [ni
 
 #### Runtime Libraries
 
-| Platform | CPU | CUDA | ROCm | Metal | oneAPI | WebGPU |
-|----------|-----|------|------|-------|--------|--------|
-| **Linux x64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
-| **Linux ARM64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
-| **macOS x64** | ✓ | - | - | ✓ | - | ✓ |
-| **macOS ARM64** | ✓ | - | - | ✓ | - | ✓ |
-| **Windows x64** | ✓ | ✓ | ✓ | - | ✓ | ✓ |
-| **Windows ARM64** | ✓ | - | - | - | - | ✓ |
+| Platform | CPU | CUDA | ROCm | Metal | DirectX | oneAPI | WebGPU |
+|----------|-----|------|------|-------|---------|--------|--------|
+| **Linux x64** | ✓ | ✓ | ✓ | - | - | ✓ | ✓ |
+| **Linux ARM64** | ✓ | ✓ | ✓ | - | - | ✓ | ✓ |
+| **macOS x64** | ✓ | - | - | ✓ | - | - | ✓ |
+| **macOS ARM64** | ✓ | - | - | ✓ | - | - | ✓ |
+| **Windows x64** | ✓ | ✓ | ✓ | - | ✓ | ✓ | ✓ |
+| **Windows ARM64** | ✓ | - | - | - | ✓ | - | ✓ |
 
 All runtime libraries available at [nikolachess.com/downloads](https://nikolachess.com/downloads)
 

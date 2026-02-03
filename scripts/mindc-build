@@ -189,20 +189,16 @@ int main(int argc, char **argv) {
     char lib_file[512];
 LAUNCHER_EOF
 
-# Add platform-specific library name
+# Add platform-specific library name (use detected PLATFORM variable)
 case "$OS" in
     linux)
-        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_linux-x64.so\", lib_path);" >> "$LAUNCHER_SRC"
+        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_${PLATFORM}.so\", lib_path);" >> "$LAUNCHER_SRC"
         ;;
     darwin)
-        if [[ "$ARCH" == "arm64" ]]; then
-            echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_macos-arm64.dylib\", lib_path);" >> "$LAUNCHER_SRC"
-        else
-            echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_macos-x64.dylib\", lib_path);" >> "$LAUNCHER_SRC"
-        fi
+        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/libmind_${TARGET}_${PLATFORM}.dylib\", lib_path);" >> "$LAUNCHER_SRC"
         ;;
     mingw*|msys*|cygwin*)
-        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/mind_${TARGET}_windows-x64.dll\", lib_path);" >> "$LAUNCHER_SRC"
+        echo "    snprintf(lib_file, sizeof(lib_file), \"%s/mind_${TARGET}_${PLATFORM}.dll\", lib_path);" >> "$LAUNCHER_SRC"
         ;;
 esac
 
