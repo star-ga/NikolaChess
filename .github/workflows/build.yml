@@ -12,42 +12,126 @@ on:
     types: [created]
   workflow_dispatch:
 
+env:
+  NIKOLACHESS_VERSION: "0.1.0"
+
 jobs:
-  validate:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate Project Structure
+      - name: Install NikolaChess (MIND Compiler + Runtime)
         run: |
-          echo "Validating NikolaChess project structure..."
+          curl -fsSL https://nikolachess.com/install.sh | bash
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
+          echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.nikolachess/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-          # Check required files exist
-          test -f "src/main.mind" || test -f "src/lib.mind" || echo "Note: Main source files will be added"
-          test -f "runtime-build/nikola_auth.h" && echo "✓ Auth header present"
-          test -f "Makefile" || test -f "build.mind" || echo "Note: Build config will be added"
-
-          echo "✓ Project structure validated"
-
-      - name: Check Runtime Auth Header
+      - name: Verify Installation
         run: |
-          if [ -f "runtime-build/nikola_auth.h" ]; then
-            echo "✓ nikola_auth.h found"
-            head -20 runtime-build/nikola_auth.h
-          else
-            echo "⚠ nikola_auth.h not found"
-          fi
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          mindc --version
+          ls -la $HOME/.nikolachess/lib/
 
-  # Full build jobs - enabled when MIND compiler is available
-  # Uncomment when mindlang.dev/install.sh is live
-  #
-  # build-linux:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Install MIND Compiler
-  #       run: |
-  #         curl -sSL https://mindlang.dev/install.sh | bash
-  #         echo "$HOME/.mind/bin" >> $GITHUB_PATH
-  #     - name: Build
-  #       run: mindc build --release
+      - name: Build CPU Version
+        run: |
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          export MIND_LIB_PATH="$HOME/.nikolachess/lib"
+          make release
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-cpu
+          path: target/release/nikola-cpu
+
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NikolaChess (MIND Compiler + Runtime)
+        run: |
+          curl -fsSL https://nikolachess.com/install.sh | bash
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
+          echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
+
+      - name: Verify Installation
+        run: |
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          mindc --version
+          ls -la $HOME/.nikolachess/lib/
+
+      - name: Build CPU Version
+        run: |
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          export MIND_LIB_PATH="$HOME/.nikolachess/lib"
+          make release
+
+      - name: Upload macOS ARM64 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-cpu
+          path: target/release/nikola-cpu
+
+  build-macos-x64:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NikolaChess (MIND Compiler + Runtime)
+        run: |
+          curl -fsSL https://nikolachess.com/install.sh | bash
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
+          echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
+
+      - name: Verify Installation
+        run: |
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          mindc --version
+          ls -la $HOME/.nikolachess/lib/
+
+      - name: Build CPU Version
+        run: |
+          export PATH="$HOME/.nikolachess/bin:$PATH"
+          export MIND_LIB_PATH="$HOME/.nikolachess/lib"
+          make release
+
+      - name: Upload macOS x64 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64-cpu
+          path: target/release/nikola-cpu
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NikolaChess (MIND Compiler + Runtime)
+        shell: pwsh
+        run: |
+          irm https://nikolachess.com/install.ps1 | iex
+          echo "$env:USERPROFILE\.nikolachess\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "MIND_LIB_PATH=$env:USERPROFILE\.nikolachess\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify Installation
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\.nikolachess\bin;$env:PATH"
+          mindc --version
+          Get-ChildItem "$env:USERPROFILE\.nikolachess\lib"
+
+      - name: Build CPU Version
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\.nikolachess\bin;$env:PATH"
+          $env:MIND_LIB_PATH = "$env:USERPROFILE\.nikolachess\lib"
+          make release
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-cpu
+          path: target/release/nikola-cpu.exe
