@@ -115,6 +115,20 @@ runtime = { version = "1.0", features = ["tensor", "cuda", "rocm", "metal", "web
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
+panic = "abort"
+debug = false
+overflow-checks = false
+
+# Maximum Protection Options
+[profile.release.protection]
+obfuscate = true
+control-flow-flatten = true
+opaque-predicates = true
+string-encrypt = true
+anti-debug = true
+integrity-check = true
+symbol-mangle = true
 
 [profile.dev]
 opt-level = 0
