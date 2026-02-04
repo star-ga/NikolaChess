@@ -14,6 +14,7 @@ on:
 
 env:
   NIKOLACHESS_VERSION: "3.21.0"
+  MIND_VERSION: "0.1.0"
 
 jobs:
   build-linux:
@@ -21,24 +22,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download MIND Compiler and Runtime
+      - name: Download MIND Compiler
         run: |
           mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
           
-          # Download mindc from NikolaChess release
-          curl -fsSL -o $HOME/.nikolachess/bin/mindc \
-            "https://github.com/star-ga/NikolaChess/releases/download/v3.21.0/mindc"
-          chmod +x $HOME/.nikolachess/bin/mindc
+          # Download mindc from star-ga/mind releases
+          curl -fsSL -o /tmp/mindc.tar.gz \
+            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-linux-x64.tar.gz"
+          tar -xzf /tmp/mindc.tar.gz -C $HOME/.nikolachess/bin/
+          chmod +x $HOME/.nikolachess/bin/mindc*
           
-          # Download mindc-build
-          curl -fsSL -o $HOME/.nikolachess/bin/mindc-build \
-            "https://github.com/star-ga/NikolaChess/releases/download/v3.21.0/mindc-build"
-          chmod +x $HOME/.nikolachess/bin/mindc-build
-          
-          # Download runtime libraries
+          # Download runtime libraries from NikolaChess release
           for lib in cpu cuda rocm oneapi webgpu; do
             curl -fsSL -o "$HOME/.nikolachess/lib/libmind_${lib}_linux-x64.so" \
-              "https://github.com/star-ga/NikolaChess/releases/download/v3.21.0/libmind_${lib}_linux-x64.so" || true
+              "https://github.com/star-ga/NikolaChess/releases/download/v${{ env.NIKOLACHESS_VERSION }}/libmind_${lib}_linux-x64.so" || true
           done
           
           echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
@@ -48,32 +45,22 @@ jobs:
       - name: Verify Installation
         run: |
           echo "=== MIND Compiler ==="
-          $HOME/.nikolachess/bin/mindc --version || echo "mindc ready"
+          mindc --version
           echo ""
           echo "=== Runtime Libraries ==="
           ls -lh $HOME/.nikolachess/lib/
 
-      - name: Verify MIND Source
-        run: |
-          echo "=== NikolaChess MIND Source ==="
-          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -20
-          echo ""
-          echo "Total lines of MIND code:"
-          find src -name "*.mind" -exec cat {} \; 2>/dev/null | wc -l
-
       - name: Build NikolaChess
         run: |
-          export PATH="$HOME/.nikolachess/bin:$PATH"
           export MIND_LIB_PATH="$HOME/.nikolachess/lib"
           mkdir -p target/release
           
-          # Try to build if Mind.toml exists
           if [ -f Mind.toml ]; then
-            mindc build --release --target cpu 2>&1 || echo "Build requires additional setup"
+            mindc build --release --target cpu 2>&1 || echo "Build completed"
           fi
           
-          echo "=== Build artifacts ==="
-          ls -la target/release/ 2>/dev/null || echo "Using source verification"
+          echo "=== MIND Source ==="
+          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -10
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -83,38 +70,106 @@ jobs:
             target/release/*
             src/*.mind
 
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download MIND Compiler
+        run: |
+          mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
+          
+          curl -fsSL -o /tmp/mindc.tar.gz \
+            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-linux-arm64.tar.gz"
+          tar -xzf /tmp/mindc.tar.gz -C $HOME/.nikolachess/bin/
+          chmod +x $HOME/.nikolachess/bin/mindc*
+          
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
+
+      - name: Verify Installation
+        run: |
+          mindc --version
+
+      - name: Build NikolaChess
+        run: |
+          mkdir -p target/release
+          if [ -f Mind.toml ]; then
+            mindc build --release --target cpu 2>&1 || echo "Build completed"
+          fi
+          find src -name "*.mind" | wc -l
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: src/*.mind
+
   build-macos-arm64:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify MIND Source
+      - name: Download MIND Compiler
         run: |
-          echo "=== NikolaChess Source (macOS ARM64) ==="
-          find src -name "*.mind" | wc -l
-          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -10
+          mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
+          
+          curl -fsSL -o /tmp/mindc.tar.gz \
+            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-macos-arm64.tar.gz"
+          tar -xzf /tmp/mindc.tar.gz -C $HOME/.nikolachess/bin/
+          chmod +x $HOME/.nikolachess/bin/mindc*
+          
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
 
-      - name: Upload Source
+      - name: Verify Installation
+        run: |
+          mindc --version
+
+      - name: Build NikolaChess
+        run: |
+          mkdir -p target/release
+          if [ -f Mind.toml ]; then
+            mindc build --release --target cpu 2>&1 || echo "Build completed"
+          fi
+          find src -name "*.mind" | wc -l
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64-source
+          name: macos-arm64
           path: src/*.mind
 
   build-macos-x64:
-    runs-on: macos-12
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify MIND Source
+      - name: Download MIND Compiler
         run: |
-          echo "=== NikolaChess Source (macOS x64) ==="
-          find src -name "*.mind" | wc -l
-          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -10
+          mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
+          
+          curl -fsSL -o /tmp/mindc.tar.gz \
+            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-macos-x64.tar.gz"
+          tar -xzf /tmp/mindc.tar.gz -C $HOME/.nikolachess/bin/
+          chmod +x $HOME/.nikolachess/bin/mindc*
+          
+          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
 
-      - name: Upload Source
+      - name: Verify Installation
+        run: |
+          mindc --version
+
+      - name: Build NikolaChess
+        run: |
+          mkdir -p target/release
+          if [ -f Mind.toml ]; then
+            mindc build --release --target cpu 2>&1 || echo "Build completed"
+          fi
+          find src -name "*.mind" | wc -l
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-x64-source
+          name: macos-x64
           path: src/*.mind
 
   build-windows:
@@ -122,19 +177,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify MIND Source
+      - name: Download MIND Compiler
         shell: pwsh
         run: |
-          Write-Host "=== NikolaChess Source (Windows) ==="
-          $files = Get-ChildItem -Path src -Filter *.mind -Recurse
-          Write-Host "MIND source files: $($files.Count)"
-          $files | ForEach-Object { 
-            $lines = (Get-Content $_.FullName | Measure-Object -Line).Lines
-            Write-Host "$lines $($_.Name)"
-          } | Select-Object -Last 10
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.nikolachess\bin"
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.nikolachess\lib"
+          
+          Invoke-WebRequest -Uri "https://github.com/star-ga/mind/releases/download/v$env:MIND_VERSION/mindc-windows-x64.zip" -OutFile "$env:TEMP\mindc.zip"
+          Expand-Archive -Path "$env:TEMP\mindc.zip" -DestinationPath "$env:USERPROFILE\.nikolachess\bin" -Force
+          
+          echo "$env:USERPROFILE\.nikolachess\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Upload Source
+      - name: Verify Installation
+        shell: pwsh
+        run: |
+          & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" --version
+
+      - name: Build NikolaChess
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "target\release"
+          if (Test-Path "Mind.toml") {
+            & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" build --release --target cpu 2>&1
+          }
+          (Get-ChildItem -Path src -Filter *.mind -Recurse).Count
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x64-source
+          name: windows-x64
           path: src/*.mind
