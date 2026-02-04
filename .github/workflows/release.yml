@@ -111,8 +111,8 @@ jobs:
           git clone --depth 1 https://github.com/star-ga/mind.git /tmp/mind-compiler
           cd /tmp/mind-compiler
 
-          # Build with mlir-lowering feature for --emit-obj support
-          cargo build --release --features mlir-lowering
+          # Build with all required features for --emit-obj support
+          cargo build --release --features mlir-build,mlir-lowering,autodiff
 
           mkdir -p $HOME/.mind/bin
           cp target/release/mindc $HOME/.mind/bin/
@@ -130,8 +130,8 @@ jobs:
           git clone --depth 1 https://github.com/star-ga/mind.git $env:TEMP\mind-compiler
           Set-Location $env:TEMP\mind-compiler
 
-          # Build with mlir-lowering feature for --emit-obj support
-          cargo build --release --features mlir-lowering
+          # Build with all required features for --emit-obj support
+          cargo build --release --features mlir-build,mlir-lowering,autodiff
 
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.mind\bin"
           Copy-Item target\release\mindc.exe "$env:USERPROFILE\.mind\bin\"
