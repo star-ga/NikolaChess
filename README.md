@@ -1,6 +1,12 @@
 # NikolaChess
 
-**Supercomputer Chess Engine Written 100% in MIND**
+[![Build](https://github.com/star-ga/NikolaChess/actions/workflows/build.yml/badge.svg)](https://github.com/star-ga/NikolaChess/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/star-ga/NikolaChess?include_prereleases)](https://github.com/star-ga/NikolaChess/releases)
+[![License](https://img.shields.io/badge/license-Proprietary-red.svg)](LICENSE)
+[![MIND Language](https://img.shields.io/badge/language-MIND-blue.svg)](https://mindlang.dev)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+
+**Supercomputer-Class Chess Engine Written 100% in MIND**
 
 Copyright (c) 2026 STARGA, Inc. All rights reserved.
 
