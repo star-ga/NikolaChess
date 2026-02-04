@@ -22,7 +22,7 @@ permissions:
 
 env:
   NIKOLACHESS_VERSION: "3.21.0"
-  MIND_VERSION: "0.1.4"
+  MIND_VERSION: "0.1.7"
 
 jobs:
   # ==========================================================================
