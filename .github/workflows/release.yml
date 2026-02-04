@@ -81,15 +81,24 @@ jobs:
       - name: Install LLVM/MLIR (Linux)
         if: runner.os == 'Linux'
         run: |
+          # Install LLVM 18 with ALL MLIR components including arith dialect
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
           sudo apt-get update
-          sudo apt-get install -y llvm-18 mlir-18-tools
+          sudo apt-get install -y llvm-18-dev mlir-18-tools libmlir-18-dev clang-18
           echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+          # Set MLIR_DIR for cmake builds
+          echo "MLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir" >> $GITHUB_ENV
 
       - name: Install LLVM/MLIR (macOS)
         if: runner.os == 'macOS'
         run: |
+          # Install LLVM 18 with all MLIR dialects
           brew install llvm@18
-          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+          LLVM_PREFIX=$(brew --prefix llvm@18)
+          echo "${LLVM_PREFIX}/bin" >> $GITHUB_PATH
+          echo "MLIR_DIR=${LLVM_PREFIX}/lib/cmake/mlir" >> $GITHUB_ENV
+          echo "LLVM_DIR=${LLVM_PREFIX}/lib/cmake/llvm" >> $GITHUB_ENV
 
       - name: Install LLVM/MLIR (Windows)
         if: runner.os == 'Windows'
