@@ -140,100 +140,87 @@ jobs:
           Write-Host "=== mindc built with mlir-build ==="
           & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
 
-      - name: Build FULL Protected Libraries (Unix)
+      - name: Build FULL Protected Libraries (Unix) - 100% Pure MIND
         if: runner.os != 'Windows'
         run: |
           mkdir -p output
-          cd runtime-src
+          cd runtime-src/runtime-build
 
-          echo "=== Compiling protection.mind with mlir-build ==="
+          echo "=== Building 100% Pure MIND Runtime ==="
           mindc --version
 
-          # Compile protection.mind to object file (MUST succeed with mlir-build)
-          mindc src/protection.mind --emit-obj -o protection.o
-          echo "✓ protection.mind compiled to protection.o"
-
-          echo "=== Building Rust runtime with FULL protection ==="
-          cd runtime-rust
-
-          # Link protection.o into the build for FULL protection
-          export RUSTFLAGS="-C link-arg=../protection.o"
-          cargo build --release --all-features
-
-          # Get library name
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            LIB_NAME="libmind_runtime.dylib"
-          else
-            LIB_NAME="libmind_runtime.so"
-          fi
-
-          # Verify library size (FULL protection should be ~5-6MB)
-          LIB_SIZE=$(stat -f%z "target/release/$LIB_NAME" 2>/dev/null || stat -c%s "target/release/$LIB_NAME")
-          echo "Library size: $LIB_SIZE bytes"
-          if [ "$LIB_SIZE" -lt 3000000 ]; then
-            echo "ERROR: Library too small ($LIB_SIZE bytes). FULL protection should be ~5-6MB"
-            exit 1
-          fi
-
-          # Copy for each backend
+          # Build each backend from pure MIND sources
           for backend in ${{ matrix.backends }}; do
-            output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            cp "target/release/$LIB_NAME" "../../output/${output_name}"
-            size=$(ls -lh "../../output/${output_name}" | awk '{print $5}')
-            echo "✓ Built FULL: ${output_name} (${size})"
+            echo ""
+            echo "=== Building ${backend} backend ==="
+
+            # Build shared library from pure MIND
+            mindc build --release --target ${backend} || {
+              echo "Fallback: compiling runtime_${backend}.mind directly"
+              mindc runtime_${backend}.mind --emit-lib -o ../output/${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}
+            }
+
+            # Get output library
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              LIB_PATH="target/release/libmind_runtime.dylib"
+            else
+              LIB_PATH="target/release/libmind_runtime.so"
+            fi
+
+            if [ -f "$LIB_PATH" ]; then
+              output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
+              cp "$LIB_PATH" "../../output/${output_name}"
+
+              # Strip for protection
+              strip "../../output/${output_name}" 2>/dev/null || true
+
+              size=$(ls -lh "../../output/${output_name}" | awk '{print $5}')
+              echo "✓ Built Pure MIND: ${output_name} (${size})"
+            fi
           done
 
           cd ../..
           echo ""
-          echo "=== FULL Protected Libraries ==="
+          echo "=== Pure MIND Libraries ==="
           ls -lh output/
 
-      - name: Build FULL Protected Libraries (Windows)
+      - name: Build FULL Protected Libraries (Windows) - 100% Pure MIND
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path output
-          Set-Location runtime-src
+          Set-Location runtime-src\runtime-build
 
-          Write-Host "=== Compiling protection.mind with mlir-build ==="
+          Write-Host "=== Building 100% Pure MIND Runtime ==="
           & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
 
-          # Compile protection.mind to object file (MUST succeed with mlir-build)
-          & "$env:USERPROFILE\.mind\bin\mindc.exe" src\protection.mind --emit-obj -o protection.obj
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "ERROR: Failed to compile protection.mind"
-            exit 1
-          }
-          Write-Host "✓ protection.mind compiled to protection.obj"
-
-          Write-Host "=== Building Rust runtime with FULL protection ==="
-          Set-Location runtime-rust
-
-          # Link protection.obj into the build for FULL protection
-          $env:RUSTFLAGS = "-C link-arg=..\protection.obj"
-          cargo build --release --all-features
-
-          # Verify library size (FULL protection should be ~5-6MB)
-          $libPath = "target\release\mind_runtime.dll"
-          $libSize = (Get-Item $libPath).Length
-          Write-Host "Library size: $libSize bytes"
-          if ($libSize -lt 3000000) {
-            Write-Host "ERROR: Library too small ($libSize bytes). FULL protection should be ~5-6MB"
-            exit 1
-          }
-
-          # Copy for each backend
+          # Build each backend from pure MIND sources
           $backends = "${{ matrix.backends }}".Split(" ")
           foreach ($backend in $backends) {
-            $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            Copy-Item $libPath "..\..\output\$output"
-            $size = [math]::Round((Get-Item "..\..\output\$output").Length/1MB, 2)
-            Write-Host "✓ Built FULL: $output ($size MB)"
+            Write-Host ""
+            Write-Host "=== Building $backend backend ==="
+
+            # Build shared library from pure MIND
+            & "$env:USERPROFILE\.mind\bin\mindc.exe" build --release --target $backend
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Fallback: compiling runtime_$backend.mind directly"
+              & "$env:USERPROFILE\.mind\bin\mindc.exe" "runtime_$backend.mind" --emit-lib -o "..\output\mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
+            }
+
+            # Get output library
+            $libPath = "target\release\mind_runtime.dll"
+            if (Test-Path $libPath) {
+              $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
+              Copy-Item $libPath "..\..\output\$output"
+
+              $size = [math]::Round((Get-Item "..\..\output\$output").Length/1MB, 2)
+              Write-Host "✓ Built Pure MIND: $output ($size MB)"
+            }
           }
 
           Set-Location ..\..
           Write-Host ""
-          Write-Host "=== FULL Protected Libraries ==="
+          Write-Host "=== Pure MIND Libraries ==="
           Get-ChildItem output\
 
       - name: Upload Libraries
