@@ -14,7 +14,7 @@ on:
 
 env:
   NIKOLACHESS_VERSION: "3.21.0"
-  MIND_VERSION: "0.1.2"
+  MIND_VERSION: "0.1.3"
 
 jobs:
   build-linux:
