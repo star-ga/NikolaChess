@@ -14,7 +14,7 @@ on:
 
 env:
   NIKOLACHESS_VERSION: "3.21.0"
-  MIND_VERSION: "0.1.0"
+  MIND_VERSION: "0.1.1"
 
 jobs:
   build-linux:
@@ -47,7 +47,7 @@ jobs:
         run: |
           mkdir -p target/release
           mindc build --release --target cpu || mindc src/main.mind --verify-only || true
-          echo "MIND Source files: $(find src -name '*.mind' | wc -l)"
+          echo "MIND Source: $(find src -name '*.mind' | wc -l) files"
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -160,19 +160,16 @@ jobs:
         run: |
           & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" --version
 
-      - name: Verify Source
+      - name: Build
         shell: pwsh
         run: |
-          # Windows mindc.exe is v0.1.0 without build subcommand - verify source only
-          Write-Host "=== NikolaChess MIND Source ==="
-          $files = Get-ChildItem -Path src -Filter *.mind -Recurse
-          Write-Host "MIND files: $($files.Count)"
-          $totalLines = 0
-          foreach ($f in $files) {
-            $lines = (Get-Content $f.FullName | Measure-Object -Line).Lines
-            $totalLines += $lines
+          New-Item -ItemType Directory -Force -Path "target\release"
+          # v0.1.1 should have build subcommand
+          & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" build --release --target cpu 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" src/main.mind --verify-only 2>&1
           }
-          Write-Host "Total lines: $totalLines"
+          Write-Host "MIND files: $((Get-ChildItem -Path src -Filter *.mind -Recurse).Count)"
 
       - name: Upload
         uses: actions/upload-artifact@v4
