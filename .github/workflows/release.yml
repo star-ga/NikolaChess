@@ -78,34 +78,70 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LLVM/MLIR (Linux)
+      - name: Download MLIR Tools (Linux)
         if: runner.os == 'Linux'
         run: |
-          # Install LLVM 18 with ALL MLIR components including arith dialect
-          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          sudo add-apt-repository "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main"
-          sudo apt-get update
-          sudo apt-get install -y llvm-18-dev mlir-18-tools libmlir-18-dev clang-18
-          echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
-          # Set MLIR_DIR for cmake builds
-          echo "MLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir" >> $GITHUB_ENV
+          # Download pre-built MLIR tools from star-ga/mlir-tools
+          echo "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
+          MLIR_VERSION="llvmorg-18.1.8"
+          ARCHIVE="mlir-${{ matrix.platform }}.tar.gz"
 
-      - name: Install LLVM/MLIR (macOS)
+          mkdir -p $HOME/.mlir-tools
+          curl -fsSL "https://github.com/star-ga/mlir-tools/releases/download/${MLIR_VERSION}/${ARCHIVE}" \
+            -o /tmp/mlir-tools.tar.gz || {
+              echo "Pre-built MLIR tools not available, falling back to system packages..."
+              sudo apt-get update
+              sudo apt-get install -y mlir-18-tools clang-18
+              echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+              exit 0
+            }
+
+          tar -xzf /tmp/mlir-tools.tar.gz -C $HOME/.mlir-tools
+          echo "$HOME/.mlir-tools/bin" >> $GITHUB_PATH
+
+          echo "mlir-opt: $(which mlir-opt 2>/dev/null || echo 'will be in PATH after this step')"
+
+      - name: Download MLIR Tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Install LLVM 18 with all MLIR dialects
-          brew install llvm@18
-          LLVM_PREFIX=$(brew --prefix llvm@18)
-          echo "${LLVM_PREFIX}/bin" >> $GITHUB_PATH
-          echo "MLIR_DIR=${LLVM_PREFIX}/lib/cmake/mlir" >> $GITHUB_ENV
-          echo "LLVM_DIR=${LLVM_PREFIX}/lib/cmake/llvm" >> $GITHUB_ENV
+          # Download pre-built MLIR tools from star-ga/mlir-tools
+          echo "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
+          MLIR_VERSION="llvmorg-18.1.8"
+          ARCHIVE="mlir-${{ matrix.platform }}.tar.gz"
 
-      - name: Install LLVM/MLIR (Windows)
+          mkdir -p $HOME/.mlir-tools
+          curl -fsSL "https://github.com/star-ga/mlir-tools/releases/download/${MLIR_VERSION}/${ARCHIVE}" \
+            -o /tmp/mlir-tools.tar.gz || {
+              echo "Pre-built MLIR tools not available, falling back to brew..."
+              brew install llvm@18
+              LLVM_PREFIX=$(brew --prefix llvm@18)
+              echo "${LLVM_PREFIX}/bin" >> $GITHUB_PATH
+              exit 0
+            }
+
+          tar -xzf /tmp/mlir-tools.tar.gz -C $HOME/.mlir-tools
+          echo "$HOME/.mlir-tools/bin" >> $GITHUB_PATH
+
+      - name: Download MLIR Tools (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # LLVM already installed on Windows runners
-          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Download pre-built MLIR tools from star-ga/mlir-tools
+          Write-Host "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
+          $mlirVersion = "llvmorg-18.1.8"
+          $archive = "mlir-${{ matrix.platform }}.zip"
+
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.mlir-tools" | Out-Null
+
+          try {
+            Invoke-WebRequest -Uri "https://github.com/star-ga/mlir-tools/releases/download/${mlirVersion}/${archive}" `
+              -OutFile "$env:TEMP\mlir-tools.zip"
+            Expand-Archive -Path "$env:TEMP\mlir-tools.zip" -DestinationPath "$env:USERPROFILE\.mlir-tools" -Force
+            echo "$env:USERPROFILE\.mlir-tools\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } catch {
+            Write-Host "Pre-built MLIR tools not available, using system LLVM..."
+            echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
 
       - name: Clone Runtime Source
         run: |
@@ -153,31 +189,58 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p output
-          cd runtime-src
+          cd runtime-src/runtime-build
 
-          echo "=== Copying FULL Protected Pure MIND Libraries ==="
+          echo "=== Compiling FULL Protected Pure MIND Libraries ==="
+          echo "Using mindc build with Mind.toml project configuration"
 
-          # Use pre-built protected libraries from runtime-build
-          # These are compiled from pure MIND source with full protection
+          # Verify tools are in PATH
+          echo "mindc: $(which mindc)"
+          echo "mlir-opt: $(which mlir-opt 2>/dev/null || echo 'not found')"
+          echo "mlir-translate: $(which mlir-translate 2>/dev/null || echo 'not found')"
+          echo "clang: $(which clang 2>/dev/null || echo 'not found')"
+
+          # Build each backend using mindc build --target
           for backend in ${{ matrix.backends }}; do
-            src_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
+            out_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
 
-            # Check runtime-build for pre-built protected libs
-            if [ -f "runtime-build/${src_name}" ]; then
-              cp "runtime-build/${src_name}" "../output/${src_name}"
-              size=$(ls -lh "../output/${src_name}" | awk '{print $5}')
-              echo "✓ Copied FULL protected: ${src_name} (${size})"
-            else
-              echo "⚠ Not found: runtime-build/${src_name}"
+            echo ""
+            echo "=== Building ${out_name} (target: ${backend}) ==="
+
+            # Build using Mind.toml configuration
+            mindc build --release --target "${backend}" --verbose 2>&1 || {
+              echo "⚠ Build failed for ${backend}, checking for pre-built fallback..."
+              if [ -f "${out_name}" ]; then
+                cp "${out_name}" "../../output/${out_name}"
+                size=$(ls -lh "../../output/${out_name}" | awk '{print $5}')
+                echo "✓ Using pre-built: ${out_name} (${size})"
+                continue
+              else
+                echo "⚠ No pre-built available for ${backend}"
+                continue
+              fi
+            }
+
+            # Find and copy the built library
+            built_lib=$(find . -name "*mind_${backend}*.${{ matrix.ext }}" -newer Mind.toml 2>/dev/null | head -1)
+            if [ -n "$built_lib" ]; then
+              cp "$built_lib" "../../output/${out_name}"
+              size=$(ls -lh "../../output/${out_name}" | awk '{print $5}')
+              echo "✓ Built FULL protected: ${out_name} (${size})"
+            elif [ -f "${out_name}" ]; then
+              # Fallback to pre-built
+              cp "${out_name}" "../../output/${out_name}"
+              size=$(ls -lh "../../output/${out_name}" | awk '{print $5}')
+              echo "✓ Using pre-built: ${out_name} (${size})"
             fi
           done
 
-          cd ..
+          cd ../..
           echo ""
           echo "=== FULL Protected Libraries ==="
           ls -lh output/ || echo "No libraries in output"
 
-          # Verify at least one library was copied
+          # Verify at least one library was built
           if [ ! "$(ls -A output/)" ]; then
             echo "ERROR: No protected libraries found"
             exit 1
@@ -188,31 +251,61 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path output
-          Set-Location runtime-src
+          Set-Location runtime-src\runtime-build
 
-          Write-Host "=== Copying FULL Protected Pure MIND Libraries ==="
+          Write-Host "=== Compiling FULL Protected Pure MIND Libraries ==="
+          Write-Host "Using mindc build with Mind.toml project configuration"
 
-          # Use pre-built protected libraries from runtime-build
+          # Verify tools are in PATH
+          Write-Host "mindc: $(Get-Command mindc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)"
+          Write-Host "mlir-opt: $(Get-Command mlir-opt -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)"
+          Write-Host "clang: $(Get-Command clang -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)"
+
+          # Build each backend using mindc build --target
           $backends = "${{ matrix.backends }}".Split(" ")
           foreach ($backend in $backends) {
-            $srcName = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            $srcPath = "runtime-build\$srcName"
+            $outName = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
 
-            if (Test-Path $srcPath) {
-              Copy-Item $srcPath "..\output\$srcName"
-              $size = [math]::Round((Get-Item "..\output\$srcName").Length/1MB, 2)
-              Write-Host "✓ Copied FULL protected: $srcName ($size MB)"
-            } else {
-              Write-Host "⚠ Not found: $srcPath"
+            Write-Host ""
+            Write-Host "=== Building $outName (target: $backend) ==="
+
+            # Build using Mind.toml configuration
+            try {
+              & mindc build --release --target $backend --verbose 2>&1
+
+              # Find and copy the built library
+              $builtLib = Get-ChildItem -Recurse -Filter "*mind_${backend}*.${{ matrix.ext }}" -ErrorAction SilentlyContinue |
+                          Where-Object { $_.LastWriteTime -gt (Get-Item Mind.toml).LastWriteTime } |
+                          Select-Object -First 1
+
+              if ($builtLib) {
+                Copy-Item $builtLib.FullName "..\..\output\$outName"
+                $size = [math]::Round((Get-Item "..\..\output\$outName").Length/1MB, 2)
+                Write-Host "✓ Built FULL protected: $outName ($size MB)"
+              } elseif (Test-Path $outName) {
+                # Fallback to pre-built
+                Copy-Item $outName "..\..\output\$outName"
+                $size = [math]::Round((Get-Item "..\..\output\$outName").Length/1MB, 2)
+                Write-Host "✓ Using pre-built: $outName ($size MB)"
+              }
+            } catch {
+              Write-Host "⚠ Build failed for $backend, checking for pre-built fallback..."
+              if (Test-Path $outName) {
+                Copy-Item $outName "..\..\output\$outName"
+                $size = [math]::Round((Get-Item "..\..\output\$outName").Length/1MB, 2)
+                Write-Host "✓ Using pre-built: $outName ($size MB)"
+              } else {
+                Write-Host "⚠ No pre-built available for $backend"
+              }
             }
           }
 
-          Set-Location ..
+          Set-Location ..\..
           Write-Host ""
           Write-Host "=== FULL Protected Libraries ==="
           Get-ChildItem output\
 
-          # Verify at least one library was copied
+          # Verify at least one library was built
           if (-not (Get-ChildItem output\ -ErrorAction SilentlyContinue)) {
             Write-Host "ERROR: No protected libraries found"
             exit 1
