@@ -1,6 +1,6 @@
 # NikolaChess Release Workflow
 # Copyright (c) 2026 STARGA, Inc. All rights reserved.
-# Builds FULL protected runtime libraries on all platforms
+# Copies FULL protected runtime libraries from nikolachess-source/runtime-build
 
 name: Release
 
@@ -26,52 +26,14 @@ env:
 
 jobs:
   # ==========================================================================
-  # Build FULL Protected Runtime Libraries
+  # Copy FULL Protected Runtime Libraries from nikolachess-source
   # ==========================================================================
-  build-runtime:
-    name: Runtime ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x64
-            platform: linux-x64
-            ext: so
-            prefix: lib
-            backends: "cpu cuda rocm oneapi webgpu"
-          - os: ubuntu-24.04-arm
-            name: Linux ARM64
-            platform: linux-arm64
-            ext: so
-            prefix: lib
-            backends: "cpu cuda rocm oneapi webgpu"
-          - os: macos-14
-            name: macOS ARM64
-            platform: macos-arm64
-            ext: dylib
-            prefix: lib
-            backends: "cpu metal webgpu"
-          - os: macos-15
-            name: macOS x64
-            platform: macos-x64
-            ext: dylib
-            prefix: lib
-            backends: "cpu metal webgpu"
-          - os: windows-latest
-            name: Windows x64
-            platform: windows-x64
-            ext: dll
-            prefix: ""
-            backends: "cpu cuda directx oneapi rocm webgpu"
-
-    runs-on: ${{ matrix.os }}
+  copy-runtime:
+    name: Copy Protected Libraries
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Clone Runtime Source
         run: |
@@ -79,64 +41,77 @@ jobs:
         env:
           RUNTIME_TOKEN: ${{ secrets.RUNTIME_TOKEN }}
 
-      - name: Build Protected Libraries (Unix)
-        if: runner.os != 'Windows'
+      - name: Copy FULL Protected Libraries
         run: |
           mkdir -p output
-          cd runtime-src/runtime-rust
 
-          # Build the Rust runtime as cdylib
-          cargo build --release
+          # Copy ALL pre-built protected libraries from runtime-build
+          echo "=== Copying FULL Protected Libraries ==="
 
-          # Get the library path
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            LIB_EXT="dylib"
-            LIB_NAME="libmind_runtime.dylib"
-          else
-            LIB_EXT="so"
-            LIB_NAME="libmind_runtime.so"
-          fi
-
-          # Copy for each backend
-          for backend in ${{ matrix.backends }}; do
-            output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            if [ -f "target/release/$LIB_NAME" ]; then
-              cp "target/release/$LIB_NAME" "../../output/${output_name}"
-              echo "Built: ${output_name} ($(ls -lh ../../output/${output_name} | awk '{print $5}'))"
+          # Linux x64
+          for backend in cpu cuda rocm oneapi webgpu; do
+            src="runtime-src/runtime-build/libmind_${backend}_linux-x64.so"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: libmind_${backend}_linux-x64.so ($(ls -lh output/libmind_${backend}_linux-x64.so | awk '{print $5}'))"
             fi
           done
 
-          cd ../..
+          # Linux ARM64
+          for backend in cpu cuda rocm oneapi webgpu; do
+            src="runtime-src/runtime-build/libmind_${backend}_linux-arm64.so"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: libmind_${backend}_linux-arm64.so ($(ls -lh output/libmind_${backend}_linux-arm64.so | awk '{print $5}'))"
+            fi
+          done
+
+          # macOS x64
+          for backend in cpu metal webgpu; do
+            src="runtime-src/runtime-build/libmind_${backend}_macos-x64.dylib"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: libmind_${backend}_macos-x64.dylib ($(ls -lh output/libmind_${backend}_macos-x64.dylib | awk '{print $5}'))"
+            fi
+          done
+
+          # macOS ARM64
+          for backend in cpu metal webgpu; do
+            src="runtime-src/runtime-build/libmind_${backend}_macos-arm64.dylib"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: libmind_${backend}_macos-arm64.dylib ($(ls -lh output/libmind_${backend}_macos-arm64.dylib | awk '{print $5}'))"
+            fi
+          done
+
+          # Windows x64
+          for backend in cpu cuda directx oneapi rocm webgpu; do
+            src="runtime-src/runtime-build/mind_${backend}_windows-x64.dll"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: mind_${backend}_windows-x64.dll ($(ls -lh output/mind_${backend}_windows-x64.dll | awk '{print $5}'))"
+            fi
+          done
+
+          # Windows ARM64
+          for backend in cpu directx webgpu; do
+            src="runtime-src/runtime-build/mind_${backend}_windows-arm64.dll"
+            if [ -f "$src" ]; then
+              cp "$src" output/
+              echo "Copied: mind_${backend}_windows-arm64.dll ($(ls -lh output/mind_${backend}_windows-arm64.dll | awk '{print $5}'))"
+            fi
+          done
+
+          echo ""
+          echo "=== All Protected Libraries ==="
           ls -lh output/
-
-      - name: Build Protected Libraries (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path output
-          Set-Location runtime-src/runtime-rust
-
-          # Build the Rust runtime
-          cargo build --release
-
-          # Copy for each backend
-          $backends = "${{ matrix.backends }}".Split(" ")
-          foreach ($backend in $backends) {
-            $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            $source = "target/release/mind_runtime.dll"
-            if (Test-Path $source) {
-              Copy-Item $source "../../output/$output"
-              Write-Host "Built: $output"
-            }
-          }
-
-          Set-Location ../..
-          Get-ChildItem output/
+          echo ""
+          echo "Total: $(ls output/ | wc -l) libraries"
 
       - name: Upload Libraries
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-${{ matrix.platform }}
+          name: runtime-all
           path: output/*
 
   # ==========================================================================
@@ -208,7 +183,7 @@ jobs:
   # ==========================================================================
   upload:
     name: Upload to Release
-    needs: [build-runtime, verify]
+    needs: [copy-runtime, verify]
     runs-on: ubuntu-latest
 
     steps:
@@ -218,10 +193,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List Built Libraries
+      - name: List Protected Libraries
         run: |
-          echo "=== Built Libraries ==="
-          find artifacts -type f -exec ls -lh {} \;
+          echo "=== FULL Protected Libraries ==="
+          ls -lh artifacts/
+          echo ""
+          echo "Total size: $(du -sh artifacts/ | awk '{print $1}')"
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
