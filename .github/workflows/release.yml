@@ -78,6 +78,26 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install LLVM/MLIR (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 mlir-18-tools
+          echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+
+      - name: Install LLVM/MLIR (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@18
+          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+      - name: Install LLVM/MLIR (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --version=18.1.8 -y
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Clone Runtime Source
         run: |
           git clone --depth 1 https://${{ secrets.RUNTIME_TOKEN }}@github.com/star-ga/nikolachess-source.git runtime-src
