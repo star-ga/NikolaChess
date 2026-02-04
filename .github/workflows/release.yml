@@ -1,6 +1,6 @@
 # NikolaChess Release Workflow
 # Copyright (c) 2026 STARGA, Inc. All rights reserved.
-# Builds FULL protected runtime libraries in PURE MIND
+# Verifies MIND source and prepares release assets
 
 name: Release
 
@@ -26,161 +26,9 @@ env:
 
 jobs:
   # ==========================================================================
-  # Build FULL Protected Runtime Libraries (Pure MIND)
+  # Verify MIND Source on All Platforms
   # ==========================================================================
-  build-runtime:
-    name: Runtime ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: Linux x64
-            platform: linux-x64
-            ext: so
-            prefix: lib
-            linker: gcc
-            linker_flags: "-shared -fPIC -lpthread -ldl -lm"
-          - os: ubuntu-24.04-arm
-            name: Linux ARM64
-            platform: linux-arm64
-            ext: so
-            prefix: lib
-            linker: gcc
-            linker_flags: "-shared -fPIC -lpthread -ldl -lm"
-          - os: macos-14
-            name: macOS ARM64
-            platform: macos-arm64
-            ext: dylib
-            prefix: lib
-            linker: clang
-            linker_flags: "-dynamiclib -lpthread"
-          - os: macos-15
-            name: macOS x64
-            platform: macos-x64
-            ext: dylib
-            prefix: lib
-            linker: clang
-            linker_flags: "-dynamiclib -lpthread"
-          - os: windows-latest
-            name: Windows x64
-            platform: windows-x64
-            ext: dll
-            prefix: ""
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download MIND Compiler (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p $HOME/.mind/bin
-          curl -fsSL -o /tmp/mindc.tar.gz \
-            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-${{ matrix.platform }}.tar.gz"
-          tar -xzf /tmp/mindc.tar.gz -C $HOME/.mind/bin/
-          chmod +x $HOME/.mind/bin/mindc
-          echo "$HOME/.mind/bin" >> $GITHUB_PATH
-
-      - name: Download MIND Compiler (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.mind\bin"
-          Invoke-WebRequest -Uri "https://github.com/star-ga/mind/releases/download/v$env:MIND_VERSION/mindc-${{ matrix.platform }}.zip" -OutFile "$env:TEMP\mindc.zip"
-          Expand-Archive -Path "$env:TEMP\mindc.zip" -DestinationPath "$env:USERPROFILE\.mind\bin" -Force
-          echo "$env:USERPROFILE\.mind\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Clone Runtime Source
-        run: |
-          git clone --depth 1 https://${{ secrets.RUNTIME_TOKEN }}@github.com/star-ga/nikolachess-source.git runtime-src
-        env:
-          RUNTIME_TOKEN: ${{ secrets.RUNTIME_TOKEN }}
-        continue-on-error: true
-
-      - name: Build Runtime Libraries (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p output
-
-          if [ -d "runtime-src/runtime-build" ]; then
-            cd runtime-src/runtime-build
-
-            # Build each backend using mindc (Pure MIND)
-            for backend in cpu cuda rocm oneapi webgpu metal; do
-              echo "=== Building $backend backend ==="
-              output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-
-              # Skip metal on non-macOS, skip directx on non-windows
-              if [ "$backend" = "metal" ] && [ "${{ runner.os }}" != "macOS" ]; then
-                continue
-              fi
-
-              # Compile MIND sources to object file
-              mindc build --target $backend --emit=obj -o "${backend}.o" 2>/dev/null || \
-              mindc src/lib.mind src/protection.mind --emit=obj -o "${backend}.o" 2>/dev/null || true
-
-              # Link to shared library
-              if [ -f "${backend}.o" ]; then
-                ${{ matrix.linker }} ${{ matrix.linker_flags }} -o "$output_name" "${backend}.o"
-                if [ -f "$output_name" ]; then
-                  ls -lh "$output_name"
-                  mv "$output_name" ../../output/
-                fi
-              fi
-            done
-
-            cd ../..
-          fi
-
-          ls -lh output/ 2>/dev/null || echo "No outputs"
-
-      - name: Build Runtime Libraries (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path output
-
-          if (Test-Path "runtime-src/runtime-build") {
-            Set-Location runtime-src/runtime-build
-
-            $backends = @("cpu", "cuda", "directx", "oneapi", "rocm", "webgpu")
-            foreach ($backend in $backends) {
-              Write-Host "=== Building $backend backend ==="
-              $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-
-              # Compile MIND sources to object file
-              & "$env:USERPROFILE\.mind\bin\mindc.exe" build --target $backend --emit=obj -o "${backend}.obj" 2>&1 | Out-Null
-              if (-not (Test-Path "${backend}.obj")) {
-                & "$env:USERPROFILE\.mind\bin\mindc.exe" src\lib.mind src\protection.mind --emit=obj -o "${backend}.obj" 2>&1 | Out-Null
-              }
-
-              # Link to DLL
-              if (Test-Path "${backend}.obj") {
-                cl /LD /Fe"$output" "${backend}.obj" 2>&1 | Out-Null
-                if (Test-Path $output) {
-                  Move-Item $output "../../output/"
-                }
-              }
-            }
-
-            Set-Location ../..
-          }
-
-          Get-ChildItem output/ -ErrorAction SilentlyContinue
-
-      - name: Upload Runtime Libraries
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ matrix.platform }}
-          path: output/*
-          if-no-files-found: warn
-
-  # ==========================================================================
-  # Verify MIND Source
-  # ==========================================================================
-  verify-source:
+  verify:
     name: Verify ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -229,37 +77,26 @@ jobs:
       - name: Verify MIND Source (Unix)
         if: runner.os != 'Windows'
         run: |
+          echo "=== MIND Compiler ==="
           mindc --version
-          mindc src/main.mind --verify-only || true
+          echo ""
+          echo "=== Verifying NikolaChess Source ==="
+          mindc src/main.mind --verify-only
+          echo ""
+          echo "=== Source Statistics ==="
           echo "MIND files: $(find src -name '*.mind' | wc -l)"
+          echo "Total lines: $(find src -name '*.mind' -exec cat {} \; | wc -l)"
 
       - name: Verify MIND Source (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Write-Host "=== MIND Compiler ==="
           & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
+          Write-Host ""
+          Write-Host "=== Verifying NikolaChess Source ==="
           & "$env:USERPROFILE\.mind\bin\mindc.exe" src\main.mind --verify-only
-          Write-Host "MIND files: $((Get-ChildItem -Path src -Filter *.mind -Recurse).Count)"
-
-  # ==========================================================================
-  # Upload to Release
-  # ==========================================================================
-  release:
-    name: Update Release
-    needs: [build-runtime, verify-source]
-    runs-on: ubuntu-latest
-    if: always()
-
-    steps:
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ env.NIKOLACHESS_VERSION }}
-          files: artifacts/*
-        continue-on-error: true
+          Write-Host ""
+          Write-Host "=== Source Statistics ==="
+          $files = (Get-ChildItem -Path src -Filter *.mind -Recurse)
+          Write-Host "MIND files: $($files.Count)"
