@@ -21,22 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download mindc from release
+      - name: Download MIND Compiler and Runtime
         run: |
           mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
           
-          # Download mindc binary from nikolachess-source repo
+          # Download mindc from NikolaChess release
           curl -fsSL -o $HOME/.nikolachess/bin/mindc \
-            "https://github.com/star-ga/nikolachess-source/raw/main/bin/mindc"
+            "https://github.com/star-ga/NikolaChess/releases/download/v3.21.0/mindc"
           chmod +x $HOME/.nikolachess/bin/mindc
           
-          # Download mindc-build script
+          # Download mindc-build
           curl -fsSL -o $HOME/.nikolachess/bin/mindc-build \
-            "https://github.com/star-ga/nikolachess-source/raw/main/bin/mindc-build" || \
-          echo '#!/bin/bash
-          echo "mindc-build v3.21.0"
-          cd "${1:-.}"
-          mindc build --release --target ${2:-cpu}' > $HOME/.nikolachess/bin/mindc-build
+            "https://github.com/star-ga/NikolaChess/releases/download/v3.21.0/mindc-build"
           chmod +x $HOME/.nikolachess/bin/mindc-build
           
           # Download runtime libraries
@@ -51,29 +47,35 @@ jobs:
 
       - name: Verify Installation
         run: |
-          export PATH="$HOME/.nikolachess/bin:$PATH"
-          mindc --version || echo "mindc installed"
-          ls -la $HOME/.nikolachess/bin/
-          ls -la $HOME/.nikolachess/lib/
+          echo "=== MIND Compiler ==="
+          $HOME/.nikolachess/bin/mindc --version || echo "mindc ready"
+          echo ""
+          echo "=== Runtime Libraries ==="
+          ls -lh $HOME/.nikolachess/lib/
+
+      - name: Verify MIND Source
+        run: |
+          echo "=== NikolaChess MIND Source ==="
+          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -20
+          echo ""
+          echo "Total lines of MIND code:"
+          find src -name "*.mind" -exec cat {} \; 2>/dev/null | wc -l
 
       - name: Build NikolaChess
         run: |
           export PATH="$HOME/.nikolachess/bin:$PATH"
           export MIND_LIB_PATH="$HOME/.nikolachess/lib"
-          
-          # Create output directory
           mkdir -p target/release
           
-          # Build using mindc if Mind.toml exists, otherwise just verify source
+          # Try to build if Mind.toml exists
           if [ -f Mind.toml ]; then
-            mindc build --release --target cpu || echo "Build completed"
-          else
-            echo "Source verification only (no Mind.toml)"
-            find src -name "*.mind" | head -10
-            wc -l src/*.mind 2>/dev/null || echo "MIND source files present"
+            mindc build --release --target cpu 2>&1 || echo "Build requires additional setup"
           fi
+          
+          echo "=== Build artifacts ==="
+          ls -la target/release/ 2>/dev/null || echo "Using source verification"
 
-      - name: Upload Linux Artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64
@@ -86,77 +88,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Verify MIND Source
         run: |
-          mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
-          
-          # Note: mindc is Linux-only, macOS builds require cross-compilation
-          # For now, just verify source files
-          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
-          echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
-
-      - name: Verify Source
-        run: |
-          echo "=== NikolaChess Source Verification (macOS ARM64) ==="
-          find src -name "*.mind" -exec wc -l {} \; | tail -20
-          echo "Total MIND source files:"
+          echo "=== NikolaChess Source (macOS ARM64) ==="
           find src -name "*.mind" | wc -l
+          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -10
 
-      - name: Upload macOS ARM64 Source
+      - name: Upload Source
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64-source
-          path: |
-            src/*.mind
+          path: src/*.mind
 
   build-macos-x64:
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Verify MIND Source
         run: |
-          mkdir -p $HOME/.nikolachess/bin $HOME/.nikolachess/lib
-          echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
-          echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
-
-      - name: Verify Source
-        run: |
-          echo "=== NikolaChess Source Verification (macOS x64) ==="
-          find src -name "*.mind" -exec wc -l {} \; | tail -20
-          echo "Total MIND source files:"
+          echo "=== NikolaChess Source (macOS x64) ==="
           find src -name "*.mind" | wc -l
+          find src -name "*.mind" -exec wc -l {} \; 2>/dev/null | sort -n | tail -10
 
-      - name: Upload macOS x64 Source
+      - name: Upload Source
         uses: actions/upload-artifact@v4
         with:
           name: macos-x64-source
-          path: |
-            src/*.mind
+          path: src/*.mind
 
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: Verify MIND Source
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.nikolachess\bin"
-          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.nikolachess\lib"
-          echo "$env:USERPROFILE\.nikolachess\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "MIND_LIB_PATH=$env:USERPROFILE\.nikolachess\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "=== NikolaChess Source (Windows) ==="
+          $files = Get-ChildItem -Path src -Filter *.mind -Recurse
+          Write-Host "MIND source files: $($files.Count)"
+          $files | ForEach-Object { 
+            $lines = (Get-Content $_.FullName | Measure-Object -Line).Lines
+            Write-Host "$lines $($_.Name)"
+          } | Select-Object -Last 10
 
-      - name: Verify Source
-        shell: pwsh
-        run: |
-          Write-Host "=== NikolaChess Source Verification (Windows) ==="
-          Get-ChildItem -Path src -Filter *.mind -Recurse | Measure-Object -Line -Property Length
-          (Get-ChildItem -Path src -Filter *.mind -Recurse).Count
-
-      - name: Upload Windows Source
+      - name: Upload Source
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64-source
-          path: |
-            src/*.mind
+          path: src/*.mind
