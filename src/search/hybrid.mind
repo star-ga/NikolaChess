@@ -1,0 +1,700 @@
+// NikolaChess - Hybrid Search Engine
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// SPTT (Superparallel Tree Traversal) implementation:
+// Combines GPU-accelerated MCTS with alpha-beta verification.
+// Uses adaptive algorithm selection based on position characteristics.
+
+import std.sync;
+import std.math;
+
+// ============================================================================
+// HYBRID SEARCH CONFIGURATION
+// ============================================================================
+
+struct HybridConfig {
+    // When to use MCTS vs alpha-beta
+    mcts_threshold_branching: i32,  // Use MCTS when branching factor > this
+    mcts_threshold_complexity: f32,  // Use MCTS when position complexity > this
+
+    // Alpha-beta settings
+    ab_depth: i32,
+    ab_threads: i32,
+
+    // MCTS settings
+    mcts_simulations: i32,
+    mcts_batch_size: i32,
+
+    // GPU settings
+    num_gpus: i32,
+    use_gpu_eval: bool,
+
+    // Verification
+    verify_with_ab: bool,      // Verify MCTS results with alpha-beta
+    verification_depth: i32,
+}
+
+impl HybridConfig {
+    fn default() -> HybridConfig {
+        return HybridConfig {
+            mcts_threshold_branching: 35,
+            mcts_threshold_complexity: 0.7,
+            ab_depth: 20,
+            ab_threads: 8,
+            mcts_simulations: 800,
+            mcts_batch_size: 256,
+            num_gpus: 1,
+            use_gpu_eval: true,
+            verify_with_ab: true,
+            verification_depth: 8,
+        };
+    }
+
+    fn aggressive_mcts() -> HybridConfig {
+        let mut cfg = Self::default();
+        cfg.mcts_threshold_branching = 20;
+        cfg.mcts_threshold_complexity = 0.5;
+        cfg.mcts_simulations = 1600;
+        return cfg;
+    }
+
+    fn conservative_ab() -> HybridConfig {
+        let mut cfg = Self::default();
+        cfg.mcts_threshold_branching = 50;
+        cfg.mcts_threshold_complexity = 0.9;
+        cfg.verify_with_ab = true;
+        cfg.verification_depth = 12;
+        return cfg;
+    }
+}
+
+// ============================================================================
+// POSITION ANALYZER
+// ============================================================================
+
+struct PositionAnalysis {
+    branching_factor: i32,
+    complexity: f32,
+    is_tactical: bool,
+    is_endgame: bool,
+    material_balance: i32,
+    king_safety_white: f32,
+    king_safety_black: f32,
+}
+
+impl PositionAnalysis {
+    fn analyze(board: &Board) -> PositionAnalysis {
+        let legal_moves = generate_legal_moves(board);
+        let branching = legal_moves.len() as i32;
+
+        // Complexity based on piece mobility and tension
+        let complexity = Self::calculate_complexity(board);
+
+        // Tactical indicators
+        let is_tactical = Self::is_tactical_position(board);
+
+        // Phase detection
+        let material = Self::count_material(board);
+        let is_endgame = material < 2400;  // Roughly Q + R worth
+
+        // King safety
+        let (ks_white, ks_black) = Self::evaluate_king_safety(board);
+
+        return PositionAnalysis {
+            branching_factor: branching,
+            complexity: complexity,
+            is_tactical: is_tactical,
+            is_endgame: is_endgame,
+            material_balance: Self::material_balance(board),
+            king_safety_white: ks_white,
+            king_safety_black: ks_black,
+        };
+    }
+
+    fn calculate_complexity(board: &Board) -> f32 {
+        // Complexity factors:
+        // 1. Number of pieces
+        // 2. Pawn structure tension
+        // 3. Piece mobility
+        // 4. Checks/threats
+
+        let piece_count = board.piece_count() as f32;
+        let max_pieces = 32.0;
+
+        let mobility = Self::total_mobility(board) as f32;
+        let max_mobility = 200.0;
+
+        let tension = Self::pawn_tension(board) as f32;
+        let max_tension = 8.0;
+
+        let threats = Self::count_threats(board) as f32;
+        let max_threats = 10.0;
+
+        let complexity = 0.3 * (piece_count / max_pieces)
+            + 0.3 * (mobility / max_mobility)
+            + 0.2 * (tension / max_tension)
+            + 0.2 * (threats / max_threats);
+
+        return complexity.min(1.0);
+    }
+
+    fn is_tactical_position(board: &Board) -> bool {
+        // Check for hanging pieces, forks, pins, etc.
+        if board.in_check() {
+            return true;
+        }
+
+        // Look for captures that win material
+        let captures = generate_captures(board);
+        for mv in captures {
+            if see_ge(board, mv, 100) {  // Winning capture
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn count_material(board: &Board) -> i32 {
+        let mut total = 0;
+        for sq in 0..64 {
+            if let Some(piece) = board.piece_at(Square(sq)) {
+                total += match piece.piece_type {
+                    PieceType::Pawn => 100,
+                    PieceType::Knight => 320,
+                    PieceType::Bishop => 330,
+                    PieceType::Rook => 500,
+                    PieceType::Queen => 900,
+                    PieceType::King => 0,
+                };
+            }
+        }
+        return total;
+    }
+
+    fn material_balance(board: &Board) -> i32 {
+        let mut balance = 0;
+        for sq in 0..64 {
+            if let Some(piece) = board.piece_at(Square(sq)) {
+                let value = match piece.piece_type {
+                    PieceType::Pawn => 100,
+                    PieceType::Knight => 320,
+                    PieceType::Bishop => 330,
+                    PieceType::Rook => 500,
+                    PieceType::Queen => 900,
+                    PieceType::King => 0,
+                };
+                balance += if piece.color == Color::White { value } else { -value };
+            }
+        }
+        return balance;
+    }
+
+    fn total_mobility(board: &Board) -> i32 {
+        // Simplified mobility count
+        return generate_legal_moves(board).len() as i32;
+    }
+
+    fn pawn_tension(board: &Board) -> i32 {
+        // Count pawns that can capture each other
+        let mut tension = 0;
+        for sq in 0..64 {
+            if let Some(piece) = board.piece_at(Square(sq)) {
+                if piece.piece_type == PieceType::Pawn {
+                    let rank = sq / 8;
+                    let file = sq % 8;
+
+                    // Check diagonal attacks
+                    let attack_rank = if piece.color == Color::White { rank + 1 } else { rank - 1 };
+                    if attack_rank >= 0 && attack_rank < 8 {
+                        for df in [-1, 1] {
+                            let attack_file = file as i32 + df;
+                            if attack_file >= 0 && attack_file < 8 {
+                                let target_sq = attack_rank * 8 + attack_file as i32;
+                                if let Some(target) = board.piece_at(Square(target_sq as u8)) {
+                                    if target.color != piece.color && target.piece_type == PieceType::Pawn {
+                                        tension += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return tension;
+    }
+
+    fn count_threats(board: &Board) -> i32 {
+        // Count pieces under attack
+        let mut threats = 0;
+        let side = board.side_to_move;
+
+        for sq in 0..64 {
+            if let Some(piece) = board.piece_at(Square(sq)) {
+                if piece.color != side {
+                    if is_attacked(board, Square(sq), side) {
+                        threats += 1;
+                    }
+                }
+            }
+        }
+        return threats;
+    }
+
+    fn evaluate_king_safety(board: &Board) -> (f32, f32) {
+        // Simplified king safety evaluation
+        let white_king_sq = board.king_square(Color::White);
+        let black_king_sq = board.king_square(Color::Black);
+
+        let white_safety = Self::king_shelter_score(board, white_king_sq, Color::White);
+        let black_safety = Self::king_shelter_score(board, black_king_sq, Color::Black);
+
+        return (white_safety, black_safety);
+    }
+
+    fn king_shelter_score(board: &Board, king_sq: Square, color: Color) -> f32 {
+        let mut score = 1.0;
+
+        // Penalize open files near king
+        let king_file = king_sq.0 % 8;
+        for df in -1..=1 {
+            let file = king_file as i32 + df;
+            if file >= 0 && file < 8 {
+                let has_pawn = Self::file_has_friendly_pawn(board, file as u8, color);
+                if !has_pawn {
+                    score -= 0.15;
+                }
+            }
+        }
+
+        // Penalize if king is in center during middlegame
+        let king_rank = king_sq.0 / 8;
+        if king_rank >= 2 && king_rank <= 5 {
+            score -= 0.2;
+        }
+
+        return score.max(0.0);
+    }
+
+    fn file_has_friendly_pawn(board: &Board, file: u8, color: Color) -> bool {
+        for rank in 0..8 {
+            let sq = Square(rank * 8 + file);
+            if let Some(piece) = board.piece_at(sq) {
+                if piece.piece_type == PieceType::Pawn && piece.color == color {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+// ============================================================================
+// HYBRID SEARCH ENGINE
+// ============================================================================
+
+struct HybridEngine {
+    config: HybridConfig,
+    mcts: MCTSEngine,
+    ab_search: AlphaBetaSearch,
+    evaluator: Arc<BatchedEvaluator>,
+}
+
+impl HybridEngine {
+    fn new(config: HybridConfig, network_path: &str, nnue_path: &str) -> HybridEngine {
+        let mcts_config = MCTSConfig {
+            num_simulations: config.mcts_simulations,
+            batch_size: config.mcts_batch_size,
+            num_gpus: config.num_gpus,
+            ..MCTSConfig::default()
+        };
+
+        let mcts = MCTSEngine::new(mcts_config, network_path);
+
+        let evaluator = create_batched_evaluator(
+            nnue_path,
+            64,  // batch size for alpha-beta
+            config.num_gpus
+        );
+
+        let ab_search = AlphaBetaSearch::new(
+            evaluator.clone(),
+            config.ab_threads,
+            config.ab_depth
+        );
+
+        return HybridEngine {
+            config: config,
+            mcts: mcts,
+            ab_search: ab_search,
+            evaluator: evaluator,
+        };
+    }
+
+    fn search(&self, board: &Board, time_limit_ms: i64) -> SearchResult {
+        // Analyze position to determine best algorithm
+        let analysis = PositionAnalysis::analyze(board);
+
+        let use_mcts = self.should_use_mcts(&analysis);
+
+        if use_mcts {
+            return self.mcts_with_verification(board, time_limit_ms, &analysis);
+        } else {
+            return self.alpha_beta_search(board, time_limit_ms);
+        }
+    }
+
+    fn should_use_mcts(&self, analysis: &PositionAnalysis) -> bool {
+        // Use MCTS for high-branching, complex positions
+        if analysis.branching_factor > self.config.mcts_threshold_branching {
+            return true;
+        }
+
+        if analysis.complexity > self.config.mcts_threshold_complexity {
+            return true;
+        }
+
+        // Don't use MCTS in endgames (alpha-beta is better)
+        if analysis.is_endgame {
+            return false;
+        }
+
+        // Don't use MCTS in highly tactical positions
+        if analysis.is_tactical {
+            return false;
+        }
+
+        return false;
+    }
+
+    fn mcts_with_verification(
+        &self,
+        board: &Board,
+        time_limit_ms: i64,
+        analysis: &PositionAnalysis
+    ) -> SearchResult {
+        // Allocate time: 80% MCTS, 20% verification
+        let mcts_time = (time_limit_ms as f64 * 0.8) as i64;
+        let verify_time = time_limit_ms - mcts_time;
+
+        // Run MCTS
+        let mcts_move = self.mcts.search(board, Some(mcts_time));
+
+        if !self.config.verify_with_ab {
+            return SearchResult {
+                best_move: mcts_move,
+                score: 0,  // MCTS doesn't give centipawn scores
+                depth: 0,
+                nodes: self.mcts.config.num_simulations as i64,
+                algorithm: SearchAlgorithm::MCTS,
+            };
+        }
+
+        // Verification with shallow alpha-beta
+        let ab_result = self.ab_search.search_depth(
+            board,
+            self.config.verification_depth,
+            verify_time
+        );
+
+        // Compare results
+        let final_move = if ab_result.best_move == mcts_move {
+            // Agreement - high confidence
+            mcts_move
+        } else {
+            // Disagreement - trust alpha-beta for tactical positions
+            if analysis.is_tactical {
+                ab_result.best_move
+            } else {
+                mcts_move
+            }
+        };
+
+        return SearchResult {
+            best_move: final_move,
+            score: ab_result.score,
+            depth: ab_result.depth,
+            nodes: self.mcts.config.num_simulations as i64 + ab_result.nodes,
+            algorithm: SearchAlgorithm::Hybrid,
+        };
+    }
+
+    fn alpha_beta_search(&self, board: &Board, time_limit_ms: i64) -> SearchResult {
+        let result = self.ab_search.search(board, time_limit_ms);
+
+        return SearchResult {
+            best_move: result.best_move,
+            score: result.score,
+            depth: result.depth,
+            nodes: result.nodes,
+            algorithm: SearchAlgorithm::AlphaBeta,
+        };
+    }
+}
+
+struct SearchResult {
+    best_move: Move,
+    score: i32,
+    depth: i32,
+    nodes: i64,
+    algorithm: SearchAlgorithm,
+}
+
+enum SearchAlgorithm {
+    AlphaBeta,
+    MCTS,
+    Hybrid,
+}
+
+// ============================================================================
+// ALPHA-BETA SEARCH (with GPU batched eval)
+// ============================================================================
+
+struct AlphaBetaSearch {
+    evaluator: Arc<BatchedEvaluator>,
+    num_threads: i32,
+    max_depth: i32,
+    // Search improvements
+    move_orderer: MoveOrderer,
+    lmr_table: LMRTable,
+    probcut_params: ProbCutParams,
+}
+
+impl AlphaBetaSearch {
+    fn new(evaluator: Arc<BatchedEvaluator>, threads: i32, depth: i32) -> AlphaBetaSearch {
+        return AlphaBetaSearch {
+            evaluator: evaluator,
+            num_threads: threads,
+            max_depth: depth,
+            move_orderer: MoveOrderer::new(),
+            lmr_table: LMRTable::new(),
+            probcut_params: ProbCutParams::default(),
+        };
+    }
+
+    fn search(&self, board: &Board, time_limit_ms: i64) -> ABResult {
+        // Iterative deepening with time management
+        let start = Instant::now();
+        let mut best_result = ABResult {
+            best_move: Move::null(),
+            score: 0,
+            depth: 0,
+            nodes: 0,
+        };
+
+        for depth in 1..=self.max_depth {
+            let elapsed = start.elapsed().as_millis() as i64;
+            if elapsed >= time_limit_ms * 2 / 3 {
+                break;  // Not enough time for next iteration
+            }
+
+            let result = self.search_depth(board, depth, time_limit_ms - elapsed);
+            best_result = result;
+
+            // Early termination on mate
+            if best_result.score.abs() > 29000 {
+                break;
+            }
+        }
+
+        return best_result;
+    }
+
+    fn search_depth(&self, board: &Board, depth: i32, _time_ms: i64) -> ABResult {
+        // Aspiration windows
+        let mut alpha = -30000;
+        let mut beta = 30000;
+
+        let (score, best_move) = self.negamax(board, depth, 0, alpha, beta);
+
+        return ABResult {
+            best_move: best_move.unwrap_or(Move::null()),
+            score: score,
+            depth: depth,
+            nodes: 0,  // Would track in real implementation
+        };
+    }
+
+    fn negamax(
+        &self,
+        board: &Board,
+        depth: i32,
+        ply: i32,
+        mut alpha: i32,
+        beta: i32
+    ) -> (i32, Option<Move>) {
+        // Base case: leaf node evaluation
+        if depth <= 0 {
+            let score = self.quiescence(board, ply, alpha, beta);
+            return (score, None);
+        }
+
+        // Checkmate / stalemate
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.is_empty() {
+            if board.in_check() {
+                return (-30000 + ply, None);  // Checkmate
+            } else {
+                return (0, None);  // Stalemate
+            }
+        }
+
+        // ProbCut pruning
+        if depth >= self.probcut_params.min_depth {
+            if let Some(score) = self.try_probcut(board, depth, beta) {
+                return (score, None);
+            }
+        }
+
+        // Null move pruning
+        if depth >= 3 && !board.in_check() {
+            let null_board = make_null_move(board);
+            let (null_score, _) = self.negamax(&null_board, depth - 3, ply + 1, -beta, -beta + 1);
+            if -null_score >= beta {
+                return (beta, None);
+            }
+        }
+
+        // Sort moves
+        let mut moves: Vec<(Move, i32)> = legal_moves.iter()
+            .map(|m| (*m, self.move_orderer.score_move(*m, board, None, None, ply)))
+            .collect();
+        moves.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut best_move = moves[0].0;
+        let mut best_score = -30000;
+
+        for (i, (mv, _)) in moves.iter().enumerate() {
+            let new_board = make_move(*board, *mv);
+
+            // LMR
+            let mut reduction = 0;
+            if i >= 3 && depth >= 3 && !board.in_check() && !new_board.in_check() {
+                reduction = self.lmr_table.base[depth.min(63) as usize][i.min(63)];
+            }
+
+            let (mut score, _) = self.negamax(
+                &new_board,
+                depth - 1 - reduction,
+                ply + 1,
+                -beta,
+                -alpha
+            );
+            score = -score;
+
+            // Re-search if LMR failed high
+            if reduction > 0 && score > alpha {
+                let (re_score, _) = self.negamax(&new_board, depth - 1, ply + 1, -beta, -alpha);
+                score = -re_score;
+            }
+
+            if score > best_score {
+                best_score = score;
+                best_move = *mv;
+            }
+
+            if score > alpha {
+                alpha = score;
+            }
+
+            if alpha >= beta {
+                self.move_orderer.update_cutoff(*mv, board, depth, ply, None);
+                break;
+            }
+        }
+
+        return (best_score, Some(best_move));
+    }
+
+    fn quiescence(&self, board: &Board, ply: i32, mut alpha: i32, beta: i32) -> i32 {
+        // Stand pat
+        let stand_pat = self.evaluate(board);
+        if stand_pat >= beta {
+            return beta;
+        }
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        // Search captures only
+        let captures = generate_captures(board);
+        for mv in captures {
+            if !see_ge(board, mv, 0) {
+                continue;  // Skip losing captures
+            }
+
+            let new_board = make_move(*board, mv);
+            let score = -self.quiescence(&new_board, ply + 1, -beta, -alpha);
+
+            if score >= beta {
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
+        return alpha;
+    }
+
+    fn evaluate(&self, board: &Board) -> i32 {
+        // Use GPU-batched NNUE evaluation
+        let hash = board.hash();
+        let acc = Accumulator::new();  // Would use incremental in real impl
+
+        self.evaluator.queue_eval(hash, board, &acc);
+        return self.evaluator.wait_for_result(hash);
+    }
+
+    fn try_probcut(&self, board: &Board, depth: i32, beta: i32) -> Option<i32> {
+        let margin = self.probcut_params.margin;
+        let reduction = self.probcut_params.reduction;
+
+        let captures = generate_captures(board);
+        for mv in captures {
+            if !see_ge(board, mv, 0) {
+                continue;
+            }
+
+            let new_board = make_move(*board, mv);
+            let (score, _) = self.negamax(
+                &new_board,
+                depth - reduction,
+                0,
+                -beta - margin,
+                -beta - margin + 1
+            );
+
+            if -score >= beta + margin {
+                return Some(beta);
+            }
+        }
+
+        return None;
+    }
+}
+
+struct ABResult {
+    best_move: Move,
+    score: i32,
+    depth: i32,
+    nodes: i64,
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+fn create_hybrid_engine(
+    config: HybridConfig,
+    network_path: &str,
+    nnue_path: &str
+) -> HybridEngine {
+    return HybridEngine::new(config, network_path, nnue_path);
+}
+
+fn hybrid_search(engine: &HybridEngine, board: &Board, time_ms: i64) -> SearchResult {
+    return engine.search(board, time_ms);
+}

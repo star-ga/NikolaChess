@@ -1,0 +1,583 @@
+// NikolaChess - Unified Chess API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Single entry point for all chess APIs and protocols
+
+import std.sync;
+import std.time;
+import std.thread;
+
+import api.syzygy;
+import api.opening;
+import api.cloud;
+import api.games;
+import api.players;
+import api.http;
+import api.tcp;
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+struct APIConfig {
+    // === Syzygy Tablebase ===
+    syzygy_local_path: Option<str>,
+    syzygy_lan_enabled: bool,
+    syzygy_lan_host: str,
+    syzygy_lan_port: u16,
+    syzygy_remote_enabled: bool,
+    syzygy_remote_url: str,
+
+    // === Opening Books ===
+    polyglot_path: Option<str>,
+    ctg_path: Option<str>,
+    abk_path: Option<str>,
+    lichess_explorer_enabled: bool,
+    chessdb_book_enabled: bool,
+
+    // === Cloud Evaluation ===
+    lichess_cloud_enabled: bool,
+    chessdb_eval_enabled: bool,
+
+    // === Online Play ===
+    lichess_token: Option<str>,
+    chesscom_username: Option<str>,
+    chesscom_password: Option<str>,
+
+    // === Game Databases ===
+    lichess_db_enabled: bool,
+    masters_db_enabled: bool,
+
+    // === Cache Settings ===
+    cache_size: usize,
+    cache_ttl_seconds: i64,
+
+    // === Timeouts ===
+    lan_timeout_ms: i64,
+    remote_timeout_ms: i64,
+
+    // === Threading ===
+    async_probes: bool,
+    max_concurrent_requests: usize,
+}
+
+fn default_config() -> APIConfig {
+    return APIConfig {
+        // Syzygy
+        syzygy_local_path: Some("./syzygy"),
+        syzygy_lan_enabled: false,
+        syzygy_lan_host: "192.168.1.100",
+        syzygy_lan_port: 7777,
+        syzygy_remote_enabled: true,
+        syzygy_remote_url: "https://tablebase.lichess.ovh/standard",
+
+        // Opening books
+        polyglot_path: Some("./books/book.bin"),
+        ctg_path: None,
+        abk_path: None,
+        lichess_explorer_enabled: true,
+        chessdb_book_enabled: true,
+
+        // Cloud eval
+        lichess_cloud_enabled: true,
+        chessdb_eval_enabled: true,
+
+        // Online play
+        lichess_token: None,
+        chesscom_username: None,
+        chesscom_password: None,
+
+        // Game databases
+        lichess_db_enabled: true,
+        masters_db_enabled: true,
+
+        // Cache
+        cache_size: 16_000_000,
+        cache_ttl_seconds: 3600,
+
+        // Timeouts
+        lan_timeout_ms: 50,
+        remote_timeout_ms: 2000,
+
+        // Threading
+        async_probes: true,
+        max_concurrent_requests: 8,
+    };
+}
+
+// ============================================================================
+// PROBE RESULTS
+// ============================================================================
+
+enum ProbeResult {
+    // Tablebase result
+    Tablebase(TablebaseResult),
+
+    // Opening book move
+    Book(BookResult),
+
+    // Cloud evaluation
+    CloudEval(CloudEvalResult),
+
+    // Game statistics
+    GameStats(GameStatsResult),
+
+    // Player info
+    PlayerInfo(PlayerResult),
+
+    // No result
+    None,
+}
+
+struct TablebaseResult {
+    wdl: i32,              // -2 to +2
+    dtz: i32,              // Distance to zeroing
+    best_move: Move,
+    source: str,           // "local", "lan", "lichess", "chessdb"
+}
+
+struct BookResult {
+    moves: Vec<BookMove>,
+    source: str,           // "polyglot", "ctg", "lichess", "chessdb"
+}
+
+struct BookMove {
+    mv: Move,
+    weight: i32,
+    win_pct: f32,
+    draw_pct: f32,
+    loss_pct: f32,
+    games: i64,
+    avg_elo: i32,
+}
+
+struct CloudEvalResult {
+    score_cp: i32,
+    depth: i32,
+    pv: Vec<Move>,
+    knodes: i64,
+    source: str,           // "lichess", "chessdb"
+}
+
+struct GameStatsResult {
+    total_games: i64,
+    white_wins: i64,
+    draws: i64,
+    black_wins: i64,
+    avg_elo: i32,
+    top_moves: Vec<BookMove>,
+}
+
+struct PlayerResult {
+    name: str,
+    rating_bullet: i32,
+    rating_blitz: i32,
+    rating_rapid: i32,
+    rating_classical: i32,
+    online: bool,
+    title: Option<str>,
+}
+
+// ============================================================================
+// UNIFIED CHESS API
+// ============================================================================
+
+struct ChessAPI {
+    config: APIConfig,
+
+    // Syzygy subsystem
+    syzygy: SyzygyUnified,
+
+    // Opening book subsystem
+    opening: OpeningUnified,
+
+    // Cloud eval subsystem
+    cloud: CloudUnified,
+
+    // Game database subsystem
+    games: GamesUnified,
+
+    // Player database subsystem
+    players: PlayersUnified,
+
+    // HTTP client pool
+    http_pool: HttpClientPool,
+
+    // Unified cache
+    cache: UnifiedCache,
+
+    // Statistics
+    stats: APIStats,
+
+    // Thread pool for async probes
+    thread_pool: ThreadPool,
+}
+
+struct APIStats {
+    syzygy_probes: i64,
+    syzygy_hits: i64,
+    book_probes: i64,
+    book_hits: i64,
+    cloud_probes: i64,
+    cloud_hits: i64,
+    cache_hits: i64,
+    total_requests: i64,
+    avg_latency_ms: f32,
+}
+
+fn create_api(config: APIConfig) -> ChessAPI {
+    println!("Initializing NikolaChess Unified API...");
+
+    // Initialize subsystems
+    let syzygy = create_syzygy_unified(&config);
+    let opening = create_opening_unified(&config);
+    let cloud = create_cloud_unified(&config);
+    let games = create_games_unified(&config);
+    let players = create_players_unified(&config);
+
+    // Initialize HTTP pool
+    let http_pool = create_http_pool(config.max_concurrent_requests);
+
+    // Initialize cache
+    let cache = create_unified_cache(config.cache_size, config.cache_ttl_seconds);
+
+    // Initialize thread pool
+    let thread_pool = ThreadPool::new(config.max_concurrent_requests);
+
+    println!("API initialized successfully");
+
+    return ChessAPI {
+        config: config,
+        syzygy: syzygy,
+        opening: opening,
+        cloud: cloud,
+        games: games,
+        players: players,
+        http_pool: http_pool,
+        cache: cache,
+        stats: APIStats::default(),
+        thread_pool: thread_pool,
+    };
+}
+
+// ============================================================================
+// UNIFIED PROBE FUNCTIONS
+// ============================================================================
+
+// Main probe function - checks all sources intelligently
+fn probe_position(api: &mut ChessAPI, board: Board) -> ProbeResult {
+    let hash = board.hash;
+    let start = time.now_ms();
+    api.stats.total_requests += 1;
+
+    // 1. Check unified cache
+    if let Some(cached) = api.cache.get(hash) {
+        api.stats.cache_hits += 1;
+        return cached;
+    }
+
+    let fen = board_to_fen(board);
+    let pieces = popcount(board.occupancy[0] | board.occupancy[1]);
+    let fullmove = board.fullmove;
+
+    // 2. Tablebase (≤7 pieces, endgame)
+    if pieces <= 7 {
+        api.stats.syzygy_probes += 1;
+        if let Some(tb) = probe_syzygy(api, board) {
+            api.stats.syzygy_hits += 1;
+            let result = ProbeResult::Tablebase(tb);
+            api.cache.insert(hash, result.clone());
+            update_latency(&mut api.stats, start);
+            return result;
+        }
+    }
+
+    // 3. Opening book (first 20 moves)
+    if fullmove <= 20 {
+        api.stats.book_probes += 1;
+        if let Some(book) = probe_opening(api, board, fen) {
+            api.stats.book_hits += 1;
+            let result = ProbeResult::Book(book);
+            api.cache.insert(hash, result.clone());
+            update_latency(&mut api.stats, start);
+            return result;
+        }
+    }
+
+    // 4. Cloud evaluation (midgame positions)
+    if pieces > 7 && pieces <= 24 {
+        api.stats.cloud_probes += 1;
+        if let Some(cloud) = probe_cloud(api, fen) {
+            api.stats.cloud_hits += 1;
+            let result = ProbeResult::CloudEval(cloud);
+            api.cache.insert(hash, result.clone());
+            update_latency(&mut api.stats, start);
+            return result;
+        }
+    }
+
+    update_latency(&mut api.stats, start);
+    return ProbeResult::None;
+}
+
+// Async probe - returns immediately, result via callback
+fn probe_position_async(
+    api: &mut ChessAPI,
+    board: Board,
+    callback: fn(ProbeResult)
+) {
+    let api_ref = api.clone();  // Thread-safe reference
+
+    api.thread_pool.spawn(move || {
+        let result = probe_position(&mut api_ref, board);
+        callback(result);
+    });
+}
+
+// Batch probe - multiple positions at once
+fn probe_batch(
+    api: &mut ChessAPI,
+    boards: &[Board]
+) -> Vec<ProbeResult> {
+    let mut results = Vec::with_capacity(boards.len());
+
+    if api.config.async_probes && boards.len() > 4 {
+        // Parallel probing
+        let futures: Vec<_> = boards.iter().map(|board| {
+            let api_ref = api.clone();
+            let b = *board;
+            api.thread_pool.spawn_future(move || {
+                probe_position(&mut api_ref, b)
+            })
+        }).collect();
+
+        for future in futures {
+            results.push(future.await());
+        }
+    } else {
+        // Sequential probing
+        for board in boards {
+            results.push(probe_position(api, *board));
+        }
+    }
+
+    return results;
+}
+
+fn update_latency(stats: &mut APIStats, start: i64) {
+    let elapsed = time.now_ms() - start;
+    let n = stats.total_requests as f32;
+    stats.avg_latency_ms = (stats.avg_latency_ms * (n - 1.0) + elapsed as f32) / n;
+}
+
+// ============================================================================
+// SYZYGY PROBING
+// ============================================================================
+
+fn probe_syzygy(api: &mut ChessAPI, board: Board) -> Option<TablebaseResult> {
+    let hash = board.hash;
+
+    // Try local first (fastest)
+    if api.syzygy.local_loaded {
+        if let Some(result) = api.syzygy.probe_local(board) {
+            return Some(TablebaseResult {
+                wdl: result.wdl,
+                dtz: result.dtz,
+                best_move: result.best_move,
+                source: "local",
+            });
+        }
+    }
+
+    // Try LAN server (fast)
+    if api.config.syzygy_lan_enabled && api.syzygy.lan_connected {
+        if let Some(result) = api.syzygy.probe_lan(board) {
+            return Some(TablebaseResult {
+                wdl: result.wdl,
+                dtz: result.dtz,
+                best_move: result.best_move,
+                source: "lan",
+            });
+        }
+    }
+
+    // Try remote Lichess API
+    if api.config.syzygy_remote_enabled {
+        let fen = board_to_fen(board);
+        if let Some(result) = probe_lichess_tablebase(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            return Some(TablebaseResult {
+                wdl: result.wdl,
+                dtz: result.dtz,
+                best_move: result.best_move,
+                source: "lichess",
+            });
+        }
+    }
+
+    return None;
+}
+
+// ============================================================================
+// OPENING BOOK PROBING
+// ============================================================================
+
+fn probe_opening(api: &mut ChessAPI, board: Board, fen: str) -> Option<BookResult> {
+    let mut all_moves: Vec<BookMove> = Vec::new();
+    let mut source = "none";
+
+    // 1. Local Polyglot book
+    if let Some(path) = &api.config.polyglot_path {
+        if let Some(moves) = api.opening.probe_polyglot(board) {
+            all_moves.extend(moves);
+            source = "polyglot";
+        }
+    }
+
+    // 2. Local CTG book (ChessBase format)
+    if let Some(path) = &api.config.ctg_path {
+        if let Some(moves) = api.opening.probe_ctg(board) {
+            merge_book_moves(&mut all_moves, moves);
+            if source == "none" { source = "ctg"; }
+        }
+    }
+
+    // 3. Local ABK book (Arena format)
+    if let Some(path) = &api.config.abk_path {
+        if let Some(moves) = api.opening.probe_abk(board) {
+            merge_book_moves(&mut all_moves, moves);
+            if source == "none" { source = "abk"; }
+        }
+    }
+
+    // 4. Lichess Explorer API
+    if api.config.lichess_explorer_enabled && all_moves.is_empty() {
+        if let Some(moves) = probe_lichess_explorer(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            all_moves.extend(moves);
+            source = "lichess";
+        }
+    }
+
+    // 5. ChessDB Opening API
+    if api.config.chessdb_book_enabled && all_moves.is_empty() {
+        if let Some(moves) = probe_chessdb_book(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            all_moves.extend(moves);
+            source = "chessdb";
+        }
+    }
+
+    if all_moves.is_empty() {
+        return None;
+    }
+
+    // Sort by weight/games
+    all_moves.sort_by(|a, b| b.weight.cmp(&a.weight));
+
+    return Some(BookResult {
+        moves: all_moves,
+        source: source,
+    });
+}
+
+fn merge_book_moves(target: &mut Vec<BookMove>, source: Vec<BookMove>) {
+    for mv in source {
+        let exists = target.iter().any(|m| m.mv.data == mv.mv.data);
+        if !exists {
+            target.push(mv);
+        }
+    }
+}
+
+// ============================================================================
+// CLOUD EVALUATION PROBING
+// ============================================================================
+
+fn probe_cloud(api: &mut ChessAPI, fen: str) -> Option<CloudEvalResult> {
+    // 1. Lichess Cloud Eval
+    if api.config.lichess_cloud_enabled {
+        if let Some(eval) = probe_lichess_cloud(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            return Some(CloudEvalResult {
+                score_cp: eval.score_cp,
+                depth: eval.depth,
+                pv: eval.pv,
+                knodes: eval.knodes,
+                source: "lichess",
+            });
+        }
+    }
+
+    // 2. ChessDB Eval
+    if api.config.chessdb_eval_enabled {
+        if let Some(eval) = probe_chessdb_eval(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            return Some(CloudEvalResult {
+                score_cp: eval.score_cp,
+                depth: eval.depth,
+                pv: eval.pv,
+                knodes: eval.knodes,
+                source: "chessdb",
+            });
+        }
+    }
+
+    return None;
+}
+
+// ============================================================================
+// GAME DATABASE QUERIES
+// ============================================================================
+
+fn query_games(api: &mut ChessAPI, fen: str) -> Option<GameStatsResult> {
+    // Lichess database
+    if api.config.lichess_db_enabled {
+        if let Some(stats) = query_lichess_games(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            return Some(stats);
+        }
+    }
+
+    // Masters database
+    if api.config.masters_db_enabled {
+        if let Some(stats) = query_masters_games(&api.http_pool, fen, api.config.remote_timeout_ms) {
+            return Some(stats);
+        }
+    }
+
+    return None;
+}
+
+fn query_player(api: &mut ChessAPI, username: str, platform: str) -> Option<PlayerResult> {
+    match platform {
+        "lichess" => query_lichess_player(&api.http_pool, username, api.config.remote_timeout_ms),
+        "chesscom" => query_chesscom_player(&api.http_pool, username, api.config.remote_timeout_ms),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn print_api_stats(api: &ChessAPI) {
+    println!("=== NikolaChess API Statistics ===");
+    println!("");
+    println!("Total requests:    {}", api.stats.total_requests);
+    println!("Cache hits:        {} ({:.1}%)", api.stats.cache_hits,
+             100.0 * api.stats.cache_hits as f32 / api.stats.total_requests.max(1) as f32);
+    println!("");
+    println!("Syzygy probes:     {}", api.stats.syzygy_probes);
+    println!("Syzygy hits:       {} ({:.1}%)", api.stats.syzygy_hits,
+             100.0 * api.stats.syzygy_hits as f32 / api.stats.syzygy_probes.max(1) as f32);
+    println!("");
+    println!("Book probes:       {}", api.stats.book_probes);
+    println!("Book hits:         {} ({:.1}%)", api.stats.book_hits,
+             100.0 * api.stats.book_hits as f32 / api.stats.book_probes.max(1) as f32);
+    println!("");
+    println!("Cloud probes:      {}", api.stats.cloud_probes);
+    println!("Cloud hits:        {} ({:.1}%)", api.stats.cloud_hits,
+             100.0 * api.stats.cloud_hits as f32 / api.stats.cloud_probes.max(1) as f32);
+    println!("");
+    println!("Avg latency:       {:.1}ms", api.stats.avg_latency_ms);
+}
+
+fn reset_stats(api: &mut ChessAPI) {
+    api.stats = APIStats::default();
+}

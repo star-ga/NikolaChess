@@ -1,0 +1,790 @@
+// NikolaChess - TCP Client/Server Module
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// TCP networking for LAN communication:
+// - TCP client for connecting to servers
+// - TCP server for hosting services
+// - Connection pooling
+// - Protocol abstraction
+
+import std.net;
+import std.sync;
+import std.time;
+
+// ============================================================================
+// TCP CLIENT
+// ============================================================================
+
+struct TcpClient {
+    socket: Option<TcpStream>,
+    address: str,
+    port: u16,
+    timeout_ms: i64,
+    connected: bool,
+    read_buffer: Vec<u8>,
+}
+
+impl TcpClient {
+    fn new(address: &str, port: u16) -> TcpClient {
+        return TcpClient {
+            socket: None,
+            address: address.to_string(),
+            port: port,
+            timeout_ms: 5000,
+            connected: false,
+            read_buffer: Vec::with_capacity(4096),
+        };
+    }
+
+    fn with_timeout(mut self, timeout_ms: i64) -> Self {
+        self.timeout_ms = timeout_ms;
+        return self;
+    }
+
+    fn connect(&mut self) -> Result<(), TcpError> {
+        let addr = format!("{}:{}", self.address, self.port);
+
+        let socket = net::tcp_connect(&addr, self.timeout_ms)
+            .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
+
+        // Set socket options
+        socket.set_nodelay(true)?;
+        socket.set_read_timeout(Some(Duration::from_millis(self.timeout_ms as u64)))?;
+
+        self.socket = Some(socket);
+        self.connected = true;
+
+        return Ok(());
+    }
+
+    fn disconnect(&mut self) {
+        if let Some(ref mut socket) = self.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        self.socket = None;
+        self.connected = false;
+    }
+
+    fn is_connected(&self) -> bool {
+        return self.connected;
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<(), TcpError> {
+        let socket = self.socket.as_mut()
+            .ok_or(TcpError::NotConnected)?;
+
+        socket.write_all(data)
+            .map_err(|e| TcpError::SendFailed(e.to_string()))?;
+
+        return Ok(());
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<(), TcpError> {
+        let mut data = line.as_bytes().to_vec();
+        data.push(b'\n');
+        return self.send(&data);
+    }
+
+    fn receive(&mut self, max_bytes: usize) -> Result<Vec<u8>, TcpError> {
+        let socket = self.socket.as_mut()
+            .ok_or(TcpError::NotConnected)?;
+
+        let mut buffer = vec![0u8; max_bytes];
+        let n = socket.read(&mut buffer)
+            .map_err(|e| TcpError::ReceiveFailed(e.to_string()))?;
+
+        buffer.truncate(n);
+        return Ok(buffer);
+    }
+
+    fn receive_line(&mut self) -> Result<String, TcpError> {
+        // Check if we have a complete line in buffer
+        if let Some(newline_pos) = self.read_buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.read_buffer.drain(..=newline_pos).collect();
+            let line_str = String::from_utf8_lossy(&line[..line.len()-1]).to_string();
+            return Ok(line_str);
+        }
+
+        // Read more data until we have a line
+        let socket = self.socket.as_mut()
+            .ok_or(TcpError::NotConnected)?;
+
+        let mut temp_buffer = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut temp_buffer)
+                .map_err(|e| TcpError::ReceiveFailed(e.to_string()))?;
+
+            if n == 0 {
+                return Err(TcpError::ConnectionClosed);
+            }
+
+            self.read_buffer.extend_from_slice(&temp_buffer[..n]);
+
+            // Check for complete line
+            if let Some(newline_pos) = self.read_buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.read_buffer.drain(..=newline_pos).collect();
+                let line_str = String::from_utf8_lossy(&line[..line.len()-1]).to_string();
+                return Ok(line_str);
+            }
+
+            // Prevent buffer overflow
+            if self.read_buffer.len() > 65536 {
+                return Err(TcpError::BufferOverflow);
+            }
+        }
+    }
+
+    fn receive_all(&mut self, timeout_ms: i64) -> Result<Vec<u8>, TcpError> {
+        let socket = self.socket.as_mut()
+            .ok_or(TcpError::NotConnected)?;
+
+        socket.set_read_timeout(Some(Duration::from_millis(timeout_ms as u64)))?;
+
+        let mut result = self.read_buffer.clone();
+        self.read_buffer.clear();
+
+        let mut temp_buffer = [0u8; 4096];
+        loop {
+            match socket.read(&mut temp_buffer) {
+                Ok(0) => break,  // Connection closed
+                Ok(n) => result.extend_from_slice(&temp_buffer[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                Err(e) => return Err(TcpError::ReceiveFailed(e.to_string())),
+            }
+        }
+
+        return Ok(result);
+    }
+}
+
+impl Drop for TcpClient {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
+// ============================================================================
+// TCP SERVER
+// ============================================================================
+
+struct TcpServer {
+    listener: Option<TcpListener>,
+    address: str,
+    port: u16,
+    running: AtomicBool,
+    clients: Mutex<Vec<TcpClientConnection>>,
+    max_clients: usize,
+}
+
+struct TcpClientConnection {
+    id: u64,
+    socket: TcpStream,
+    address: SocketAddr,
+    connected_at: Instant,
+    last_activity: Instant,
+}
+
+impl TcpServer {
+    fn new(address: &str, port: u16) -> TcpServer {
+        return TcpServer {
+            listener: None,
+            address: address.to_string(),
+            port: port,
+            running: AtomicBool::new(false),
+            clients: Mutex::new(Vec::new()),
+            max_clients: 100,
+        };
+    }
+
+    fn with_max_clients(mut self, max: usize) -> Self {
+        self.max_clients = max;
+        return self;
+    }
+
+    fn bind(&mut self) -> Result<(), TcpError> {
+        let addr = format!("{}:{}", self.address, self.port);
+
+        let listener = TcpListener::bind(&addr)
+            .map_err(|e| TcpError::BindFailed(e.to_string()))?;
+
+        // Set non-blocking for accept
+        listener.set_nonblocking(true)?;
+
+        self.listener = Some(listener);
+        return Ok(());
+    }
+
+    fn start<F>(&mut self, handler: F) -> Result<(), TcpError>
+    where
+        F: Fn(&mut TcpClientConnection, &str) -> Option<String> + Send + Sync + 'static
+    {
+        let listener = self.listener.as_ref()
+            .ok_or(TcpError::NotBound)?;
+
+        self.running.store(true, Ordering::SeqCst);
+
+        println!("TCP Server listening on {}:{}", self.address, self.port);
+
+        let handler = Arc::new(handler);
+        let mut next_client_id = 0u64;
+
+        while self.running.load(Ordering::SeqCst) {
+            // Accept new connections
+            match listener.accept() {
+                Ok((socket, addr)) => {
+                    // Check max clients
+                    let clients = self.clients.lock().unwrap();
+                    if clients.len() >= self.max_clients {
+                        drop(socket);  // Reject connection
+                        continue;
+                    }
+                    drop(clients);
+
+                    // Set socket options
+                    socket.set_nodelay(true).ok();
+                    socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
+
+                    let client = TcpClientConnection {
+                        id: next_client_id,
+                        socket: socket,
+                        address: addr,
+                        connected_at: Instant::now(),
+                        last_activity: Instant::now(),
+                    };
+
+                    next_client_id += 1;
+
+                    println!("Client connected: {} (ID: {})", addr, client.id);
+
+                    let mut clients = self.clients.lock().unwrap();
+                    clients.push(client);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No pending connections
+                }
+                Err(e) => {
+                    eprintln!("Accept error: {}", e);
+                }
+            }
+
+            // Process existing clients
+            let mut clients = self.clients.lock().unwrap();
+            let mut to_remove = Vec::new();
+
+            for client in clients.iter_mut() {
+                match read_client_line(client) {
+                    Ok(Some(line)) => {
+                        client.last_activity = Instant::now();
+
+                        // Handle the request
+                        if let Some(response) = handler(client, &line) {
+                            if let Err(e) = write_client_line(client, &response) {
+                                eprintln!("Write error for client {}: {}", client.id, e);
+                                to_remove.push(client.id);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No data available
+                    }
+                    Err(TcpError::ConnectionClosed) => {
+                        println!("Client disconnected: {} (ID: {})", client.address, client.id);
+                        to_remove.push(client.id);
+                    }
+                    Err(e) => {
+                        eprintln!("Read error for client {}: {:?}", client.id, e);
+                        to_remove.push(client.id);
+                    }
+                }
+
+                // Check for idle timeout (5 minutes)
+                if client.last_activity.elapsed() > Duration::from_secs(300) {
+                    println!("Client timed out: {} (ID: {})", client.address, client.id);
+                    to_remove.push(client.id);
+                }
+            }
+
+            // Remove disconnected clients
+            clients.retain(|c| !to_remove.contains(&c.id));
+            drop(clients);
+
+            // Small sleep to prevent busy loop
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        return Ok(());
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+
+        // Close all client connections
+        let mut clients = self.clients.lock().unwrap();
+        clients.clear();
+
+        // Close listener
+        self.listener = None;
+    }
+
+    fn client_count(&self) -> usize {
+        let clients = self.clients.lock().unwrap();
+        return clients.len();
+    }
+
+    fn broadcast(&self, message: &str) {
+        let mut clients = self.clients.lock().unwrap();
+        let mut to_remove = Vec::new();
+
+        for client in clients.iter_mut() {
+            if let Err(_) = write_client_line(client, message) {
+                to_remove.push(client.id);
+            }
+        }
+
+        clients.retain(|c| !to_remove.contains(&c.id));
+    }
+}
+
+fn read_client_line(client: &mut TcpClientConnection) -> Result<Option<String>, TcpError> {
+    let mut buffer = [0u8; 1024];
+
+    match client.socket.read(&mut buffer) {
+        Ok(0) => Err(TcpError::ConnectionClosed),
+        Ok(n) => {
+            let data = &buffer[..n];
+            // Find newline
+            if let Some(newline_pos) = data.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&data[..newline_pos]).to_string();
+                return Ok(Some(line));
+            }
+            return Ok(None);
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(e) => Err(TcpError::ReceiveFailed(e.to_string())),
+    }
+}
+
+fn write_client_line(client: &mut TcpClientConnection, line: &str) -> Result<(), TcpError> {
+    let mut data = line.as_bytes().to_vec();
+    data.push(b'\n');
+
+    client.socket.write_all(&data)
+        .map_err(|e| TcpError::SendFailed(e.to_string()))?;
+
+    return Ok(());
+}
+
+// ============================================================================
+// CONNECTION POOL
+// ============================================================================
+
+struct TcpConnectionPool {
+    address: str,
+    port: u16,
+    connections: Mutex<Vec<TcpClient>>,
+    max_connections: usize,
+    timeout_ms: i64,
+}
+
+impl TcpConnectionPool {
+    fn new(address: &str, port: u16, max_connections: usize) -> TcpConnectionPool {
+        return TcpConnectionPool {
+            address: address.to_string(),
+            port: port,
+            connections: Mutex::new(Vec::new()),
+            max_connections: max_connections,
+            timeout_ms: 5000,
+        };
+    }
+
+    fn get(&self) -> Result<PooledConnection, TcpError> {
+        // Try to get an existing connection
+        let mut connections = self.connections.lock().unwrap();
+
+        if let Some(mut client) = connections.pop() {
+            if client.is_connected() {
+                return Ok(PooledConnection {
+                    client: Some(client),
+                    pool: self,
+                });
+            }
+        }
+
+        drop(connections);
+
+        // Create new connection
+        let mut client = TcpClient::new(&self.address, self.port)
+            .with_timeout(self.timeout_ms);
+
+        client.connect()?;
+
+        return Ok(PooledConnection {
+            client: Some(client),
+            pool: self,
+        });
+    }
+
+    fn return_connection(&self, client: TcpClient) {
+        let mut connections = self.connections.lock().unwrap();
+
+        if connections.len() < self.max_connections && client.is_connected() {
+            connections.push(client);
+        }
+        // Otherwise the connection is dropped
+    }
+
+    fn clear(&self) {
+        let mut connections = self.connections.lock().unwrap();
+        connections.clear();
+    }
+}
+
+struct PooledConnection<'a> {
+    client: Option<TcpClient>,
+    pool: &'a TcpConnectionPool,
+}
+
+impl<'a> PooledConnection<'a> {
+    fn send(&mut self, data: &[u8]) -> Result<(), TcpError> {
+        self.client.as_mut().unwrap().send(data)
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<(), TcpError> {
+        self.client.as_mut().unwrap().send_line(line)
+    }
+
+    fn receive_line(&mut self) -> Result<String, TcpError> {
+        self.client.as_mut().unwrap().receive_line()
+    }
+}
+
+impl<'a> Drop for PooledConnection<'a> {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.pool.return_connection(client);
+        }
+    }
+}
+
+// ============================================================================
+// LAN SERVICE DISCOVERY
+// ============================================================================
+
+struct ServiceDiscovery {
+    multicast_addr: str,
+    port: u16,
+    services: Mutex<Vec<DiscoveredService>>,
+}
+
+struct DiscoveredService {
+    name: str,
+    address: str,
+    port: u16,
+    service_type: str,
+    discovered_at: Instant,
+}
+
+impl ServiceDiscovery {
+    fn new() -> ServiceDiscovery {
+        return ServiceDiscovery {
+            multicast_addr: "239.255.255.250".to_string(),
+            port: 1900,
+            services: Mutex::new(Vec::new()),
+        };
+    }
+
+    fn announce(&self, service_name: &str, service_type: &str, port: u16) -> Result<(), TcpError> {
+        // Create UDP socket for multicast
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| TcpError::BindFailed(e.to_string()))?;
+
+        // Build announcement
+        let local_ip = get_local_ip()?;
+        let announcement = format!(
+            "ANNOUNCE {} {} {} {}",
+            service_name, service_type, local_ip, port
+        );
+
+        // Send to multicast group
+        let addr = format!("{}:{}", self.multicast_addr, self.port);
+        socket.send_to(announcement.as_bytes(), &addr)
+            .map_err(|e| TcpError::SendFailed(e.to_string()))?;
+
+        return Ok(());
+    }
+
+    fn discover(&self, service_type: &str, timeout_ms: i64) -> Vec<DiscoveredService> {
+        // Create UDP socket for receiving
+        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", self.port)) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        // Join multicast group
+        let _ = socket.join_multicast_v4(
+            &self.multicast_addr.parse().unwrap(),
+            &"0.0.0.0".parse().unwrap()
+        );
+
+        // Set timeout
+        socket.set_read_timeout(Some(Duration::from_millis(timeout_ms as u64))).ok();
+
+        // Send discovery request
+        let request = format!("DISCOVER {}", service_type);
+        let addr = format!("{}:{}", self.multicast_addr, self.port);
+        let _ = socket.send_to(request.as_bytes(), &addr);
+
+        // Collect responses
+        let mut discovered = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+        while Instant::now() < deadline {
+            match socket.recv_from(&mut buffer) {
+                Ok((n, _addr)) => {
+                    let response = String::from_utf8_lossy(&buffer[..n]);
+                    if let Some(service) = parse_announcement(&response) {
+                        if service.service_type == service_type {
+                            discovered.push(service);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        return discovered;
+    }
+}
+
+fn parse_announcement(s: &str) -> Option<DiscoveredService> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() >= 5 && parts[0] == "ANNOUNCE" {
+        return Some(DiscoveredService {
+            name: parts[1].to_string(),
+            service_type: parts[2].to_string(),
+            address: parts[3].to_string(),
+            port: parts[4].parse().ok()?,
+            discovered_at: Instant::now(),
+        });
+    }
+    return None;
+}
+
+fn get_local_ip() -> Result<String, TcpError> {
+    // Connect to external address to determine local IP
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| TcpError::BindFailed(e.to_string()))?;
+
+    socket.connect("8.8.8.8:80")
+        .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
+
+    let local_addr = socket.local_addr()
+        .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
+
+    return Ok(local_addr.ip().to_string());
+}
+
+// ============================================================================
+// CHESS-SPECIFIC LAN PROTOCOLS
+// ============================================================================
+
+// LAN Tablebase Server Protocol
+struct LanTablebaseClient {
+    pool: TcpConnectionPool,
+}
+
+impl LanTablebaseClient {
+    fn new(address: &str, port: u16) -> LanTablebaseClient {
+        return LanTablebaseClient {
+            pool: TcpConnectionPool::new(address, port, 4),
+        };
+    }
+
+    fn probe(&self, fen: &str) -> Option<TablebaseResult> {
+        let mut conn = self.pool.get().ok()?;
+
+        // Send probe request
+        let request = format!("PROBE {}", fen);
+        conn.send_line(&request).ok()?;
+
+        // Receive response
+        let response = conn.receive_line().ok()?;
+
+        // Parse response: "WDL <wdl> DTZ <dtz> MOVE <uci>"
+        parse_tablebase_response(&response)
+    }
+}
+
+fn parse_tablebase_response(response: &str) -> Option<TablebaseResult> {
+    let parts: Vec<&str> = response.split_whitespace().collect();
+
+    let mut wdl = 0i32;
+    let mut dtz = 0i32;
+    let mut best_move = None;
+
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            "WDL" if i + 1 < parts.len() => {
+                wdl = parts[i + 1].parse().ok()?;
+                i += 2;
+            }
+            "DTZ" if i + 1 < parts.len() => {
+                dtz = parts[i + 1].parse().ok()?;
+                i += 2;
+            }
+            "MOVE" if i + 1 < parts.len() => {
+                best_move = parse_uci_move(parts[i + 1]);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    return Some(TablebaseResult {
+        wdl: wdl,
+        dtz: dtz,
+        best_move: best_move,
+    });
+}
+
+// LAN Analysis Server Protocol
+struct LanAnalysisClient {
+    pool: TcpConnectionPool,
+}
+
+impl LanAnalysisClient {
+    fn new(address: &str, port: u16) -> LanAnalysisClient {
+        return LanAnalysisClient {
+            pool: TcpConnectionPool::new(address, port, 4),
+        };
+    }
+
+    fn analyze(&self, fen: &str, depth: i32) -> Option<AnalysisResult> {
+        let mut conn = self.pool.get().ok()?;
+
+        // Send analysis request
+        let request = format!("ANALYZE {} depth {}", fen, depth);
+        conn.send_line(&request).ok()?;
+
+        // Receive response lines until "DONE"
+        let mut lines = Vec::new();
+        loop {
+            let response = conn.receive_line().ok()?;
+            if response == "DONE" {
+                break;
+            }
+            lines.push(response);
+        }
+
+        // Parse analysis result
+        parse_analysis_response(&lines)
+    }
+}
+
+fn parse_analysis_response(lines: &[String]) -> Option<AnalysisResult> {
+    // Parse UCI-style info lines
+    let mut result = AnalysisResult {
+        lines: Vec::new(),
+        depth: 0,
+        knodes: 0,
+        time_ms: 0,
+    };
+
+    for line in lines {
+        if line.starts_with("info") {
+            if let Some(analysis_line) = parse_info_line(line) {
+                result.depth = result.depth.max(analysis_line.depth);
+                result.lines.push(analysis_line);
+            }
+        }
+    }
+
+    return Some(result);
+}
+
+fn parse_info_line(line: &str) -> Option<AnalysisLine> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+
+    let mut depth = 0i32;
+    let mut score_cp = 0i32;
+    let mut score_mate = None;
+    let mut pv = Vec::new();
+
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            "depth" if i + 1 < parts.len() => {
+                depth = parts[i + 1].parse().ok()?;
+                i += 2;
+            }
+            "score" if i + 2 < parts.len() => {
+                match parts[i + 1] {
+                    "cp" => {
+                        score_cp = parts[i + 2].parse().ok()?;
+                    }
+                    "mate" => {
+                        score_mate = Some(parts[i + 2].parse().ok()?);
+                    }
+                    _ => {}
+                }
+                i += 3;
+            }
+            "pv" => {
+                for mv_str in &parts[i + 1..] {
+                    if let Some(mv) = parse_uci_move(mv_str) {
+                        pv.push(mv);
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+
+    return Some(AnalysisLine {
+        score_cp: score_cp,
+        score_mate: score_mate,
+        pv: pv,
+        depth: depth,
+    });
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+enum TcpError {
+    ConnectionFailed(str),
+    NotConnected,
+    NotBound,
+    BindFailed(str),
+    SendFailed(str),
+    ReceiveFailed(str),
+    ConnectionClosed,
+    BufferOverflow,
+    Timeout,
+}
+
+impl std::fmt::Display for TcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            TcpError::ConnectionFailed(s) => write!(f, "Connection failed: {}", s),
+            TcpError::NotConnected => write!(f, "Not connected"),
+            TcpError::NotBound => write!(f, "Server not bound"),
+            TcpError::BindFailed(s) => write!(f, "Bind failed: {}", s),
+            TcpError::SendFailed(s) => write!(f, "Send failed: {}", s),
+            TcpError::ReceiveFailed(s) => write!(f, "Receive failed: {}", s),
+            TcpError::ConnectionClosed => write!(f, "Connection closed"),
+            TcpError::BufferOverflow => write!(f, "Buffer overflow"),
+            TcpError::Timeout => write!(f, "Timeout"),
+        }
+    }
+}
+

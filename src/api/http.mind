@@ -1,0 +1,591 @@
+// NikolaChess - HTTP Client Module
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// HTTP client for API communication:
+// - Connection pooling
+// - Timeout handling
+// - JSON parsing
+// - URL encoding
+
+import std.net;
+import std.sync;
+import std.time;
+
+// ============================================================================
+// HTTP CLIENT
+// ============================================================================
+
+struct HttpClient {
+    timeout_ms: i64,
+    user_agent: str,
+}
+
+fn HttpClient::new() -> HttpClient {
+    return HttpClient {
+        timeout_ms: 5000,
+        user_agent: "NikolaChess/1.0",
+    };
+}
+
+// ============================================================================
+// HTTP CLIENT POOL
+// ============================================================================
+
+struct HttpClientPool {
+    clients: Vec<HttpClient>,
+    max_clients: usize,
+    active: AtomicUsize,
+    lock: Mutex<()>,
+}
+
+fn HttpClientPool::new(max_clients: usize) -> HttpClientPool {
+    let mut clients = Vec::with_capacity(max_clients);
+    for _ in 0..max_clients {
+        clients.push(HttpClient::new());
+    }
+
+    return HttpClientPool {
+        clients: clients,
+        max_clients: max_clients,
+        active: AtomicUsize::new(0),
+        lock: Mutex::new(()),
+    };
+}
+
+// ============================================================================
+// HTTP REQUEST BUILDER
+// ============================================================================
+
+struct HttpRequest {
+    method: str,
+    url: str,
+    headers: Vec<(str, str)>,
+    body: Option<str>,
+    timeout_ms: i64,
+    pool: *const HttpClientPool,
+}
+
+impl HttpClientPool {
+    fn get(&self, url: &str) -> HttpRequest {
+        return HttpRequest {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: 5000,
+            pool: self as *const HttpClientPool,
+        };
+    }
+
+    fn post(&self, url: &str) -> HttpRequest {
+        return HttpRequest {
+            method: "POST".to_string(),
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: 5000,
+            pool: self as *const HttpClientPool,
+        };
+    }
+}
+
+impl HttpRequest {
+    fn header(mut self, key: &str, value: &str) -> Self {
+        self.headers.push((key.to_string(), value.to_string()));
+        return self;
+    }
+
+    fn timeout(mut self, ms: i64) -> Self {
+        self.timeout_ms = ms;
+        return self;
+    }
+
+    fn body(mut self, body: &str) -> Self {
+        self.body = Some(body.to_string());
+        return self;
+    }
+
+    fn json_body(mut self, json: &str) -> Self {
+        self.headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        self.body = Some(json.to_string());
+        return self;
+    }
+
+    fn send(self) -> Result<HttpResponse, HttpError> {
+        // Build raw HTTP request
+        let host = extract_host(&self.url);
+        let path = extract_path(&self.url);
+        let is_https = self.url.starts_with("https://");
+        let port = if is_https { 443 } else { 80 };
+
+        // Connect
+        let socket = if is_https {
+            net.tls_connect(&host, port, self.timeout_ms)?
+        } else {
+            net.tcp_connect(&format!("{}:{}", host, port), self.timeout_ms)?
+        };
+
+        // Build request string
+        let mut request_str = format!("{} {} HTTP/1.1\r\n", self.method, path);
+        request_str.push_str(&format!("Host: {}\r\n", host));
+        request_str.push_str("Connection: close\r\n");
+        request_str.push_str("User-Agent: NikolaChess/1.0\r\n");
+
+        for (key, value) in &self.headers {
+            request_str.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
+        if let Some(ref body) = self.body {
+            request_str.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            request_str.push_str("\r\n");
+            request_str.push_str(body);
+        } else {
+            request_str.push_str("\r\n");
+        }
+
+        // Send request
+        socket.write_all(request_str.as_bytes())?;
+
+        // Read response with timeout
+        let response_data = socket.read_all_timeout(self.timeout_ms)?;
+        let response_str = String::from_utf8_lossy(&response_data);
+
+        // Parse response
+        parse_http_response(&response_str)
+    }
+}
+
+// ============================================================================
+// HTTP RESPONSE
+// ============================================================================
+
+struct HttpResponse {
+    status: u16,
+    headers: Vec<(str, str)>,
+    body: str,
+}
+
+impl HttpResponse {
+    fn ok(&self) -> bool {
+        return self.status >= 200 && self.status < 300;
+    }
+
+    fn text(&self) -> Result<String, HttpError> {
+        return Ok(self.body.clone());
+    }
+
+    fn json(&self) -> Result<JsonValue, HttpError> {
+        parse_json(&self.body)
+    }
+}
+
+// ============================================================================
+// HTTP ERROR
+// ============================================================================
+
+enum HttpError {
+    ConnectionFailed(str),
+    Timeout,
+    InvalidResponse(str),
+    ParseError(str),
+}
+
+// ============================================================================
+// RESPONSE PARSING
+// ============================================================================
+
+fn parse_http_response(response: &str) -> Result<HttpResponse, HttpError> {
+    let lines: Vec<&str> = response.split("\r\n").collect();
+    if lines.is_empty() {
+        return Err(HttpError::InvalidResponse("Empty response".to_string()));
+    }
+
+    // Parse status line
+    let status_line = lines[0];
+    let status_parts: Vec<&str> = status_line.split_whitespace().collect();
+    if status_parts.len() < 2 {
+        return Err(HttpError::InvalidResponse("Invalid status line".to_string()));
+    }
+
+    let status = status_parts[1].parse::<u16>()
+        .map_err(|_| HttpError::InvalidResponse("Invalid status code".to_string()))?;
+
+    // Parse headers
+    let mut headers = Vec::new();
+    let mut body_start = 1;
+
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        if line.is_empty() {
+            body_start = i + 1;
+            break;
+        }
+
+        if let Some(colon_pos) = line.find(':') {
+            let key = line[..colon_pos].trim().to_string();
+            let value = line[colon_pos + 1..].trim().to_string();
+            headers.push((key, value));
+        }
+    }
+
+    // Extract body
+    let body = if body_start < lines.len() {
+        lines[body_start..].join("\r\n")
+    } else {
+        String::new()
+    };
+
+    return Ok(HttpResponse {
+        status: status,
+        headers: headers,
+        body: body,
+    });
+}
+
+// ============================================================================
+// URL HELPERS
+// ============================================================================
+
+fn extract_host(url: &str) -> String {
+    let without_scheme = if url.starts_with("https://") {
+        &url[8..]
+    } else if url.starts_with("http://") {
+        &url[7..]
+    } else {
+        url
+    };
+
+    let end = without_scheme.find('/').unwrap_or(without_scheme.len());
+    let host_port = &without_scheme[..end];
+
+    // Remove port if present
+    let host_end = host_port.find(':').unwrap_or(host_port.len());
+    return host_port[..host_end].to_string();
+}
+
+fn extract_path(url: &str) -> String {
+    let without_scheme = if url.starts_with("https://") {
+        &url[8..]
+    } else if url.starts_with("http://") {
+        &url[7..]
+    } else {
+        url
+    };
+
+    if let Some(path_start) = without_scheme.find('/') {
+        return without_scheme[path_start..].to_string();
+    }
+    return "/".to_string();
+}
+
+fn url_encode(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                result.push(c);
+            }
+            ' ' => {
+                result.push_str("%20");
+            }
+            '/' => {
+                result.push_str("%2F");
+            }
+            _ => {
+                let bytes = c.to_string().as_bytes();
+                for b in bytes {
+                    result.push_str(&format!("%{:02X}", b));
+                }
+            }
+        }
+    }
+    return result;
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// JSON PARSING (Simplified)
+// ============================================================================
+
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(str),
+    Array(Vec<JsonValue>),
+    Object(Vec<(str, JsonValue)>),
+}
+
+impl JsonValue {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            JsonValue::Number(n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            JsonValue::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&Vec<JsonValue>> {
+        match self {
+            JsonValue::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    fn get(&self, key: &str) -> JsonValue {
+        match self {
+            JsonValue::Object(obj) => {
+                for (k, v) in obj {
+                    if k == key {
+                        return v.clone();
+                    }
+                }
+                JsonValue::Null
+            }
+            _ => JsonValue::Null,
+        }
+    }
+}
+
+impl std::ops::Index<&str> for JsonValue {
+    type Output = JsonValue;
+
+    fn index(&self, key: &str) -> &JsonValue {
+        match self {
+            JsonValue::Object(obj) => {
+                for (k, v) in obj {
+                    if k == key {
+                        return v;
+                    }
+                }
+                &JsonValue::Null
+            }
+            _ => &JsonValue::Null,
+        }
+    }
+}
+
+impl std::ops::Index<usize> for JsonValue {
+    type Output = JsonValue;
+
+    fn index(&self, idx: usize) -> &JsonValue {
+        match self {
+            JsonValue::Array(arr) => {
+                if idx < arr.len() {
+                    return &arr[idx];
+                }
+                &JsonValue::Null
+            }
+            _ => &JsonValue::Null,
+        }
+    }
+}
+
+fn parse_json(s: &str) -> Result<JsonValue, HttpError> {
+    let s = s.trim();
+    parse_json_value(s, 0).map(|(v, _)| v)
+}
+
+fn parse_json_value(s: &str, pos: usize) -> Result<(JsonValue, usize), HttpError> {
+    let s = &s[pos..];
+    let s = s.trim_start();
+
+    if s.is_empty() {
+        return Err(HttpError::ParseError("Unexpected end of JSON".to_string()));
+    }
+
+    match s.chars().next().unwrap() {
+        'n' => {
+            if s.starts_with("null") {
+                return Ok((JsonValue::Null, pos + 4));
+            }
+            Err(HttpError::ParseError("Invalid null".to_string()))
+        }
+        't' => {
+            if s.starts_with("true") {
+                return Ok((JsonValue::Bool(true), pos + 4));
+            }
+            Err(HttpError::ParseError("Invalid true".to_string()))
+        }
+        'f' => {
+            if s.starts_with("false") {
+                return Ok((JsonValue::Bool(false), pos + 5));
+            }
+            Err(HttpError::ParseError("Invalid false".to_string()))
+        }
+        '"' => parse_json_string(s).map(|(v, len)| (JsonValue::String(v), pos + len)),
+        '[' => parse_json_array(s).map(|(v, len)| (JsonValue::Array(v), pos + len)),
+        '{' => parse_json_object(s).map(|(v, len)| (JsonValue::Object(v), pos + len)),
+        c if c == '-' || c.is_digit(10) => {
+            parse_json_number(s).map(|(v, len)| (JsonValue::Number(v), pos + len))
+        }
+        _ => Err(HttpError::ParseError("Invalid JSON value".to_string())),
+    }
+}
+
+fn parse_json_string(s: &str) -> Result<(String, usize), HttpError> {
+    if !s.starts_with('"') {
+        return Err(HttpError::ParseError("Expected string".to_string()));
+    }
+
+    let mut result = String::new();
+    let mut escaped = false;
+    let mut len = 1;
+
+    for c in s[1..].chars() {
+        len += c.len_utf8();
+        if escaped {
+            match c {
+                'n' => result.push('\n'),
+                'r' => result.push('\r'),
+                't' => result.push('\t'),
+                '"' => result.push('"'),
+                '\\' => result.push('\\'),
+                _ => result.push(c),
+            }
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Ok((result, len));
+        } else {
+            result.push(c);
+        }
+    }
+
+    Err(HttpError::ParseError("Unterminated string".to_string()))
+}
+
+fn parse_json_number(s: &str) -> Result<(f64, usize), HttpError> {
+    let mut end = 0;
+    let mut has_dot = false;
+    let mut has_exp = false;
+
+    for (i, c) in s.chars().enumerate() {
+        if c == '-' && i == 0 {
+            end = i + 1;
+        } else if c.is_digit(10) {
+            end = i + 1;
+        } else if c == '.' && !has_dot {
+            has_dot = true;
+            end = i + 1;
+        } else if (c == 'e' || c == 'E') && !has_exp {
+            has_exp = true;
+            end = i + 1;
+        } else if (c == '+' || c == '-') && has_exp && (s.chars().nth(i - 1) == Some('e') || s.chars().nth(i - 1) == Some('E')) {
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    let num_str = &s[..end];
+    let num = num_str.parse::<f64>()
+        .map_err(|_| HttpError::ParseError("Invalid number".to_string()))?;
+
+    Ok((num, end))
+}
+
+fn parse_json_array(s: &str) -> Result<(Vec<JsonValue>, usize), HttpError> {
+    // Simplified array parsing
+    let mut arr = Vec::new();
+    let mut pos = 1;  // Skip '['
+
+    loop {
+        let remaining = &s[pos..].trim_start();
+        if remaining.starts_with(']') {
+            return Ok((arr, pos + 1));
+        }
+
+        if !arr.is_empty() {
+            if !remaining.starts_with(',') {
+                return Err(HttpError::ParseError("Expected comma".to_string()));
+            }
+            pos += 1;
+        }
+
+        let (value, new_pos) = parse_json_value(s, pos)?;
+        arr.push(value);
+        pos = new_pos;
+    }
+}
+
+fn parse_json_object(s: &str) -> Result<(Vec<(str, JsonValue)>, usize), HttpError> {
+    // Simplified object parsing
+    let mut obj = Vec::new();
+    let mut pos = 1;  // Skip '{'
+
+    loop {
+        let remaining = &s[pos..].trim_start();
+        if remaining.starts_with('}') {
+            return Ok((obj, pos + 1));
+        }
+
+        if !obj.is_empty() {
+            if !remaining.starts_with(',') {
+                return Err(HttpError::ParseError("Expected comma".to_string()));
+            }
+            pos += 1;
+        }
+
+        // Parse key
+        let (key, key_len) = parse_json_string(&s[pos..].trim_start())?;
+        pos += key_len;
+
+        // Skip colon
+        let remaining = &s[pos..].trim_start();
+        if !remaining.starts_with(':') {
+            return Err(HttpError::ParseError("Expected colon".to_string()));
+        }
+        pos += 1;
+
+        // Parse value
+        let (value, new_pos) = parse_json_value(s, pos)?;
+        obj.push((key, value));
+        pos = new_pos;
+    }
+}

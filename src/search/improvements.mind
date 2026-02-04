@@ -1,0 +1,451 @@
+// NikolaChess - Search Improvements
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Advanced search improvements:
+// - History-modulated LMR
+// - ProbCut pruning
+
+import std.math;
+
+// ============================================================================
+// HISTORY TABLE (for History-modulated LMR)
+// ============================================================================
+
+struct HistoryTable {
+    // history[side][from_sq][to_sq] - 12-bit values
+    table: [[[i16; 64]; 64]; 2],
+    max_value: i16,
+}
+
+impl HistoryTable {
+    fn new() -> HistoryTable {
+        return HistoryTable {
+            table: [[[0i16; 64]; 64]; 2],
+            max_value: 16384,
+        };
+    }
+
+    fn get(&self, side: Color, from: Square, to: Square) -> i16 {
+        return self.table[side as usize][from.0 as usize][to.0 as usize];
+    }
+
+    fn update(&mut self, side: Color, from: Square, to: Square, depth: i32, is_cutoff: bool) {
+        let bonus = if is_cutoff {
+            depth * depth  // Quadratic bonus for cutoffs
+        } else {
+            -(depth * depth / 2)  // Penalty for fail-lows
+        };
+
+        let entry = &mut self.table[side as usize][from.0 as usize][to.0 as usize];
+
+        // Gravity formula to prevent overflow
+        let new_value = *entry as i32 + bonus - (*entry as i32 * bonus.abs() / self.max_value as i32);
+        *entry = new_value.clamp(-self.max_value as i32, self.max_value as i32) as i16;
+    }
+
+    fn clear(&mut self) {
+        for side in 0..2 {
+            for from in 0..64 {
+                for to in 0..64 {
+                    self.table[side][from][to] = 0;
+                }
+            }
+        }
+    }
+
+    fn age(&mut self) {
+        // Reduce all values by half (for new game/position)
+        for side in 0..2 {
+            for from in 0..64 {
+                for to in 0..64 {
+                    self.table[side][from][to] /= 2;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HISTORY-MODULATED LMR (Late Move Reductions)
+// ============================================================================
+
+struct LMRTable {
+    // Precomputed base reductions: lmr[depth][move_num]
+    base: [[i32; 64]; 64],
+}
+
+impl LMRTable {
+    fn new() -> LMRTable {
+        let mut table = LMRTable {
+            base: [[0; 64]; 64],
+        };
+
+        // Initialize with log formula
+        for depth in 1..64 {
+            for move_num in 1..64 {
+                // Base reduction: log(depth) * log(move_num) / 2
+                let d = depth as f64;
+                let m = move_num as f64;
+                table.base[depth][move_num] = ((d.ln() * m.ln()) / 2.0) as i32;
+            }
+        }
+
+        return table;
+    }
+}
+
+fn calculate_lmr_reduction(
+    lmr_table: &LMRTable,
+    history: &HistoryTable,
+    depth: i32,
+    move_num: i32,
+    mv: Move,
+    board: &Board,
+    is_pv_node: bool,
+    is_improving: bool,
+) -> i32 {
+    // No reduction for first few moves or shallow depths
+    if move_num < 3 || depth < 3 {
+        return 0;
+    }
+
+    // Base reduction from table
+    let base_red = lmr_table.base[depth.min(63) as usize][move_num.min(63) as usize];
+
+    // History bonus: [-2.0, +2.0] range normalized
+    let hist_value = history.get(board.side_to_move, mv.from, mv.to);
+    let hist_bonus = hist_value as f32 / 8192.0;  // Normalize to roughly [-2, 2]
+
+    // Modulate reduction by history
+    // Good moves (positive history) get less reduction
+    // Bad moves (negative history) get more reduction
+    let history_adjustment = (hist_bonus * depth as f32 / 4.0) as i32;
+    let mut reduction = base_red - history_adjustment;
+
+    // PV nodes get less reduction
+    if is_pv_node {
+        reduction -= 1;
+    }
+
+    // Improving positions get less reduction
+    if is_improving {
+        reduction -= 1;
+    }
+
+    // Ensure minimum reduction of 1 and don't reduce into qsearch
+    reduction = reduction.max(1);
+    if depth - reduction < 1 {
+        reduction = depth - 1;
+    }
+
+    return reduction;
+}
+
+// ============================================================================
+// PROBCUT PRUNING
+// ============================================================================
+
+struct ProbCutParams {
+    margin: i32,           // Score margin for cutoff verification
+    min_depth: i32,        // Minimum depth to apply ProbCut
+    reduction: i32,        // Depth reduction for verification search
+    enabled: bool,
+}
+
+impl ProbCutParams {
+    fn default() -> ProbCutParams {
+        return ProbCutParams {
+            margin: 200,       // ~2 pawns
+            min_depth: 5,
+            reduction: 4,
+            enabled: true,
+        };
+    }
+}
+
+fn try_probcut(
+    board: &Board,
+    depth: i32,
+    beta: i32,
+    params: &ProbCutParams,
+    search_fn: &dyn Fn(&Board, i32, i32, i32) -> i32,
+) -> Option<i32> {
+    if !params.enabled || depth < params.min_depth {
+        return None;
+    }
+
+    // Only try ProbCut for captures and promotions
+    let captures = generate_captures(board);
+    if captures.is_empty() {
+        return None;
+    }
+
+    let probcut_beta = beta + params.margin;
+    let reduced_depth = depth - params.reduction;
+
+    // Try each capture with a null-window search
+    for mv in captures {
+        // SEE filter: skip captures that lose material
+        if !see_ge(board, mv, 0) {
+            continue;
+        }
+
+        let new_board = make_move(*board, mv);
+
+        // Verification search with reduced depth
+        let score = -search_fn(&new_board, reduced_depth, -probcut_beta, -probcut_beta + 1);
+
+        // If reduced search confirms the cutoff, prune
+        if score >= probcut_beta {
+            return Some(beta);
+        }
+    }
+
+    return None;
+}
+
+// ============================================================================
+// COUNTERMOVE HEURISTIC
+// ============================================================================
+
+struct CountermoveTable {
+    // countermove[piece][to_square] = best response move
+    table: [[Option<Move>; 64]; 12],
+}
+
+impl CountermoveTable {
+    fn new() -> CountermoveTable {
+        return CountermoveTable {
+            table: [[None; 64]; 12],
+        };
+    }
+
+    fn get(&self, prev_move: Move, board: &Board) -> Option<Move> {
+        let piece = board.piece_at(prev_move.to)?;
+        let piece_idx = piece_to_index(piece);
+        return self.table[piece_idx][prev_move.to.0 as usize];
+    }
+
+    fn update(&mut self, prev_move: Move, response: Move, board: &Board) {
+        if let Some(piece) = board.piece_at(prev_move.to) {
+            let piece_idx = piece_to_index(piece);
+            self.table[piece_idx][prev_move.to.0 as usize] = Some(response);
+        }
+    }
+
+    fn clear(&mut self) {
+        for p in 0..12 {
+            for sq in 0..64 {
+                self.table[p][sq] = None;
+            }
+        }
+    }
+}
+
+fn piece_to_index(piece: Piece) -> usize {
+    let base = match piece.piece_type {
+        PieceType::Pawn => 0,
+        PieceType::Knight => 1,
+        PieceType::Bishop => 2,
+        PieceType::Rook => 3,
+        PieceType::Queen => 4,
+        PieceType::King => 5,
+    };
+    return base + (piece.color as usize) * 6;
+}
+
+// ============================================================================
+// KILLER MOVES
+// ============================================================================
+
+struct KillerMoves {
+    // killers[ply][slot] - 2 killer moves per ply
+    moves: [[Option<Move>; 2]; 128],
+}
+
+impl KillerMoves {
+    fn new() -> KillerMoves {
+        return KillerMoves {
+            moves: [[None; 2]; 128],
+        };
+    }
+
+    fn get(&self, ply: i32) -> [Option<Move>; 2] {
+        if ply < 0 || ply >= 128 {
+            return [None, None];
+        }
+        return self.moves[ply as usize];
+    }
+
+    fn update(&mut self, ply: i32, mv: Move) {
+        if ply < 0 || ply >= 128 {
+            return;
+        }
+
+        let slot = &mut self.moves[ply as usize];
+
+        // Don't duplicate
+        if slot[0] == Some(mv) {
+            return;
+        }
+
+        // Shift and insert
+        slot[1] = slot[0];
+        slot[0] = Some(mv);
+    }
+
+    fn clear(&mut self) {
+        for ply in 0..128 {
+            self.moves[ply] = [None, None];
+        }
+    }
+}
+
+// ============================================================================
+// MOVE ORDERING WITH HISTORY
+// ============================================================================
+
+struct MoveOrderer {
+    history: HistoryTable,
+    countermoves: CountermoveTable,
+    killers: KillerMoves,
+}
+
+impl MoveOrderer {
+    fn new() -> MoveOrderer {
+        return MoveOrderer {
+            history: HistoryTable::new(),
+            countermoves: CountermoveTable::new(),
+            killers: KillerMoves::new(),
+        };
+    }
+
+    fn score_move(
+        &self,
+        mv: Move,
+        board: &Board,
+        tt_move: Option<Move>,
+        prev_move: Option<Move>,
+        ply: i32,
+    ) -> i32 {
+        // TT move gets highest priority
+        if tt_move == Some(mv) {
+            return 10_000_000;
+        }
+
+        let mut score = 0i32;
+
+        // Captures scored by MVV-LVA + SEE
+        if let Some(captured) = board.piece_at(mv.to) {
+            let victim_value = piece_value(captured.piece_type);
+            let attacker_value = board.piece_at(mv.from)
+                .map(|p| piece_value(p.piece_type))
+                .unwrap_or(100);
+
+            // MVV-LVA base score
+            score = 1_000_000 + victim_value * 10 - attacker_value;
+
+            // SEE bonus for winning captures
+            if see_ge(board, mv, 0) {
+                score += 500_000;
+            }
+
+            return score;
+        }
+
+        // Promotions
+        if let Some(promo) = mv.promotion {
+            score = 900_000 + piece_value(promo);
+            return score;
+        }
+
+        // Killer moves
+        let killers = self.killers.get(ply);
+        if killers[0] == Some(mv) {
+            return 800_000;
+        }
+        if killers[1] == Some(mv) {
+            return 700_000;
+        }
+
+        // Countermove
+        if let Some(prev) = prev_move {
+            if self.countermoves.get(prev, board) == Some(mv) {
+                score += 600_000;
+            }
+        }
+
+        // History score
+        let hist = self.history.get(board.side_to_move, mv.from, mv.to);
+        score += hist as i32;
+
+        return score;
+    }
+
+    fn update_cutoff(&mut self, mv: Move, board: &Board, depth: i32, ply: i32, prev_move: Option<Move>) {
+        // Update history
+        self.history.update(board.side_to_move, mv.from, mv.to, depth, true);
+
+        // Update killers (only for quiet moves)
+        if board.piece_at(mv.to).is_none() && mv.promotion.is_none() {
+            self.killers.update(ply, mv);
+        }
+
+        // Update countermove
+        if let Some(prev) = prev_move {
+            self.countermoves.update(prev, mv, board);
+        }
+    }
+
+    fn update_fail_low(&mut self, mv: Move, board: &Board, depth: i32) {
+        // Penalize quiet moves that failed low
+        if board.piece_at(mv.to).is_none() && mv.promotion.is_none() {
+            self.history.update(board.side_to_move, mv.from, mv.to, depth, false);
+        }
+    }
+
+    fn new_search(&mut self) {
+        self.killers.clear();
+        // History and countermoves are preserved but aged
+        self.history.age();
+    }
+
+    fn new_game(&mut self) {
+        self.history.clear();
+        self.countermoves.clear();
+        self.killers.clear();
+    }
+}
+
+fn piece_value(pt: PieceType) -> i32 {
+    match pt {
+        PieceType::Pawn => 100,
+        PieceType::Knight => 320,
+        PieceType::Bishop => 330,
+        PieceType::Rook => 500,
+        PieceType::Queen => 900,
+        PieceType::King => 20000,
+    }
+}
+
+// ============================================================================
+// INTEGRATED SEARCH IMPROVEMENTS
+// ============================================================================
+
+struct SearchImprovements {
+    lmr_table: LMRTable,
+    probcut_params: ProbCutParams,
+    move_orderer: MoveOrderer,
+}
+
+impl SearchImprovements {
+    fn new() -> SearchImprovements {
+        return SearchImprovements {
+            lmr_table: LMRTable::new(),
+            probcut_params: ProbCutParams::default(),
+            move_orderer: MoveOrderer::new(),
+        };
+    }
+}
+

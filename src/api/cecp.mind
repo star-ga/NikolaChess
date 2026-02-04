@@ -1,0 +1,1088 @@
+// NikolaChess - CECP/XBoard Protocol
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Chess Engine Communication Protocol (CECP) / XBoard implementation:
+// - Full protocol v2 support
+// - Time controls and pondering
+// - Analysis mode
+// - ICS compatibility
+
+import std.io;
+import std.time;
+import std.sync;
+
+// ============================================================================
+// CECP ENGINE STATE
+// ============================================================================
+
+struct CECPEngine {
+    // Protocol state
+    protocol_version: i32,
+    features_done: bool,
+
+    // Game state
+    board: Board,
+    game_history: Vec<Move>,
+    force_mode: bool,
+    analyze_mode: bool,
+    edit_mode: bool,
+
+    // Color and side
+    engine_color: Color,
+    computer_opponent: bool,
+
+    // Time control
+    time_control: CECPTimeControl,
+    engine_time_cs: i64,    // Centiseconds
+    opponent_time_cs: i64,
+
+    // Search control
+    max_depth: i32,
+    post_thinking: bool,
+    ponder_enabled: bool,
+    is_pondering: bool,
+
+    // Engine options
+    random_mode: bool,
+    book_enabled: bool,
+
+    // API integration
+    api: ChessAPI,
+    search_handle: Option<SearchHandle>,
+
+    // ICS mode
+    ics_mode: bool,
+    ics_host: Option<str>,
+}
+
+enum CECPTimeControl {
+    Conventional { moves: i32, base_cs: i64, inc_cs: i64 },
+    Incremental { base_cs: i64, inc_cs: i64 },
+    ExactTime { time_cs: i64 },
+    Depth { depth: i32 },
+    Nodes { nodes: i64 },
+    Infinite,
+}
+
+// ============================================================================
+// CECP ENGINE CREATION
+// ============================================================================
+
+fn CECPEngine::new(api_config: APIConfig) -> CECPEngine {
+    return CECPEngine {
+        protocol_version: 2,
+        features_done: false,
+        board: Board::starting_position(),
+        game_history: Vec::new(),
+        force_mode: false,
+        analyze_mode: false,
+        edit_mode: false,
+        engine_color: Color::Black,
+        computer_opponent: false,
+        time_control: CECPTimeControl::Conventional {
+            moves: 40,
+            base_cs: 30000,
+            inc_cs: 0,
+        },
+        engine_time_cs: 30000,
+        opponent_time_cs: 30000,
+        max_depth: 100,
+        post_thinking: false,
+        ponder_enabled: false,
+        is_pondering: false,
+        random_mode: false,
+        book_enabled: true,
+        api: ChessAPI::new(api_config),
+        search_handle: None,
+        ics_mode: false,
+        ics_host: None,
+    };
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+fn run_cecp_engine(engine: &mut CECPEngine) {
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line).is_err() {
+            break;
+        }
+
+        let cmd = line.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+
+        // Log received command
+        if engine.post_thinking {
+            // Don't echo in post mode
+        }
+
+        let should_quit = process_cecp_command(engine, cmd);
+        if should_quit {
+            break;
+        }
+    }
+}
+
+// ============================================================================
+// COMMAND PROCESSING
+// ============================================================================
+
+fn process_cecp_command(engine: &mut CECPEngine, cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    let command = parts[0];
+
+    match command {
+        // Protocol commands
+        "xboard" => cmd_xboard(engine),
+        "protover" => cmd_protover(engine, &parts),
+        "accepted" => { /* Feature accepted, ignore */ }
+        "rejected" => cmd_rejected(engine, &parts),
+
+        // Game setup
+        "new" => cmd_new(engine),
+        "variant" => cmd_variant(engine, &parts),
+        "quit" => return true,
+        "random" => engine.random_mode = !engine.random_mode,
+        "force" => engine.force_mode = true,
+        "go" => cmd_go(engine),
+        "playother" => cmd_playother(engine),
+        "white" => engine.engine_color = Color::Black,  // Engine plays black
+        "black" => engine.engine_color = Color::White,  // Engine plays white
+        "level" => cmd_level(engine, &parts),
+        "st" => cmd_st(engine, &parts),
+        "sd" => cmd_sd(engine, &parts),
+        "nps" => { /* Set nodes per second limit */ }
+        "time" => cmd_time(engine, &parts),
+        "otim" => cmd_otim(engine, &parts),
+
+        // Move commands
+        "usermove" => cmd_usermove(engine, &parts),
+        "?" => cmd_move_now(engine),
+
+        // Analysis
+        "analyze" => cmd_analyze(engine),
+        "exit" => cmd_exit_analyze(engine),
+        ".." => { /* Exit analysis (alternate) */ cmd_exit_analyze(engine); }
+
+        // Board setup
+        "setboard" => cmd_setboard(engine, &parts),
+        "edit" => cmd_edit(engine),
+        "#" => cmd_edit_clear(engine),
+        "c" => cmd_edit_color(engine),
+        "." => cmd_edit_done(engine),
+
+        // Undo
+        "undo" => cmd_undo(engine),
+        "remove" => cmd_remove(engine),
+
+        // Features
+        "post" => engine.post_thinking = true,
+        "nopost" => engine.post_thinking = false,
+        "hard" => engine.ponder_enabled = true,
+        "easy" => engine.ponder_enabled = false,
+        "ping" => cmd_ping(engine, &parts),
+        "draw" => cmd_draw_offer(engine),
+        "result" => cmd_result(engine, &parts),
+
+        // Information
+        "hint" => cmd_hint(engine),
+        "bk" => cmd_book(engine),
+        "computer" => engine.computer_opponent = true,
+        "name" => { /* Opponent name, ignore */ }
+        "rating" => { /* Rating info, ignore */ }
+        "ics" => cmd_ics(engine, &parts),
+
+        // Memory/cores
+        "memory" => cmd_memory(engine, &parts),
+        "cores" => cmd_cores(engine, &parts),
+        "egtpath" => cmd_egtpath(engine, &parts),
+
+        // Options
+        "option" => cmd_option(engine, &parts),
+
+        _ => {
+            // Try to parse as a move
+            if is_valid_move_string(command) {
+                cmd_move(engine, command);
+            } else if engine.edit_mode {
+                cmd_edit_piece(engine, command);
+            } else {
+                println!("Error (unknown command): {}", cmd);
+            }
+        }
+    }
+
+    return false;
+}
+
+// ============================================================================
+// PROTOCOL COMMANDS
+// ============================================================================
+
+fn cmd_xboard(engine: &mut CECPEngine) {
+    // Enter xboard mode - send newline to confirm
+    println!("");
+}
+
+fn cmd_protover(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        engine.protocol_version = parts[1].parse().unwrap_or(1);
+    }
+
+    // Send features
+    println!("feature myname=\"NikolaChess 1.0\"");
+    println!("feature setboard=1");
+    println!("feature ping=1");
+    println!("feature playother=1");
+    println!("feature san=0");
+    println!("feature usermove=1");
+    println!("feature time=1");
+    println!("feature draw=1");
+    println!("feature reuse=1");
+    println!("feature analyze=1");
+    println!("feature colors=0");
+    println!("feature ics=1");
+    println!("feature name=1");
+    println!("feature pause=0");
+    println!("feature nps=1");
+    println!("feature debug=1");
+    println!("feature memory=1");
+    println!("feature smp=1");
+    println!("feature egt=\"syzygy\"");
+    println!("feature option=\"Use NNUE -check 1\"");
+    println!("feature option=\"Use Cloud Eval -check 0\"");
+    println!("feature option=\"LAN Tablebase -string \"");
+    println!("feature done=1");
+
+    engine.features_done = true;
+}
+
+fn cmd_rejected(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        let feature = parts[1];
+        // Handle rejected features if needed
+        match feature {
+            "usermove" => { /* Will receive moves without prefix */ }
+            _ => {}
+        }
+    }
+}
+
+// ============================================================================
+// GAME SETUP COMMANDS
+// ============================================================================
+
+fn cmd_new(engine: &mut CECPEngine) {
+    // Stop any search
+    stop_search(engine);
+
+    // Reset to starting position
+    engine.board = Board::starting_position();
+    engine.game_history.clear();
+
+    // Reset modes
+    engine.force_mode = false;
+    engine.analyze_mode = false;
+    engine.edit_mode = false;
+
+    // Engine plays black by default
+    engine.engine_color = Color::Black;
+
+    // Reset time
+    engine.engine_time_cs = 30000;
+    engine.opponent_time_cs = 30000;
+
+    // Clear API caches
+    engine.api.clear_caches();
+}
+
+fn cmd_variant(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        let variant = parts[1];
+        match variant {
+            "normal" | "standard" => { /* Standard chess, OK */ }
+            "fischerandom" | "chess960" => {
+                // TODO: Support Chess960
+                println!("Error (variant not supported): {}", variant);
+            }
+            _ => {
+                println!("Error (variant not supported): {}", variant);
+            }
+        }
+    }
+}
+
+fn cmd_go(engine: &mut CECPEngine) {
+    engine.force_mode = false;
+    engine.engine_color = engine.board.side_to_move;
+
+    // Start thinking
+    start_search(engine);
+}
+
+fn cmd_playother(engine: &mut CECPEngine) {
+    engine.force_mode = false;
+    engine.engine_color = engine.board.side_to_move.opposite();
+
+    // If pondering is enabled, start pondering
+    if engine.ponder_enabled {
+        start_ponder(engine);
+    }
+}
+
+// ============================================================================
+// TIME CONTROL COMMANDS
+// ============================================================================
+
+fn cmd_level(engine: &mut CECPEngine, parts: &[&str]) {
+    // level MPS BASE INC
+    // MPS = moves per session (0 for all)
+    // BASE = base time in minutes (or min:sec)
+    // INC = increment in seconds
+
+    if parts.len() < 4 {
+        return;
+    }
+
+    let mps = parts[1].parse::<i32>().unwrap_or(0);
+    let base = parse_time_string(parts[2]);
+    let inc = parts[3].parse::<i64>().unwrap_or(0) * 100;  // Convert to centiseconds
+
+    if mps == 0 {
+        engine.time_control = CECPTimeControl::Incremental {
+            base_cs: base,
+            inc_cs: inc,
+        };
+    } else {
+        engine.time_control = CECPTimeControl::Conventional {
+            moves: mps,
+            base_cs: base,
+            inc_cs: inc,
+        };
+    }
+
+    engine.engine_time_cs = base;
+    engine.opponent_time_cs = base;
+}
+
+fn parse_time_string(s: &str) -> i64 {
+    // Parse "5" or "5:30" format, return centiseconds
+    if let Some(colon) = s.find(':') {
+        let mins = s[..colon].parse::<i64>().unwrap_or(0);
+        let secs = s[colon + 1..].parse::<i64>().unwrap_or(0);
+        return (mins * 60 + secs) * 100;
+    } else {
+        let mins = s.parse::<i64>().unwrap_or(0);
+        return mins * 60 * 100;
+    }
+}
+
+fn cmd_st(engine: &mut CECPEngine, parts: &[&str]) {
+    // Exact time per move in seconds
+    if parts.len() >= 2 {
+        let time_s = parts[1].parse::<i64>().unwrap_or(10);
+        engine.time_control = CECPTimeControl::ExactTime {
+            time_cs: time_s * 100,
+        };
+    }
+}
+
+fn cmd_sd(engine: &mut CECPEngine, parts: &[&str]) {
+    // Search depth limit
+    if parts.len() >= 2 {
+        let depth = parts[1].parse::<i32>().unwrap_or(100);
+        engine.max_depth = depth;
+        engine.time_control = CECPTimeControl::Depth { depth: depth };
+    }
+}
+
+fn cmd_time(engine: &mut CECPEngine, parts: &[&str]) {
+    // Engine's remaining time in centiseconds
+    if parts.len() >= 2 {
+        engine.engine_time_cs = parts[1].parse().unwrap_or(30000);
+    }
+}
+
+fn cmd_otim(engine: &mut CECPEngine, parts: &[&str]) {
+    // Opponent's remaining time in centiseconds
+    if parts.len() >= 2 {
+        engine.opponent_time_cs = parts[1].parse().unwrap_or(30000);
+    }
+}
+
+// ============================================================================
+// MOVE COMMANDS
+// ============================================================================
+
+fn cmd_usermove(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        cmd_move(engine, parts[1]);
+    }
+}
+
+fn cmd_move(engine: &mut CECPEngine, move_str: &str) {
+    // Parse the move
+    let mv = match parse_move(&engine.board, move_str) {
+        Some(m) => m,
+        None => {
+            println!("Illegal move: {}", move_str);
+            return;
+        }
+    };
+
+    // Validate the move
+    if !is_legal_move(&engine.board, mv) {
+        println!("Illegal move: {}", move_str);
+        return;
+    }
+
+    // Stop pondering if we were
+    if engine.is_pondering {
+        stop_ponder(engine);
+    }
+
+    // Make the move
+    engine.board = make_move(engine.board, mv);
+    engine.game_history.push(mv);
+
+    // If not in force mode, start thinking
+    if !engine.force_mode && !engine.analyze_mode {
+        if engine.board.side_to_move == engine.engine_color {
+            start_search(engine);
+        }
+    }
+
+    // In analyze mode, restart analysis
+    if engine.analyze_mode {
+        start_analysis(engine);
+    }
+}
+
+fn cmd_move_now(engine: &mut CECPEngine) {
+    // Force engine to move immediately
+    if let Some(ref handle) = engine.search_handle {
+        handle.stop();
+        // Wait for best move and output it
+        if let Some(result) = handle.wait() {
+            output_move(engine, result.best_move);
+        }
+    }
+}
+
+fn parse_move(board: &Board, s: &str) -> Option<Move> {
+    // Try coordinate notation first (e2e4)
+    if let Some(mv) = parse_coordinate_move(board, s) {
+        return Some(mv);
+    }
+
+    // Try SAN notation (e4, Nf3, O-O)
+    if let Some(mv) = parse_san_move(board, s) {
+        return Some(mv);
+    }
+
+    return None;
+}
+
+fn parse_coordinate_move(board: &Board, s: &str) -> Option<Move> {
+    if s.len() < 4 {
+        return None;
+    }
+
+    let from_file = (s.chars().nth(0)? as u8).wrapping_sub(b'a');
+    let from_rank = (s.chars().nth(1)? as u8).wrapping_sub(b'1');
+    let to_file = (s.chars().nth(2)? as u8).wrapping_sub(b'a');
+    let to_rank = (s.chars().nth(3)? as u8).wrapping_sub(b'1');
+
+    if from_file > 7 || from_rank > 7 || to_file > 7 || to_rank > 7 {
+        return None;
+    }
+
+    let from = Square::from_coords(from_file as i32, from_rank as i32);
+    let to = Square::from_coords(to_file as i32, to_rank as i32);
+
+    // Check for promotion
+    let promo = if s.len() >= 5 {
+        match s.chars().nth(4)? {
+            'q' | 'Q' => Some(PieceType::Queen),
+            'r' | 'R' => Some(PieceType::Rook),
+            'b' | 'B' => Some(PieceType::Bishop),
+            'n' | 'N' => Some(PieceType::Knight),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Find matching move in legal moves
+    let legal_moves = generate_legal_moves(board);
+    for mv in legal_moves {
+        if mv.from == from && mv.to == to {
+            if let Some(p) = promo {
+                if mv.promotion == Some(p) {
+                    return Some(mv);
+                }
+            } else if mv.promotion.is_none() {
+                return Some(mv);
+            }
+        }
+    }
+
+    return None;
+}
+
+fn parse_san_move(board: &Board, san: &str) -> Option<Move> {
+    // Simplified SAN parser
+    let san = san.trim_end_matches('+').trim_end_matches('#');
+
+    // Castling
+    if san == "O-O" || san == "0-0" {
+        let from = if board.side_to_move == Color::White { Square::E1 } else { Square::E8 };
+        let to = if board.side_to_move == Color::White { Square::G1 } else { Square::G8 };
+        return find_move_from_to(board, from, to);
+    }
+
+    if san == "O-O-O" || san == "0-0-0" {
+        let from = if board.side_to_move == Color::White { Square::E1 } else { Square::E8 };
+        let to = if board.side_to_move == Color::White { Square::C1 } else { Square::C8 };
+        return find_move_from_to(board, from, to);
+    }
+
+    // TODO: Full SAN parsing
+    return None;
+}
+
+fn find_move_from_to(board: &Board, from: Square, to: Square) -> Option<Move> {
+    let legal_moves = generate_legal_moves(board);
+    for mv in legal_moves {
+        if mv.from == from && mv.to == to {
+            return Some(mv);
+        }
+    }
+    return None;
+}
+
+// ============================================================================
+// ANALYSIS MODE
+// ============================================================================
+
+fn cmd_analyze(engine: &mut CECPEngine) {
+    engine.analyze_mode = true;
+    engine.force_mode = true;
+    start_analysis(engine);
+}
+
+fn cmd_exit_analyze(engine: &mut CECPEngine) {
+    engine.analyze_mode = false;
+    stop_search(engine);
+}
+
+fn start_analysis(engine: &mut CECPEngine) {
+    // Stop any existing search
+    stop_search(engine);
+
+    // Start infinite analysis
+    let params = SearchParams {
+        depth: 100,
+        time_ms: 0,  // Infinite
+        nodes: 0,
+        infinite: true,
+        multi_pv: 1,
+    };
+
+    engine.search_handle = Some(start_search_async(&engine.board, params, |info| {
+        output_analysis_info(info);
+    }));
+}
+
+fn output_analysis_info(info: SearchInfo) {
+    // CECP analysis output format:
+    // ply score time nodes pv
+    let score = if let Some(mate) = info.score_mate {
+        if mate > 0 {
+            100000 - mate * 100
+        } else {
+            -100000 - mate * 100
+        }
+    } else {
+        info.score_cp
+    };
+
+    let time_cs = info.time_ms / 10;
+    let nodes = info.nodes;
+
+    let pv_str: String = info.pv.iter()
+        .map(|m| move_to_coordinate(m))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!("{} {} {} {} {}", info.depth, score, time_cs, nodes, pv_str);
+}
+
+// ============================================================================
+// BOARD SETUP
+// ============================================================================
+
+fn cmd_setboard(engine: &mut CECPEngine, parts: &[&str]) {
+    // setboard FEN
+    if parts.len() >= 2 {
+        let fen = parts[1..].join(" ");
+        match parse_fen(&fen) {
+            Ok(board) => {
+                engine.board = board;
+                engine.game_history.clear();
+            }
+            Err(_) => {
+                println!("Error (bad FEN): {}", fen);
+            }
+        }
+    }
+}
+
+fn cmd_edit(engine: &mut CECPEngine) {
+    engine.edit_mode = true;
+    // Clear the board
+    engine.board = Board::empty();
+    engine.board.side_to_move = Color::White;
+}
+
+fn cmd_edit_clear(engine: &mut CECPEngine) {
+    // Clear the board in edit mode
+    engine.board = Board::empty();
+}
+
+fn cmd_edit_color(engine: &mut CECPEngine) {
+    // Toggle edit color
+    engine.board.side_to_move = engine.board.side_to_move.opposite();
+}
+
+fn cmd_edit_piece(engine: &mut CECPEngine, cmd: &str) {
+    // Place a piece: Pa4 = white pawn on a4 (if white's turn in edit)
+    if cmd.len() < 3 {
+        return;
+    }
+
+    let piece_char = cmd.chars().nth(0).unwrap();
+    let file = (cmd.chars().nth(1).unwrap() as u8).wrapping_sub(b'a');
+    let rank = (cmd.chars().nth(2).unwrap() as u8).wrapping_sub(b'1');
+
+    if file > 7 || rank > 7 {
+        return;
+    }
+
+    let square = Square::from_coords(file as i32, rank as i32);
+
+    let piece_type = match piece_char.to_ascii_uppercase() {
+        'P' => PieceType::Pawn,
+        'N' => PieceType::Knight,
+        'B' => PieceType::Bishop,
+        'R' => PieceType::Rook,
+        'Q' => PieceType::Queen,
+        'K' => PieceType::King,
+        _ => return,
+    };
+
+    let color = engine.board.side_to_move;
+    engine.board.set_piece(square, Some(Piece { piece_type, color }));
+}
+
+fn cmd_edit_done(engine: &mut CECPEngine) {
+    engine.edit_mode = false;
+    // Validate the position
+    if !is_valid_position(&engine.board) {
+        println!("Error (invalid position)");
+    }
+}
+
+// ============================================================================
+// UNDO COMMANDS
+// ============================================================================
+
+fn cmd_undo(engine: &mut CECPEngine) {
+    // Undo one half-move
+    if !engine.game_history.is_empty() {
+        // Replay from start without the last move
+        let moves = engine.game_history.clone();
+        engine.board = Board::starting_position();
+        engine.game_history.clear();
+
+        for i in 0..moves.len() - 1 {
+            engine.board = make_move(engine.board, moves[i]);
+            engine.game_history.push(moves[i]);
+        }
+    }
+}
+
+fn cmd_remove(engine: &mut CECPEngine) {
+    // Undo two half-moves (one full move)
+    cmd_undo(engine);
+    cmd_undo(engine);
+}
+
+// ============================================================================
+// SEARCH AND OUTPUT
+// ============================================================================
+
+fn start_search(engine: &mut CECPEngine) {
+    // Stop any existing search
+    stop_search(engine);
+
+    // Check opening book first
+    if engine.book_enabled {
+        if let Some(book_move) = probe_opening_book(&engine.api, &engine.board) {
+            // Apply some randomness if in random mode
+            output_move(engine, book_move.mv);
+            return;
+        }
+    }
+
+    // Check tablebase
+    let piece_count = engine.board.piece_count();
+    if piece_count <= 7 {
+        if let Some(tb_result) = probe_tablebase(&engine.api, &engine.board) {
+            if let Some(mv) = tb_result.best_move {
+                output_move(engine, mv);
+                return;
+            }
+        }
+    }
+
+    // Calculate search time
+    let time_ms = calculate_search_time(engine);
+
+    let params = SearchParams {
+        depth: engine.max_depth,
+        time_ms: time_ms,
+        nodes: 0,
+        infinite: false,
+        multi_pv: 1,
+    };
+
+    // Start search with thinking output
+    engine.search_handle = Some(start_search_async(&engine.board, params, |info| {
+        if engine.post_thinking {
+            output_thinking(info);
+        }
+    }));
+
+    // Wait for result
+    if let Some(ref handle) = engine.search_handle {
+        if let Some(result) = handle.wait() {
+            output_move(engine, result.best_move);
+
+            // Start pondering if enabled
+            if engine.ponder_enabled {
+                if let Some(ponder_move) = result.ponder_move {
+                    start_ponder_on(engine, ponder_move);
+                }
+            }
+        }
+    }
+}
+
+fn calculate_search_time(engine: &CECPEngine) -> i64 {
+    match &engine.time_control {
+        CECPTimeControl::Conventional { moves, base_cs, inc_cs } => {
+            // Estimate moves to go
+            let moves_made = engine.game_history.len() as i32;
+            let moves_to_go = if *moves > 0 {
+                let moves_in_period = moves_made % *moves;
+                *moves - moves_in_period
+            } else {
+                30  // Estimate
+            };
+
+            let time_for_moves = engine.engine_time_cs / (moves_to_go.max(1) as i64);
+            let base_time = time_for_moves * 10;  // Convert to ms
+
+            // Add increment
+            base_time + inc_cs * 10 / 2
+        }
+        CECPTimeControl::Incremental { base_cs, inc_cs } => {
+            // Use 1/30th of remaining time + half increment
+            let base_time = engine.engine_time_cs * 10 / 30;
+            base_time + inc_cs * 10 / 2
+        }
+        CECPTimeControl::ExactTime { time_cs } => {
+            time_cs * 10  // Convert to ms
+        }
+        CECPTimeControl::Depth { .. } => {
+            0  // No time limit
+        }
+        CECPTimeControl::Nodes { .. } => {
+            0  // No time limit
+        }
+        CECPTimeControl::Infinite => {
+            0  // Infinite
+        }
+    }
+}
+
+fn output_thinking(info: SearchInfo) {
+    // CECP thinking output format:
+    // ply score time nodes pv
+    let score = if let Some(mate) = info.score_mate {
+        if mate > 0 {
+            100000 - mate
+        } else {
+            -100000 - mate
+        }
+    } else {
+        info.score_cp
+    };
+
+    let time_cs = info.time_ms / 10;
+
+    let pv_str: String = info.pv.iter()
+        .map(|m| move_to_coordinate(m))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!("{} {} {} {} {}", info.depth, score, time_cs, info.nodes, pv_str);
+}
+
+fn output_move(engine: &mut CECPEngine, mv: Move) {
+    // Make the move internally
+    engine.board = make_move(engine.board, mv);
+    engine.game_history.push(mv);
+
+    // Output the move
+    let move_str = move_to_coordinate(&mv);
+    println!("move {}", move_str);
+
+    // Check for game end
+    if is_checkmate(&engine.board) {
+        if engine.board.side_to_move == engine.engine_color {
+            println!("0-1 {{Black mates}}");
+        } else {
+            println!("1-0 {{White mates}}");
+        }
+    } else if is_stalemate(&engine.board) {
+        println!("1/2-1/2 {{Stalemate}}");
+    } else if is_insufficient_material(&engine.board) {
+        println!("1/2-1/2 {{Insufficient material}}");
+    } else if is_fifty_move_rule(&engine.board) {
+        println!("1/2-1/2 {{50 move rule}}");
+    } else if is_threefold_repetition(&engine.board, &engine.game_history) {
+        println!("1/2-1/2 {{Repetition}}");
+    }
+}
+
+fn move_to_coordinate(mv: &Move) -> String {
+    let from_file = (b'a' + mv.from.file() as u8) as char;
+    let from_rank = (b'1' + mv.from.rank() as u8) as char;
+    let to_file = (b'a' + mv.to.file() as u8) as char;
+    let to_rank = (b'1' + mv.to.rank() as u8) as char;
+
+    let mut s = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);
+
+    if let Some(promo) = mv.promotion {
+        let promo_char = match promo {
+            PieceType::Queen => 'q',
+            PieceType::Rook => 'r',
+            PieceType::Bishop => 'b',
+            PieceType::Knight => 'n',
+            _ => 'q',
+        };
+        s.push(promo_char);
+    }
+
+    return s;
+}
+
+// ============================================================================
+// PONDERING
+// ============================================================================
+
+fn start_ponder(engine: &mut CECPEngine) {
+    // Start pondering on the expected opponent move
+    // This is called when we're waiting for opponent to move
+    engine.is_pondering = true;
+
+    // We don't know what move to ponder on, so just wait
+}
+
+fn start_ponder_on(engine: &mut CECPEngine, ponder_move: Move) {
+    // Ponder on specific move
+    engine.is_pondering = true;
+
+    // Make the ponder move on a copy of the board
+    let ponder_board = make_move(engine.board, ponder_move);
+
+    let params = SearchParams {
+        depth: 100,
+        time_ms: 0,  // Infinite
+        nodes: 0,
+        infinite: true,
+        multi_pv: 1,
+    };
+
+    engine.search_handle = Some(start_search_async(&ponder_board, params, |_| {}));
+}
+
+fn stop_ponder(engine: &mut CECPEngine) {
+    engine.is_pondering = false;
+    stop_search(engine);
+}
+
+fn stop_search(engine: &mut CECPEngine) {
+    if let Some(ref handle) = engine.search_handle {
+        handle.stop();
+    }
+    engine.search_handle = None;
+}
+
+// ============================================================================
+// MISC COMMANDS
+// ============================================================================
+
+fn cmd_ping(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        println!("pong {}", parts[1]);
+    }
+}
+
+fn cmd_draw_offer(engine: &mut CECPEngine) {
+    // Evaluate if we should accept the draw
+    let eval = quick_evaluate(&engine.board);
+
+    // Accept draw if position is roughly equal or worse
+    if eval.abs() < 50 {
+        println!("offer draw");
+    }
+}
+
+fn cmd_result(engine: &mut CECPEngine, parts: &[&str]) {
+    // Game ended
+    stop_search(engine);
+    // Result is for logging purposes
+}
+
+fn cmd_hint(engine: &mut CECPEngine) {
+    // Give a hint - output the expected best move
+    if let Some(book_move) = probe_opening_book(&engine.api, &engine.board) {
+        println!("Hint: {}", move_to_coordinate(&book_move.mv));
+        return;
+    }
+
+    // Do a quick search
+    let params = SearchParams {
+        depth: 10,
+        time_ms: 1000,
+        nodes: 0,
+        infinite: false,
+        multi_pv: 1,
+    };
+
+    let handle = start_search_sync(&engine.board, params);
+    if let Some(result) = handle {
+        println!("Hint: {}", move_to_coordinate(&result.best_move));
+    }
+}
+
+fn cmd_book(engine: &mut CECPEngine) {
+    // Show book moves
+    let book_moves = get_all_book_moves(&engine.api, &engine.board);
+
+    if book_moves.is_empty() {
+        println!(" No book moves");
+    } else {
+        for bm in book_moves {
+            let move_str = move_to_coordinate(&bm.mv);
+            println!(" {} ({} games, {:.0}% wins)",
+                     move_str,
+                     bm.games,
+                     bm.win_pct());
+        }
+    }
+    println!("");
+}
+
+fn cmd_ics(engine: &mut CECPEngine, parts: &[&str]) {
+    engine.ics_mode = true;
+    if parts.len() >= 2 {
+        engine.ics_host = Some(parts[1].to_string());
+    }
+}
+
+fn cmd_memory(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        let mb = parts[1].parse::<usize>().unwrap_or(128);
+        // Set hash table size
+        engine.api.set_hash_size(mb);
+    }
+}
+
+fn cmd_cores(engine: &mut CECPEngine, parts: &[&str]) {
+    if parts.len() >= 2 {
+        let cores = parts[1].parse::<usize>().unwrap_or(1);
+        // Set number of search threads
+        engine.api.set_threads(cores);
+    }
+}
+
+fn cmd_egtpath(engine: &mut CECPEngine, parts: &[&str]) {
+    // egtpath TYPE PATH
+    if parts.len() >= 3 {
+        let tb_type = parts[1];
+        let path = parts[2];
+
+        if tb_type == "syzygy" {
+            engine.api.syzygy.set_path(path);
+        }
+    }
+}
+
+fn cmd_option(engine: &mut CECPEngine, parts: &[&str]) {
+    // option NAME=VALUE
+    if parts.len() >= 2 {
+        let opt = parts[1..].join(" ");
+        if let Some(eq_pos) = opt.find('=') {
+            let name = opt[..eq_pos].trim();
+            let value = opt[eq_pos + 1..].trim();
+
+            match name {
+                "Use NNUE" => {
+                    engine.api.set_use_nnue(value == "1" || value == "true");
+                }
+                "Use Cloud Eval" => {
+                    engine.api.set_use_cloud(value == "1" || value == "true");
+                }
+                "LAN Tablebase" => {
+                    if !value.is_empty() {
+                        engine.api.syzygy.set_lan_server(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn is_valid_move_string(s: &str) -> bool {
+    // Check if string looks like a move
+    let len = s.len();
+    if len < 4 || len > 5 {
+        return false;
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+
+    // Check coordinate format: e2e4 or e7e8q
+    chars[0] >= 'a' && chars[0] <= 'h' &&
+    chars[1] >= '1' && chars[1] <= '8' &&
+    chars[2] >= 'a' && chars[2] <= 'h' &&
+    chars[3] >= '1' && chars[3] <= '8'
+}
+

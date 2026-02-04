@@ -1,0 +1,571 @@
+// NikolaChess - Lichess Bot API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Full Lichess Bot API implementation for online play
+// Supports: challenges, games, streaming, chat
+
+import std.thread;
+import std.sync;
+import std.time;
+
+// ============================================================================
+// LICHESS BOT CLIENT
+// ============================================================================
+
+struct LichessBot {
+    token: str,
+    http: HttpClientPool,
+    base_url: str,
+
+    // State
+    username: str,
+    connected: bool,
+    playing: bool,
+    current_game: Option<GameState>,
+
+    // Engine
+    engine: UCIEngine,
+
+    // Settings
+    accept_rated: bool,
+    accept_casual: bool,
+    min_rating: i32,
+    max_rating: i32,
+    accept_variants: Vec<str>,
+    accept_time_controls: Vec<str>,
+}
+
+struct GameState {
+    game_id: str,
+    white: str,
+    black: str,
+    initial_fen: str,
+    moves: Vec<str>,
+    wtime: i64,
+    btime: i64,
+    winc: i64,
+    binc: i64,
+    status: str,
+    is_my_turn: bool,
+}
+
+fn create_lichess_bot(token: &str) -> LichessBot {
+    return LichessBot {
+        token: token.to_string(),
+        http: HttpClientPool::new(4),
+        base_url: "https://lichess.org/api".to_string(),
+        username: String::new(),
+        connected: false,
+        playing: false,
+        current_game: None,
+        engine: create_uci_engine(),
+        accept_rated: true,
+        accept_casual: true,
+        min_rating: 0,
+        max_rating: 4000,
+        accept_variants: vec!["standard".to_string()],
+        accept_time_controls: vec!["bullet".to_string(), "blitz".to_string(),
+                                   "rapid".to_string(), "classical".to_string()],
+    };
+}
+
+// ============================================================================
+// BOT MAIN LOOP
+// ============================================================================
+
+fn run_lichess_bot(bot: &mut LichessBot) {
+    println!("Starting Lichess Bot...");
+
+    // Get account info
+    if !get_account_info(bot) {
+        println!("ERROR: Failed to authenticate with Lichess");
+        return;
+    }
+
+    println!("Logged in as: {}", bot.username);
+    bot.connected = true;
+
+    // Start event stream
+    start_event_stream(bot);
+}
+
+fn get_account_info(bot: &mut LichessBot) -> bool {
+    let response = bot.http.get(&format!("{}/account", bot.base_url))
+        .header("Authorization", &format!("Bearer {}", bot.token))
+        .timeout(5000)
+        .send();
+
+    match response {
+        Ok(resp) => {
+            if resp.status != 200 {
+                return false;
+            }
+
+            if let Ok(json) = resp.json() {
+                bot.username = json["username"].as_str().unwrap_or("").to_string();
+                return !bot.username.is_empty();
+            }
+            return false;
+        }
+        Err(_) => return false,
+    }
+}
+
+// ============================================================================
+// EVENT STREAMING
+// ============================================================================
+
+fn start_event_stream(bot: &mut LichessBot) {
+    let url = format!("{}/stream/event", bot.base_url);
+
+    // Stream events using Server-Sent Events (SSE)
+    loop {
+        let response = bot.http.get(&url)
+            .header("Authorization", &format!("Bearer {}", bot.token))
+            .header("Accept", "application/x-ndjson")
+            .timeout(0)  // No timeout for streaming
+            .send();
+
+        match response {
+            Ok(resp) => {
+                if resp.status != 200 {
+                    println!("Event stream error: {}", resp.status);
+                    thread.sleep(5000);
+                    continue;
+                }
+
+                // Process NDJSON stream
+                for line in resp.body.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if let Ok(json) = parse_json(line) {
+                        handle_event(bot, &json);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Event stream connection error: {:?}", e);
+                thread.sleep(5000);
+            }
+        }
+    }
+}
+
+fn handle_event(bot: &mut LichessBot, event: &JsonValue) {
+    let event_type = event["type"].as_str().unwrap_or("");
+
+    match event_type {
+        "challenge" => {
+            let challenge = &event["challenge"];
+            handle_challenge(bot, challenge);
+        }
+        "challengeCanceled" => {
+            // Challenge was canceled, nothing to do
+        }
+        "challengeDeclined" => {
+            // Our challenge was declined
+        }
+        "gameStart" => {
+            let game_id = event["game"]["gameId"].as_str().unwrap_or("");
+            if !game_id.is_empty() {
+                start_game(bot, game_id);
+            }
+        }
+        "gameFinish" => {
+            bot.playing = false;
+            bot.current_game = None;
+            println!("Game finished");
+        }
+        _ => {
+            // Unknown event type
+        }
+    }
+}
+
+// ============================================================================
+// CHALLENGE HANDLING
+// ============================================================================
+
+fn handle_challenge(bot: &mut LichessBot, challenge: &JsonValue) {
+    let challenge_id = challenge["id"].as_str().unwrap_or("");
+    let challenger = challenge["challenger"]["name"].as_str().unwrap_or("");
+    let rating = challenge["challenger"]["rating"].as_i64().unwrap_or(0) as i32;
+    let variant = challenge["variant"]["key"].as_str().unwrap_or("");
+    let rated = challenge["rated"].as_bool().unwrap_or(false);
+    let time_control = challenge["speed"].as_str().unwrap_or("");
+
+    println!("Challenge from {} ({}): {} {} {}",
+             challenger, rating, variant, time_control, if rated { "rated" } else { "casual" });
+
+    // Check if we should accept
+    if !should_accept_challenge(bot, challenge) {
+        decline_challenge(bot, challenge_id, "generic");
+        println!("  -> Declined");
+        return;
+    }
+
+    // Accept challenge
+    accept_challenge(bot, challenge_id);
+    println!("  -> Accepted");
+}
+
+fn should_accept_challenge(bot: &LichessBot, challenge: &JsonValue) -> bool {
+    let rated = challenge["rated"].as_bool().unwrap_or(false);
+    let variant = challenge["variant"]["key"].as_str().unwrap_or("");
+    let speed = challenge["speed"].as_str().unwrap_or("");
+    let rating = challenge["challenger"]["rating"].as_i64().unwrap_or(0) as i32;
+
+    // Check rated/casual
+    if rated && !bot.accept_rated {
+        return false;
+    }
+    if !rated && !bot.accept_casual {
+        return false;
+    }
+
+    // Check variant
+    if !bot.accept_variants.contains(&variant.to_string()) {
+        return false;
+    }
+
+    // Check time control
+    if !bot.accept_time_controls.contains(&speed.to_string()) {
+        return false;
+    }
+
+    // Check rating range
+    if rating < bot.min_rating || rating > bot.max_rating {
+        return false;
+    }
+
+    // Don't play if already in a game
+    if bot.playing {
+        return false;
+    }
+
+    return true;
+}
+
+fn accept_challenge(bot: &mut LichessBot, challenge_id: &str) {
+    let url = format!("{}/challenge/{}/accept", bot.base_url, challenge_id);
+
+    let response = bot.http.post(&url)
+        .header("Authorization", &format!("Bearer {}", bot.token))
+        .timeout(5000)
+        .send();
+
+    if let Err(e) = response {
+        println!("Failed to accept challenge: {:?}", e);
+    }
+}
+
+fn decline_challenge(bot: &mut LichessBot, challenge_id: &str, reason: &str) {
+    let url = format!("{}/challenge/{}/decline", bot.base_url, challenge_id);
+
+    let body = format!(r#"{{"reason": "{}"}}"#, reason);
+
+    bot.http.post(&url)
+        .header("Authorization", &format!("Bearer {}", bot.token))
+        .json_body(&body)
+        .timeout(5000)
+        .send()
+        .ok();
+}
+
+// ============================================================================
+// GAME HANDLING
+// ============================================================================
+
+fn start_game(bot: &mut LichessBot, game_id: &str) {
+    println!("Game started: {}", game_id);
+    bot.playing = true;
+
+    // Start game stream in separate thread
+    let game_id_owned = game_id.to_string();
+    let token = bot.token.clone();
+    let base_url = bot.base_url.clone();
+    let http = bot.http.clone();
+
+    thread.spawn(move || {
+        stream_game(&http, &base_url, &token, &game_id_owned);
+    });
+}
+
+fn stream_game(http: &HttpClientPool, base_url: &str, token: &str, game_id: &str) {
+    let url = format!("{}/bot/game/stream/{}", base_url, game_id);
+
+    let response = http.get(&url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .header("Accept", "application/x-ndjson")
+        .timeout(0)
+        .send();
+
+    match response {
+        Ok(resp) => {
+            if resp.status != 200 {
+                println!("Game stream error: {}", resp.status);
+                return;
+            }
+
+            let mut game_state = GameState {
+                game_id: game_id.to_string(),
+                white: String::new(),
+                black: String::new(),
+                initial_fen: "startpos".to_string(),
+                moves: Vec::new(),
+                wtime: 0,
+                btime: 0,
+                winc: 0,
+                binc: 0,
+                status: "started".to_string(),
+                is_my_turn: false,
+            };
+
+            for line in resp.body.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(json) = parse_json(line) {
+                    handle_game_event(http, base_url, token, &mut game_state, &json);
+                }
+            }
+        }
+        Err(e) => {
+            println!("Game stream connection error: {:?}", e);
+        }
+    }
+}
+
+fn handle_game_event(
+    http: &HttpClientPool,
+    base_url: &str,
+    token: &str,
+    state: &mut GameState,
+    event: &JsonValue
+) {
+    let event_type = event["type"].as_str().unwrap_or("");
+
+    match event_type {
+        "gameFull" => {
+            // Initial game state
+            state.white = event["white"]["name"].as_str().unwrap_or("").to_string();
+            state.black = event["black"]["name"].as_str().unwrap_or("").to_string();
+
+            if let Some(fen) = event["initialFen"].as_str() {
+                if fen != "startpos" {
+                    state.initial_fen = fen.to_string();
+                }
+            }
+
+            // Parse current state
+            let game_state = &event["state"];
+            update_game_state(state, game_state, token);
+
+            // Make move if it's our turn
+            if state.is_my_turn {
+                make_bot_move(http, base_url, token, state);
+            }
+        }
+        "gameState" => {
+            update_game_state(state, event, token);
+
+            if state.status == "started" && state.is_my_turn {
+                make_bot_move(http, base_url, token, state);
+            }
+        }
+        "chatLine" => {
+            let username = event["username"].as_str().unwrap_or("");
+            let text = event["text"].as_str().unwrap_or("");
+            println!("Chat [{}]: {}", username, text);
+
+            // Auto-respond to common messages
+            if text.to_lowercase().contains("gl") || text.to_lowercase().contains("good luck") {
+                send_chat(http, base_url, token, &state.game_id, "player", "gl hf!");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn update_game_state(state: &mut GameState, event: &JsonValue, my_username: &str) {
+    // Parse moves
+    if let Some(moves_str) = event["moves"].as_str() {
+        state.moves = moves_str.split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+    }
+
+    // Parse time
+    state.wtime = event["wtime"].as_i64().unwrap_or(0);
+    state.btime = event["btime"].as_i64().unwrap_or(0);
+    state.winc = event["winc"].as_i64().unwrap_or(0);
+    state.binc = event["binc"].as_i64().unwrap_or(0);
+
+    // Parse status
+    state.status = event["status"].as_str().unwrap_or("started").to_string();
+
+    // Determine if it's our turn
+    let num_moves = state.moves.len();
+    let white_to_move = num_moves % 2 == 0;
+
+    state.is_my_turn = (white_to_move && state.white == my_username) ||
+                       (!white_to_move && state.black == my_username);
+}
+
+fn make_bot_move(http: &HttpClientPool, base_url: &str, token: &str, state: &GameState) {
+    // Set up position
+    let mut engine = create_uci_engine();
+
+    // Build position command
+    let position = if state.initial_fen == "startpos" {
+        if state.moves.is_empty() {
+            "position startpos".to_string()
+        } else {
+            format!("position startpos moves {}", state.moves.join(" "))
+        }
+    } else {
+        if state.moves.is_empty() {
+            format!("position fen {}", state.initial_fen)
+        } else {
+            format!("position fen {} moves {}", state.initial_fen, state.moves.join(" "))
+        }
+    };
+
+    // Process position
+    let parts: Vec<&str> = position.split_whitespace().collect();
+    cmd_position(&mut engine, &parts);
+
+    // Build go command
+    let go_cmd = format!("go wtime {} btime {} winc {} binc {}",
+                         state.wtime, state.btime, state.winc, state.binc);
+
+    // Run search synchronously and get best move
+    let parts: Vec<&str> = go_cmd.split_whitespace().collect();
+
+    // Simplified: just search to depth 20 with time limit
+    let time_ms = if engine.board.side_to_move == 0 {
+        calculate_time_simple(state.wtime, state.winc)
+    } else {
+        calculate_time_simple(state.btime, state.binc)
+    };
+
+    let result = search(&mut engine.search, engine.board, 20, time_ms);
+    let best_move = move_to_uci(result.best_move);
+
+    // Send move to Lichess
+    send_move(http, base_url, token, &state.game_id, &best_move);
+}
+
+fn calculate_time_simple(time_ms: i64, inc_ms: i64) -> i64 {
+    let base = time_ms / 30;
+    let with_inc = base + inc_ms * 3 / 4;
+    return with_inc.min(time_ms / 3).max(100);
+}
+
+fn send_move(http: &HttpClientPool, base_url: &str, token: &str, game_id: &str, uci_move: &str) {
+    let url = format!("{}/bot/game/{}/move/{}", base_url, game_id, uci_move);
+
+    let response = http.post(&url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .timeout(5000)
+        .send();
+
+    match response {
+        Ok(resp) => {
+            if resp.status != 200 {
+                println!("Failed to send move: {}", resp.status);
+            }
+        }
+        Err(e) => {
+            println!("Error sending move: {:?}", e);
+        }
+    }
+}
+
+fn send_chat(http: &HttpClientPool, base_url: &str, token: &str, game_id: &str, room: &str, text: &str) {
+    let url = format!("{}/bot/game/{}/chat", base_url, game_id);
+    let body = format!(r#"{{"room": "{}", "text": "{}"}}"#, room, text);
+
+    http.post(&url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .json_body(&body)
+        .timeout(5000)
+        .send()
+        .ok();
+}
+
+// ============================================================================
+// CHALLENGE OTHERS
+// ============================================================================
+
+fn challenge_player(bot: &mut LichessBot, username: &str, rated: bool, clock_limit: i32, clock_increment: i32) {
+    let url = format!("{}/challenge/{}", bot.base_url, username);
+
+    let body = format!(
+        r#"{{"rated": {}, "clock.limit": {}, "clock.increment": {}, "variant": "standard"}}"#,
+        rated, clock_limit, clock_increment
+    );
+
+    let response = bot.http.post(&url)
+        .header("Authorization", &format!("Bearer {}", bot.token))
+        .json_body(&body)
+        .timeout(10000)
+        .send();
+
+    match response {
+        Ok(resp) => {
+            if resp.status == 200 {
+                println!("Challenge sent to {}", username);
+            } else {
+                println!("Failed to challenge {}: {}", username, resp.status);
+            }
+        }
+        Err(e) => {
+            println!("Error challenging {}: {:?}", username, e);
+        }
+    }
+}
+
+// ============================================================================
+// BOT COMMANDS
+// ============================================================================
+
+fn resign_game(bot: &mut LichessBot) {
+    if let Some(ref game) = bot.current_game {
+        let url = format!("{}/bot/game/{}/resign", bot.base_url, game.game_id);
+
+        bot.http.post(&url)
+            .header("Authorization", &format!("Bearer {}", bot.token))
+            .timeout(5000)
+            .send()
+            .ok();
+    }
+}
+
+fn abort_game(bot: &mut LichessBot) {
+    if let Some(ref game) = bot.current_game {
+        let url = format!("{}/bot/game/{}/abort", bot.base_url, game.game_id);
+
+        bot.http.post(&url)
+            .header("Authorization", &format!("Bearer {}", bot.token))
+            .timeout(5000)
+            .send()
+            .ok();
+    }
+}
+
+fn offer_draw(bot: &mut LichessBot) {
+    if let Some(ref game) = bot.current_game {
+        let url = format!("{}/bot/game/{}/draw/yes", bot.base_url, game.game_id);
+
+        bot.http.post(&url)
+            .header("Authorization", &format!("Bearer {}", bot.token))
+            .timeout(5000)
+            .send()
+            .ok();
+    }
+}

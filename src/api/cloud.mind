@@ -1,0 +1,408 @@
+// NikolaChess - Cloud Evaluation API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Cloud evaluation APIs:
+// - Lichess Cloud Eval (Stockfish analysis)
+// - ChessDB Eval (deep analysis)
+// - Custom analysis servers
+
+import std.sync;
+import std.time;
+
+// ============================================================================
+// CLOUD EVALUATION RESULT
+// ============================================================================
+
+struct CloudEval {
+    score_cp: i32,         // Score in centipawns
+    score_mate: Option<i32>, // Mate in N (if applicable)
+    depth: i32,            // Search depth
+    seldepth: i32,         // Selective depth
+    pv: Vec<Move>,         // Principal variation
+    knodes: i64,           // Kilonodes searched
+    time_ms: i64,          // Time spent
+    source: str,           // API source
+    cached: bool,          // From cache?
+}
+
+// ============================================================================
+// CLOUD UNIFIED CLIENT
+// ============================================================================
+
+struct CloudUnified {
+    http: HttpClientPool,
+    cache: LRUCache<u64, CloudEval>,
+    lichess_enabled: bool,
+    chessdb_enabled: bool,
+    custom_enabled: bool,
+    custom_url: Option<str>,
+    timeout_ms: i64,
+    stats: CloudStats,
+}
+
+struct CloudStats {
+    lichess_probes: i64,
+    lichess_hits: i64,
+    chessdb_probes: i64,
+    chessdb_hits: i64,
+    custom_probes: i64,
+    custom_hits: i64,
+    cache_hits: i64,
+    avg_depth: f32,
+}
+
+fn create_cloud_unified(config: &APIConfig) -> CloudUnified {
+    return CloudUnified {
+        http: HttpClientPool::new(4),
+        cache: LRUCache::new(1_000_000),
+        lichess_enabled: config.lichess_cloud_enabled,
+        chessdb_enabled: config.chessdb_eval_enabled,
+        custom_enabled: false,
+        custom_url: None,
+        timeout_ms: config.remote_timeout_ms,
+        stats: CloudStats::default(),
+    };
+}
+
+fn probe_cloud_unified(cloud: &mut CloudUnified, board: Board) -> Option<CloudEval> {
+    let hash = board.hash;
+
+    // Check cache
+    if let Some(cached) = cloud.cache.get(hash) {
+        cloud.stats.cache_hits += 1;
+        let mut result = cached.clone();
+        result.cached = true;
+        return Some(result);
+    }
+
+    let fen = board_to_fen(board);
+    let mut result: Option<CloudEval> = None;
+
+    // 1. Lichess Cloud Eval (usually has more positions)
+    if cloud.lichess_enabled {
+        cloud.stats.lichess_probes += 1;
+        result = probe_lichess_cloud(&cloud.http, &fen, cloud.timeout_ms);
+        if result.is_some() {
+            cloud.stats.lichess_hits += 1;
+            result.as_mut().unwrap().source = "lichess".to_string();
+        }
+    }
+
+    // 2. ChessDB Eval (deeper analysis for some positions)
+    if result.is_none() && cloud.chessdb_enabled {
+        cloud.stats.chessdb_probes += 1;
+        result = probe_chessdb_eval(&cloud.http, &fen, cloud.timeout_ms);
+        if result.is_some() {
+            cloud.stats.chessdb_hits += 1;
+            result.as_mut().unwrap().source = "chessdb".to_string();
+        }
+    }
+
+    // 3. Custom server
+    if result.is_none() && cloud.custom_enabled {
+        if let Some(ref url) = cloud.custom_url {
+            cloud.stats.custom_probes += 1;
+            result = probe_custom_server(&cloud.http, url, &fen, cloud.timeout_ms);
+            if result.is_some() {
+                cloud.stats.custom_hits += 1;
+                result.as_mut().unwrap().source = "custom".to_string();
+            }
+        }
+    }
+
+    // Cache and return
+    if let Some(ref eval) = result {
+        cloud.cache.insert(hash, eval.clone());
+        update_avg_depth(&mut cloud.stats, eval.depth);
+    }
+
+    return result;
+}
+
+fn update_avg_depth(stats: &mut CloudStats, depth: i32) {
+    let n = (stats.lichess_hits + stats.chessdb_hits + stats.custom_hits) as f32;
+    stats.avg_depth = (stats.avg_depth * (n - 1.0) + depth as f32) / n;
+}
+
+// ============================================================================
+// LICHESS CLOUD EVAL API
+// ============================================================================
+
+fn probe_lichess_cloud(
+    http: &HttpClientPool,
+    fen: &str,
+    timeout_ms: i64
+) -> Option<CloudEval> {
+    let url = format!(
+        "https://lichess.org/api/cloud-eval?fen={}&multiPv=1",
+        url_encode(fen)
+    );
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(timeout_ms)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    // Check if evaluation exists
+    if json["pvs"].as_array()?.is_empty() {
+        return None;
+    }
+
+    let pv_data = &json["pvs"][0];
+
+    // Parse score
+    let (score_cp, score_mate) = if let Some(mate) = pv_data["mate"].as_i64() {
+        (0, Some(mate as i32))
+    } else {
+        (pv_data["cp"].as_i64().unwrap_or(0) as i32, None)
+    };
+
+    // Parse PV
+    let pv_str = pv_data["moves"].as_str().unwrap_or("");
+    let pv = parse_pv(pv_str);
+
+    let depth = json["depth"].as_i64().unwrap_or(0) as i32;
+    let knodes = json["knodes"].as_i64().unwrap_or(0);
+
+    return Some(CloudEval {
+        score_cp: score_cp,
+        score_mate: score_mate,
+        depth: depth,
+        seldepth: depth,
+        pv: pv,
+        knodes: knodes,
+        time_ms: 0,
+        source: "lichess".to_string(),
+        cached: false,
+    });
+}
+
+// ============================================================================
+// CHESSDB EVAL API
+// ============================================================================
+
+fn probe_chessdb_eval(
+    http: &HttpClientPool,
+    fen: &str,
+    timeout_ms: i64
+) -> Option<CloudEval> {
+    let url = format!(
+        "https://www.chessdb.cn/cdb.php?action=queryall&board={}",
+        url_encode(fen)
+    );
+
+    let response = http.get(&url)
+        .timeout(timeout_ms)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let text = response.text().ok()?;
+    if text.starts_with("unknown") || text.is_empty() {
+        return None;
+    }
+
+    // Parse ChessDB format: "move:score:depth:..."
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Parse first line (best move)
+    let parts: Vec<&str> = lines[0].split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let score_cp = parts[1].parse::<i32>().unwrap_or(0);
+    let depth = if parts.len() >= 3 {
+        parts[2].parse::<i32>().unwrap_or(0)
+    } else {
+        30  // Default depth
+    };
+
+    // Build PV from all moves
+    let mut pv = Vec::new();
+    for line in &lines {
+        let mv_parts: Vec<&str> = line.split(':').collect();
+        if !mv_parts.is_empty() {
+            if let Some(mv) = parse_uci_move(mv_parts[0]) {
+                pv.push(mv);
+                break;  // Only first move for main line
+            }
+        }
+    }
+
+    return Some(CloudEval {
+        score_cp: score_cp,
+        score_mate: None,
+        depth: depth,
+        seldepth: depth,
+        pv: pv,
+        knodes: 0,
+        time_ms: 0,
+        source: "chessdb".to_string(),
+        cached: false,
+    });
+}
+
+// ============================================================================
+// CUSTOM SERVER PROBE
+// ============================================================================
+
+fn probe_custom_server(
+    http: &HttpClientPool,
+    base_url: &str,
+    fen: &str,
+    timeout_ms: i64
+) -> Option<CloudEval> {
+    let url = format!("{}?fen={}", base_url, url_encode(fen));
+
+    let response = http.get(&url)
+        .timeout(timeout_ms)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    let score_cp = json["score_cp"].as_i64().unwrap_or(0) as i32;
+    let depth = json["depth"].as_i64().unwrap_or(0) as i32;
+    let pv_str = json["pv"].as_str().unwrap_or("");
+
+    return Some(CloudEval {
+        score_cp: score_cp,
+        score_mate: json["mate"].as_i64().map(|x| x as i32),
+        depth: depth,
+        seldepth: json["seldepth"].as_i64().unwrap_or(depth as i64) as i32,
+        pv: parse_pv(pv_str),
+        knodes: json["knodes"].as_i64().unwrap_or(0),
+        time_ms: json["time_ms"].as_i64().unwrap_or(0),
+        source: "custom".to_string(),
+        cached: false,
+    });
+}
+
+// ============================================================================
+// ANALYSIS REQUEST (For deeper analysis)
+// ============================================================================
+
+struct AnalysisRequest {
+    fen: str,
+    depth: i32,
+    multi_pv: i32,
+    time_ms: i64,
+}
+
+struct AnalysisResult {
+    lines: Vec<AnalysisLine>,
+    depth: i32,
+    knodes: i64,
+    time_ms: i64,
+}
+
+struct AnalysisLine {
+    score_cp: i32,
+    score_mate: Option<i32>,
+    pv: Vec<Move>,
+    depth: i32,
+}
+
+fn request_analysis(
+    cloud: &mut CloudUnified,
+    request: AnalysisRequest
+) -> Option<AnalysisResult> {
+    // Use Lichess analysis API for multi-PV
+    if cloud.lichess_enabled {
+        let url = format!(
+            "https://lichess.org/api/cloud-eval?fen={}&multiPv={}",
+            url_encode(&request.fen),
+            request.multi_pv
+        );
+
+        let response = cloud.http.get(&url)
+            .timeout(request.time_ms.max(cloud.timeout_ms))
+            .send()
+            .ok()?;
+
+        if response.status != 200 {
+            return None;
+        }
+
+        let json = response.json().ok()?;
+        let pvs = json["pvs"].as_array()?;
+
+        let mut lines = Vec::new();
+        for pv_data in pvs {
+            let (score_cp, score_mate) = if let Some(mate) = pv_data["mate"].as_i64() {
+                (0, Some(mate as i32))
+            } else {
+                (pv_data["cp"].as_i64().unwrap_or(0) as i32, None)
+            };
+
+            let pv_str = pv_data["moves"].as_str().unwrap_or("");
+
+            lines.push(AnalysisLine {
+                score_cp: score_cp,
+                score_mate: score_mate,
+                pv: parse_pv(pv_str),
+                depth: json["depth"].as_i64().unwrap_or(0) as i32,
+            });
+        }
+
+        return Some(AnalysisResult {
+            lines: lines,
+            depth: json["depth"].as_i64().unwrap_or(0) as i32,
+            knodes: json["knodes"].as_i64().unwrap_or(0),
+            time_ms: 0,
+        });
+    }
+
+    return None;
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+fn parse_pv(pv_str: &str) -> Vec<Move> {
+    let mut pv = Vec::new();
+    for uci in pv_str.split_whitespace() {
+        if let Some(mv) = parse_uci_move(uci) {
+            pv.push(mv);
+        }
+    }
+    return pv;
+}
+
+fn print_cloud_stats(cloud: &CloudUnified) {
+    let total = cloud.stats.lichess_probes + cloud.stats.chessdb_probes + cloud.stats.custom_probes;
+    let hits = cloud.stats.lichess_hits + cloud.stats.chessdb_hits + cloud.stats.custom_hits;
+
+    println!("=== Cloud Evaluation Statistics ===");
+    println!("Lichess:   {} probes, {} hits ({:.1}%)",
+             cloud.stats.lichess_probes, cloud.stats.lichess_hits,
+             100.0 * cloud.stats.lichess_hits as f32 / cloud.stats.lichess_probes.max(1) as f32);
+    println!("ChessDB:   {} probes, {} hits ({:.1}%)",
+             cloud.stats.chessdb_probes, cloud.stats.chessdb_hits,
+             100.0 * cloud.stats.chessdb_hits as f32 / cloud.stats.chessdb_probes.max(1) as f32);
+    println!("Custom:    {} probes, {} hits ({:.1}%)",
+             cloud.stats.custom_probes, cloud.stats.custom_hits,
+             100.0 * cloud.stats.custom_hits as f32 / cloud.stats.custom_probes.max(1) as f32);
+    println!("Cache:     {} hits", cloud.stats.cache_hits);
+    println!("Avg depth: {:.1}", cloud.stats.avg_depth);
+}

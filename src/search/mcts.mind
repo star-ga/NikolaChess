@@ -1,0 +1,696 @@
+// NikolaChess - GPU-Accelerated Monte Carlo Tree Search
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// AlphaZero-style MCTS/PUCT with GPU-batched neural network inference.
+// Replaces traditional alpha-beta for positions where GPU parallelism
+// provides superior node throughput.
+
+import std.sync;
+import std.math;
+import std.collections;
+
+// ============================================================================
+// MCTS CONFIGURATION
+// ============================================================================
+
+struct MCTSConfig {
+    // PUCT exploration constant
+    c_puct: f32,
+    // FPU (First Play Urgency) reduction
+    fpu_reduction: f32,
+    // Dirichlet noise for root exploration
+    root_dirichlet_alpha: f32,
+    root_exploration_fraction: f32,
+    // Virtual loss for parallel search
+    virtual_loss: f32,
+    // Batch size for GPU inference
+    batch_size: i32,
+    // Number of simulations
+    num_simulations: i32,
+    // Temperature for move selection
+    temperature: f32,
+    // Use GPU clustering
+    num_gpus: i32,
+}
+
+impl MCTSConfig {
+    fn default() -> MCTSConfig {
+        return MCTSConfig {
+            c_puct: 2.5,
+            fpu_reduction: 0.25,
+            root_dirichlet_alpha: 0.3,
+            root_exploration_fraction: 0.25,
+            virtual_loss: 1.0,
+            batch_size: 256,
+            num_simulations: 800,
+            temperature: 1.0,
+            num_gpus: 1,
+        };
+    }
+
+    fn for_analysis() -> MCTSConfig {
+        let mut cfg = Self::default();
+        cfg.num_simulations = 10000;
+        cfg.temperature = 0.0;  // Deterministic best move
+        return cfg;
+    }
+
+    fn for_multi_gpu(num_gpus: i32) -> MCTSConfig {
+        let mut cfg = Self::default();
+        cfg.num_gpus = num_gpus;
+        cfg.batch_size = 256 * num_gpus;
+        cfg.num_simulations = 800 * num_gpus;
+        return cfg;
+    }
+}
+
+// ============================================================================
+// MCTS NODE
+// ============================================================================
+
+struct MCTSNode {
+    // Move that led to this node
+    mv: Option<Move>,
+    // Parent reference (weak to avoid cycles)
+    parent: Option<Weak<MCTSNode>>,
+    // Children
+    children: Vec<Arc<MCTSNode>>,
+    // Statistics
+    visit_count: AtomicI32,
+    total_value: AtomicF32,
+    virtual_loss: AtomicF32,
+    // Policy prior from neural network
+    prior: f32,
+    // Cached terminal result (if any)
+    terminal_value: Option<f32>,
+    // Position hash for transposition
+    hash: u64,
+    // Node lock for expansion
+    expanding: AtomicBool,
+}
+
+impl MCTSNode {
+    fn new(mv: Option<Move>, prior: f32, hash: u64) -> MCTSNode {
+        return MCTSNode {
+            mv: mv,
+            parent: None,
+            children: Vec::new(),
+            visit_count: AtomicI32::new(0),
+            total_value: AtomicF32::new(0.0),
+            virtual_loss: AtomicF32::new(0.0),
+            prior: prior,
+            terminal_value: None,
+            hash: hash,
+            expanding: AtomicBool::new(false),
+        };
+    }
+
+    fn visit_count(&self) -> i32 {
+        return self.visit_count.load(Ordering::Relaxed);
+    }
+
+    fn q_value(&self) -> f32 {
+        let visits = self.visit_count() as f32;
+        let vl = self.virtual_loss.load(Ordering::Relaxed);
+        if visits + vl <= 0.0 {
+            return 0.0;
+        }
+        let total = self.total_value.load(Ordering::Relaxed);
+        return total / (visits + vl);
+    }
+
+    fn ucb_score(&self, parent_visits: i32, c_puct: f32, fpu: f32) -> f32 {
+        let visits = self.visit_count() as f32;
+        let vl = self.virtual_loss.load(Ordering::Relaxed);
+
+        // Q value (average value of subtree)
+        let q = if visits + vl > 0.0 {
+            self.total_value.load(Ordering::Relaxed) / (visits + vl)
+        } else {
+            fpu  // First Play Urgency
+        };
+
+        // U value (exploration bonus)
+        let u = c_puct * self.prior * (parent_visits as f32).sqrt() / (1.0 + visits + vl);
+
+        return q + u;
+    }
+
+    fn select_child(&self, c_puct: f32, fpu: f32) -> Option<Arc<MCTSNode>> {
+        if self.children.is_empty() {
+            return None;
+        }
+
+        let parent_visits = self.visit_count();
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_child = None;
+
+        for child in &self.children {
+            let score = child.ucb_score(parent_visits, c_puct, fpu);
+            if score > best_score {
+                best_score = score;
+                best_child = Some(child.clone());
+            }
+        }
+
+        return best_child;
+    }
+
+    fn add_virtual_loss(&self, vl: f32) {
+        self.virtual_loss.fetch_add(vl, Ordering::Relaxed);
+    }
+
+    fn remove_virtual_loss(&self, vl: f32) {
+        self.virtual_loss.fetch_add(-vl, Ordering::Relaxed);
+    }
+
+    fn backup(&self, value: f32) {
+        self.visit_count.fetch_add(1, Ordering::Relaxed);
+        self.total_value.fetch_add(value, Ordering::Relaxed);
+
+        // Propagate up the tree (negating for opponent perspective)
+        if let Some(parent_weak) = &self.parent {
+            if let Some(parent) = parent_weak.upgrade() {
+                parent.backup(-value);
+            }
+        }
+    }
+
+    fn is_expanded(&self) -> bool {
+        return !self.children.is_empty() || self.terminal_value.is_some();
+    }
+
+    fn best_move(&self, temperature: f32) -> Option<Move> {
+        if self.children.is_empty() {
+            return None;
+        }
+
+        if temperature == 0.0 {
+            // Deterministic: pick most visited
+            return self.children.iter()
+                .max_by_key(|c| c.visit_count())
+                .and_then(|c| c.mv);
+        }
+
+        // Probabilistic selection based on visit counts
+        let total_visits: f32 = self.children.iter()
+            .map(|c| (c.visit_count() as f32).powf(1.0 / temperature))
+            .sum();
+
+        let mut rng = rand::thread_rng();
+        let r = rng.gen::<f32>() * total_visits;
+        let mut cumsum = 0.0;
+
+        for child in &self.children {
+            cumsum += (child.visit_count() as f32).powf(1.0 / temperature);
+            if cumsum >= r {
+                return child.mv;
+            }
+        }
+
+        return self.children.last().and_then(|c| c.mv);
+    }
+}
+
+// ============================================================================
+// POLICY-VALUE NETWORK
+// ============================================================================
+
+struct PolicyValueNetwork on(gpu0) {
+    // Shared backbone (ResNet-style)
+    conv_blocks: Vec<ConvBlock>,
+    // Policy head
+    policy_conv: Conv2d,
+    policy_fc: Linear,
+    // Value head
+    value_conv: Conv2d,
+    value_fc1: Linear,
+    value_fc2: Linear,
+}
+
+struct ConvBlock on(gpu0) {
+    conv1: Conv2d,
+    bn1: BatchNorm2d,
+    conv2: Conv2d,
+    bn2: BatchNorm2d,
+}
+
+impl PolicyValueNetwork {
+    fn load(path: &str) -> Result<PolicyValueNetwork, Error> on(gpu0) {
+        // Load pre-trained network weights
+        return Self::deserialize(read_binary(path)?);
+    }
+
+    fn forward_batch(
+        &self,
+        boards: &[Board],
+    ) -> (Vec<Vec<f32>>, Vec<f32>) on(gpu0..gpu7) {
+        let n = boards.len();
+
+        // Encode positions as tensors
+        // Shape: [N, 112, 8, 8] (112 planes: 6 piece types * 2 colors * 8 history + extras)
+        let inputs = Self::encode_positions(boards) on(gpu0);
+
+        // Forward through backbone
+        let mut x = inputs;
+        for block in &self.conv_blocks {
+            let residual = x.clone();
+            x = block.bn1.forward(block.conv1.forward(x)).relu();
+            x = block.bn2.forward(block.conv2.forward(x));
+            x = (x + residual).relu();
+        }
+
+        // Policy head
+        let policy_conv_out = self.policy_conv.forward(x.clone()).relu();
+        let policy_flat = policy_conv_out.flatten(1);
+        let policy_logits = self.policy_fc.forward(policy_flat);
+        let policies = softmax(policy_logits, dim=1);
+
+        // Value head
+        let value_conv_out = self.value_conv.forward(x).relu();
+        let value_flat = value_conv_out.flatten(1);
+        let value_hidden = self.value_fc1.forward(value_flat).relu();
+        let values = self.value_fc2.forward(value_hidden).tanh();
+
+        // Convert to move probabilities
+        let mut move_policies = Vec::with_capacity(n);
+        for i in 0..n {
+            let board = &boards[i];
+            let legal_moves = generate_legal_moves(board);
+            let mut priors = Vec::with_capacity(legal_moves.len());
+
+            for mv in &legal_moves {
+                let idx = Self::move_to_policy_index(mv, board);
+                priors.push(policies[i][idx]);
+            }
+
+            // Renormalize to legal moves
+            let sum: f32 = priors.iter().sum();
+            if sum > 0.0 {
+                for p in &mut priors {
+                    *p /= sum;
+                }
+            } else {
+                // Uniform if all zero
+                let uniform = 1.0 / legal_moves.len() as f32;
+                priors = vec![uniform; legal_moves.len()];
+            }
+
+            move_policies.push(priors);
+        }
+
+        let value_vec: Vec<f32> = values.squeeze().to_vec();
+        return (move_policies, value_vec);
+    }
+
+    fn encode_positions(boards: &[Board]) -> Tensor<f32, [N, 112, 8, 8]> on(gpu0) {
+        let n = boards.len();
+        let mut tensor = Tensor::zeros([n, 112, 8, 8]) on(gpu0);
+
+        for (i, board) in boards.iter().enumerate() {
+            // Piece planes (planes 0-11: P, N, B, R, Q, K for each color)
+            for sq in 0..64 {
+                let rank = sq / 8;
+                let file = sq % 8;
+
+                if let Some(piece) = board.piece_at(Square(sq)) {
+                    let plane = piece.piece_type as usize + piece.color as usize * 6;
+                    tensor[i][plane][rank][file] = 1.0;
+                }
+            }
+
+            // Repetition counters (planes 12-13)
+            tensor[i][12].fill(board.repetition_count() as f32 / 3.0);
+
+            // Castling rights (planes 14-17)
+            if board.can_castle_kingside(Color::White) { tensor[i][14].fill(1.0); }
+            if board.can_castle_queenside(Color::White) { tensor[i][15].fill(1.0); }
+            if board.can_castle_kingside(Color::Black) { tensor[i][16].fill(1.0); }
+            if board.can_castle_queenside(Color::Black) { tensor[i][17].fill(1.0); }
+
+            // Side to move (plane 18)
+            if board.side_to_move == Color::White {
+                tensor[i][18].fill(1.0);
+            }
+
+            // Move count normalization (plane 19)
+            tensor[i][19].fill(board.halfmove_clock as f32 / 100.0);
+
+            // En passant (planes 20-27, one per file if EP is possible)
+            if let Some(ep) = board.ep_square {
+                let file = ep.0 % 8;
+                tensor[i][20 + file as usize].fill(1.0);
+            }
+        }
+
+        return tensor;
+    }
+
+    fn move_to_policy_index(mv: &Move, board: &Board) -> usize {
+        // Map move to neural network policy index
+        // Using UCI-style encoding: from_sq * 73 + direction_index
+        let from = mv.from.0 as usize;
+        let to = mv.to.0 as usize;
+
+        // Queen moves (56 directions * 7 distances)
+        let dr = (to as i32 / 8) - (from as i32 / 8);
+        let df = (to as i32 % 8) - (from as i32 % 8);
+
+        let direction = match (dr.signum(), df.signum()) {
+            (0, 1) => 0,   // East
+            (0, -1) => 1,  // West
+            (1, 0) => 2,   // South
+            (-1, 0) => 3,  // North
+            (1, 1) => 4,   // SE
+            (1, -1) => 5,  // SW
+            (-1, 1) => 6,  // NE
+            (-1, -1) => 7, // NW
+            _ => 0,
+        };
+
+        let distance = dr.abs().max(df.abs()) as usize - 1;
+
+        // Knight moves (8 directions)
+        let knight_idx = if (dr.abs() == 2 && df.abs() == 1) || (dr.abs() == 1 && df.abs() == 2) {
+            Some(match (dr, df) {
+                (2, 1) => 0, (2, -1) => 1, (-2, 1) => 2, (-2, -1) => 3,
+                (1, 2) => 4, (1, -2) => 5, (-1, 2) => 6, (-1, -2) => 7,
+                _ => 0,
+            })
+        } else {
+            None
+        };
+
+        // Underpromotions (3 types: N, B, R)
+        let promo_idx = mv.promotion.map(|p| match p {
+            PieceType::Knight => 0,
+            PieceType::Bishop => 1,
+            PieceType::Rook => 2,
+            _ => 0,
+        });
+
+        if let Some(ki) = knight_idx {
+            return from * 73 + 56 + ki;
+        } else if let Some(pi) = promo_idx {
+            return from * 73 + 64 + pi * 3 + (df + 1) as usize;
+        } else {
+            return from * 73 + direction * 7 + distance;
+        }
+    }
+}
+
+// ============================================================================
+// MCTS ENGINE
+// ============================================================================
+
+struct MCTSEngine {
+    config: MCTSConfig,
+    network: Arc<PolicyValueNetwork>,
+    // Evaluation batching
+    eval_queue: Mutex<Vec<(Arc<MCTSNode>, Board)>>,
+    eval_results: Mutex<HashMap<u64, (Vec<(Move, f32)>, f32)>>,
+    batch_ready: CondVar,
+    // Transposition table
+    tt: DashMap<u64, Arc<MCTSNode>>,
+}
+
+impl MCTSEngine {
+    fn new(config: MCTSConfig, network_path: &str) -> MCTSEngine {
+        let network = Arc::new(PolicyValueNetwork::load(network_path).unwrap());
+
+        let engine = MCTSEngine {
+            config: config,
+            network: network,
+            eval_queue: Mutex::new(Vec::new()),
+            eval_results: Mutex::new(HashMap::new()),
+            batch_ready: CondVar::new(),
+            tt: DashMap::new(),
+        };
+
+        // Start GPU evaluation threads
+        for gpu_id in 0..config.num_gpus {
+            let engine_clone = engine.clone();
+            spawn(move || {
+                engine_clone.batch_evaluation_loop(gpu_id);
+            });
+        }
+
+        return engine;
+    }
+
+    fn search(&self, board: &Board, time_limit_ms: Option<i64>) -> Move {
+        // Create root node
+        let root = Arc::new(MCTSNode::new(None, 1.0, board.hash()));
+
+        // Expand root
+        self.expand_node(&root, board);
+
+        // Add Dirichlet noise at root for exploration
+        self.add_root_noise(&root);
+
+        // Run simulations
+        let start_time = Instant::now();
+        let mut simulations = 0;
+
+        while simulations < self.config.num_simulations {
+            // Check time limit
+            if let Some(limit) = time_limit_ms {
+                if start_time.elapsed().as_millis() as i64 >= limit {
+                    break;
+                }
+            }
+
+            // Run parallel simulations
+            let batch_size = self.config.batch_size.min(
+                self.config.num_simulations - simulations
+            );
+
+            self.run_simulation_batch(&root, board, batch_size);
+            simulations += batch_size;
+        }
+
+        // Select best move
+        let best_move = root.best_move(self.config.temperature)
+            .expect("No legal moves");
+
+        return best_move;
+    }
+
+    fn run_simulation_batch(&self, root: &Arc<MCTSNode>, root_board: &Board, batch_size: i32) {
+        let mut leaves = Vec::with_capacity(batch_size as usize);
+        let mut boards = Vec::with_capacity(batch_size as usize);
+        let mut paths = Vec::with_capacity(batch_size as usize);
+
+        // Selection phase: traverse to leaves
+        for _ in 0..batch_size {
+            let (leaf, board, path) = self.select_leaf(root, root_board);
+            leaves.push(leaf);
+            boards.push(board);
+            paths.push(path);
+        }
+
+        // Expansion + Evaluation phase (batched on GPU)
+        let (policies, values) = self.network.forward_batch(&boards) on(gpu0..gpu7);
+
+        // Backup phase
+        for (i, leaf) in leaves.iter().enumerate() {
+            // Expand if not terminal
+            if leaf.terminal_value.is_none() {
+                let legal_moves = generate_legal_moves(&boards[i]);
+                let policy = &policies[i];
+
+                for (j, mv) in legal_moves.iter().enumerate() {
+                    let child = Arc::new(MCTSNode::new(
+                        Some(*mv),
+                        policy[j],
+                        boards[i].hash_after_move(*mv),
+                    ));
+                    // Note: would need interior mutability for children
+                    // leaf.children.push(child);
+                }
+            }
+
+            // Backup value
+            let value = leaf.terminal_value.unwrap_or(values[i]);
+            leaf.backup(value);
+
+            // Remove virtual loss from path
+            for node in &paths[i] {
+                node.remove_virtual_loss(self.config.virtual_loss);
+            }
+        }
+    }
+
+    fn select_leaf(
+        &self,
+        root: &Arc<MCTSNode>,
+        root_board: &Board
+    ) -> (Arc<MCTSNode>, Board, Vec<Arc<MCTSNode>>) {
+        let mut node = root.clone();
+        let mut board = root_board.clone();
+        let mut path = Vec::new();
+
+        let fpu = self.config.fpu_reduction;
+
+        loop {
+            path.push(node.clone());
+            node.add_virtual_loss(self.config.virtual_loss);
+
+            // Terminal check
+            if board.is_checkmate() {
+                // Note: would need interior mutability
+                // node.terminal_value = Some(-1.0);
+                return (node, board, path);
+            }
+            if board.is_stalemate() || board.is_draw() {
+                // node.terminal_value = Some(0.0);
+                return (node, board, path);
+            }
+
+            // Leaf check (not yet expanded)
+            if !node.is_expanded() {
+                return (node, board, path);
+            }
+
+            // Select best child
+            if let Some(child) = node.select_child(self.config.c_puct, fpu) {
+                if let Some(mv) = child.mv {
+                    board = make_move(board, mv);
+                }
+                node = child;
+            } else {
+                return (node, board, path);
+            }
+        }
+    }
+
+    fn expand_node(&self, node: &Arc<MCTSNode>, board: &Board) {
+        if node.expanding.swap(true, Ordering::SeqCst) {
+            return;  // Another thread is expanding
+        }
+
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.is_empty() {
+            return;
+        }
+
+        // Get policy from network (single position)
+        let (policies, _) = self.network.forward_batch(&[board.clone()]);
+        let policy = &policies[0];
+
+        // Create children
+        // Note: would need interior mutability
+        // for (i, mv) in legal_moves.iter().enumerate() {
+        //     let child = Arc::new(MCTSNode::new(
+        //         Some(*mv),
+        //         policy[i],
+        //         board.hash_after_move(*mv),
+        //     ));
+        //     node.children.push(child);
+        // }
+    }
+
+    fn add_root_noise(&self, root: &Arc<MCTSNode>) {
+        let alpha = self.config.root_dirichlet_alpha;
+        let frac = self.config.root_exploration_fraction;
+
+        // Generate Dirichlet noise
+        let n = root.children.len();
+        let noise = dirichlet_sample(alpha, n);
+
+        // Mix with policy priors
+        // Note: would need interior mutability
+        // for (i, child) in root.children.iter().enumerate() {
+        //     child.prior = (1.0 - frac) * child.prior + frac * noise[i];
+        // }
+    }
+
+    fn batch_evaluation_loop(&self, gpu_id: i32) on(gpu(gpu_id)) {
+        loop {
+            // Wait for batch
+            let batch = {
+                let mut queue = self.eval_queue.lock();
+                while queue.len() < self.config.batch_size as usize {
+                    self.batch_ready.wait(&mut queue);
+                }
+                queue.drain(..).collect::<Vec<_>>()
+            };
+
+            // Run batched inference
+            let boards: Vec<Board> = batch.iter().map(|(_, b)| b.clone()).collect();
+            let (policies, values) = self.network.forward_batch(&boards);
+
+            // Store results
+            let mut results = self.eval_results.lock();
+            for (i, (node, board)) in batch.iter().enumerate() {
+                let legal_moves = generate_legal_moves(board);
+                let move_priors: Vec<(Move, f32)> = legal_moves.iter()
+                    .zip(policies[i].iter())
+                    .map(|(m, p)| (*m, *p))
+                    .collect();
+                results.insert(node.hash, (move_priors, values[i]));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn dirichlet_sample(alpha: f32, n: usize) -> Vec<f32> {
+    let mut rng = rand::thread_rng();
+    let mut samples = Vec::with_capacity(n);
+    let mut sum = 0.0;
+
+    for _ in 0..n {
+        // Gamma sampling for Dirichlet
+        let gamma = gamma_sample(alpha, 1.0, &mut rng);
+        samples.push(gamma);
+        sum += gamma;
+    }
+
+    // Normalize
+    for s in &mut samples {
+        *s /= sum;
+    }
+
+    return samples;
+}
+
+fn gamma_sample(alpha: f32, beta: f32, rng: &mut impl Rng) -> f32 {
+    // Marsaglia and Tsang's method
+    let d = alpha - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+
+    loop {
+        let x: f32 = rng.gen_range(-10.0..10.0);
+        let v = (1.0 + c * x).powi(3);
+        if v > 0.0 {
+            let u: f32 = rng.gen();
+            if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x.powi(2) + d * (1.0 - v + v.ln()) {
+                return d * v / beta;
+            }
+        }
+    }
+}
+
+fn softmax(logits: Tensor<f32, [N, M]>, dim: i32) -> Tensor<f32, [N, M]> on(gpu0) {
+    let max_vals = logits.max(dim, keepdim=true);
+    let exp_vals = (logits - max_vals).exp();
+    let sum_vals = exp_vals.sum(dim, keepdim=true);
+    return exp_vals / sum_vals;
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+fn create_mcts_engine(config: MCTSConfig, network_path: &str) -> MCTSEngine {
+    return MCTSEngine::new(config, network_path);
+}
+
+fn mcts_search(engine: &MCTSEngine, board: &Board, time_ms: i64) -> Move {
+    return engine.search(board, Some(time_ms));
+}

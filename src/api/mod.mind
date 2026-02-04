@@ -1,0 +1,35 @@
+// NikolaChess - Unified API Module
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Complete chess engine API supporting:
+// - All protocols: UCI, CECP/xboard, Lichess Bot, Chess.com, Arena
+// - All databases: Syzygy, Opening books, Cloud eval, Game DBs
+// - All play modes: Local, LAN, Online, Analysis
+
+// Protocol modules
+pub mod uci;           // Universal Chess Interface
+pub mod cecp;          // Chess Engine Communication Protocol (xboard)
+pub mod lichess;       // Lichess Bot API
+pub mod chesscom;      // Chess.com Bot API
+pub mod arena;         // Arena GUI extensions
+
+// Database modules
+pub mod syzygy;        // Tablebase (local/LAN/remote)
+pub mod opening;       // Opening books (Polyglot/CTG/ABK)
+pub mod cloud;         // Cloud evaluation APIs
+pub mod games;         // Game database APIs
+pub mod players;       // Player/rating APIs
+
+// Network modules
+pub mod http;          // HTTP client
+pub mod tcp;           // TCP client/server
+pub mod websocket;     // WebSocket for live play
+
+// Unified interface
+pub mod unified;       // Unified API wrapper
+
+// Re-exports
+pub use unified::ChessAPI;
+pub use unified::APIConfig;
+pub use unified::ProbeResult;

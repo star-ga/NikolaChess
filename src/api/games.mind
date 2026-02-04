@@ -1,0 +1,941 @@
+// NikolaChess - Game Database API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Game database access and querying:
+// - PGN parsing and writing
+// - Local game storage
+// - Remote database queries (Lichess, Chess.com)
+// - Position search
+// - Opening statistics
+
+import std.io;
+import std.sync;
+import std.time;
+
+// ============================================================================
+// GAME STRUCTURE
+// ============================================================================
+
+struct Game {
+    // Headers
+    event: str,
+    site: str,
+    date: str,
+    round: str,
+    white: str,
+    black: str,
+    result: GameResult,
+    white_elo: Option<i32>,
+    black_elo: Option<i32>,
+    eco: Option<str>,
+    opening: Option<str>,
+    time_control: Option<str>,
+
+    // Game data
+    moves: Vec<Move>,
+    annotations: Vec<GameAnnotation>,
+    initial_position: Option<Board>,
+
+    // Metadata
+    source: str,
+    game_id: Option<str>,
+}
+
+enum GameResult {
+    WhiteWins,
+    BlackWins,
+    Draw,
+    Unknown,
+    InProgress,
+}
+
+struct GameAnnotation {
+    move_number: i32,
+    ply: i32,
+    nag: Option<i32>,        // Numeric Annotation Glyph
+    comment: Option<str>,
+    evaluation: Option<i32>, // Centipawns
+    variations: Vec<Vec<Move>>,
+}
+
+// NAG codes
+const NAG_GOOD_MOVE: i32 = 1;        // !
+const NAG_MISTAKE: i32 = 2;          // ?
+const NAG_BRILLIANT: i32 = 3;        // !!
+const NAG_BLUNDER: i32 = 4;          // ??
+const NAG_INTERESTING: i32 = 5;      // !?
+const NAG_DUBIOUS: i32 = 6;          // ?!
+
+// ============================================================================
+// GAME DATABASE
+// ============================================================================
+
+struct GameDatabase {
+    games: Vec<Game>,
+    positions: HashMap<u64, Vec<usize>>,  // Position hash -> game indices
+    opening_stats: HashMap<u64, OpeningStats>,
+    path: Option<str>,
+    modified: bool,
+}
+
+struct OpeningStats {
+    total_games: i64,
+    white_wins: i64,
+    black_wins: i64,
+    draws: i64,
+    avg_elo: f32,
+    popular_continuations: Vec<(Move, i32)>,
+}
+
+impl GameDatabase {
+    fn new() -> GameDatabase {
+        return GameDatabase {
+            games: Vec::new(),
+            positions: HashMap::new(),
+            opening_stats: HashMap::new(),
+            path: None,
+            modified: false,
+        };
+    }
+
+    fn load(path: &str) -> Result<GameDatabase, GameDbError> {
+        let mut db = GameDatabase::new();
+        db.path = Some(path.to_string());
+
+        // Read PGN file
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| GameDbError::IoError(e.to_string()))?;
+
+        // Parse games
+        let games = parse_pgn(&content)?;
+
+        for game in games {
+            db.add_game(game);
+        }
+
+        db.modified = false;
+        return Ok(db);
+    }
+
+    fn save(&mut self) -> Result<(), GameDbError> {
+        let path = self.path.as_ref()
+            .ok_or(GameDbError::NoPath)?;
+
+        let mut content = String::new();
+
+        for game in &self.games {
+            content.push_str(&format_pgn(game));
+            content.push_str("\n\n");
+        }
+
+        std::fs::write(path, &content)
+            .map_err(|e| GameDbError::IoError(e.to_string()))?;
+
+        self.modified = false;
+        return Ok(());
+    }
+
+    fn add_game(&mut self, game: Game) {
+        let game_idx = self.games.len();
+
+        // Index positions
+        let mut board = game.initial_position.clone()
+            .unwrap_or(Board::starting_position());
+
+        self.index_position(board.hash, game_idx);
+
+        for mv in &game.moves {
+            board = make_move(board, *mv);
+            self.index_position(board.hash, game_idx);
+        }
+
+        // Update opening stats
+        update_opening_stats(&mut self.opening_stats, &game);
+
+        self.games.push(game);
+        self.modified = true;
+    }
+
+    fn index_position(&mut self, hash: u64, game_idx: usize) {
+        self.positions
+            .entry(hash)
+            .or_insert_with(Vec::new)
+            .push(game_idx);
+    }
+
+    fn find_by_position(&self, board: &Board) -> Vec<&Game> {
+        let mut result = Vec::new();
+
+        if let Some(indices) = self.positions.get(&board.hash) {
+            for &idx in indices {
+                if idx < self.games.len() {
+                    result.push(&self.games[idx]);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    fn search(&self, query: &GameQuery) -> Vec<&Game> {
+        let mut result: Vec<&Game> = self.games.iter().collect();
+
+        // Filter by player
+        if let Some(ref player) = query.player {
+            let player_lower = player.to_lowercase();
+            result.retain(|g| {
+                g.white.to_lowercase().contains(&player_lower) ||
+                g.black.to_lowercase().contains(&player_lower)
+            });
+        }
+
+        // Filter by white player
+        if let Some(ref white) = query.white {
+            let white_lower = white.to_lowercase();
+            result.retain(|g| g.white.to_lowercase().contains(&white_lower));
+        }
+
+        // Filter by black player
+        if let Some(ref black) = query.black {
+            let black_lower = black.to_lowercase();
+            result.retain(|g| g.black.to_lowercase().contains(&black_lower));
+        }
+
+        // Filter by result
+        if let Some(ref res) = query.result {
+            result.retain(|g| &g.result == res);
+        }
+
+        // Filter by ECO code
+        if let Some(ref eco) = query.eco {
+            result.retain(|g| {
+                g.eco.as_ref().map(|e| e.starts_with(eco)).unwrap_or(false)
+            });
+        }
+
+        // Filter by date range
+        if let Some(ref from) = query.date_from {
+            result.retain(|g| &g.date >= from);
+        }
+        if let Some(ref to) = query.date_to {
+            result.retain(|g| &g.date <= to);
+        }
+
+        // Filter by ELO range
+        if let Some(min_elo) = query.min_elo {
+            result.retain(|g| {
+                g.white_elo.unwrap_or(0) >= min_elo ||
+                g.black_elo.unwrap_or(0) >= min_elo
+            });
+        }
+
+        // Limit results
+        if let Some(limit) = query.limit {
+            result.truncate(limit);
+        }
+
+        return result;
+    }
+
+    fn get_opening_stats(&self, board: &Board) -> Option<&OpeningStats> {
+        return self.opening_stats.get(&board.hash);
+    }
+
+    fn game_count(&self) -> usize {
+        return self.games.len();
+    }
+}
+
+fn update_opening_stats(stats: &mut HashMap<u64, OpeningStats>, game: &Game) {
+    let mut board = game.initial_position.clone()
+        .unwrap_or(Board::starting_position());
+
+    let avg_elo = match (game.white_elo, game.black_elo) {
+        (Some(w), Some(b)) => (w + b) as f32 / 2.0,
+        (Some(w), None) => w as f32,
+        (None, Some(b)) => b as f32,
+        (None, None) => 0.0,
+    };
+
+    // Only count opening positions (first 20 moves)
+    for (i, mv) in game.moves.iter().enumerate().take(40) {
+        let entry = stats.entry(board.hash).or_insert(OpeningStats {
+            total_games: 0,
+            white_wins: 0,
+            black_wins: 0,
+            draws: 0,
+            avg_elo: 0.0,
+            popular_continuations: Vec::new(),
+        });
+
+        entry.total_games += 1;
+        match game.result {
+            GameResult::WhiteWins => entry.white_wins += 1,
+            GameResult::BlackWins => entry.black_wins += 1,
+            GameResult::Draw => entry.draws += 1,
+            _ => {}
+        }
+
+        // Update average ELO
+        let n = entry.total_games as f32;
+        entry.avg_elo = (entry.avg_elo * (n - 1.0) + avg_elo) / n;
+
+        // Track continuation
+        if let Some((_, count)) = entry.popular_continuations.iter_mut()
+            .find(|(m, _)| *m == *mv)
+        {
+            *count += 1;
+        } else {
+            entry.popular_continuations.push((*mv, 1));
+        }
+
+        // Sort continuations by popularity
+        entry.popular_continuations.sort_by(|a, b| b.1.cmp(&a.1));
+        entry.popular_continuations.truncate(10);
+
+        board = make_move(board, *mv);
+    }
+}
+
+struct GameQuery {
+    player: Option<str>,
+    white: Option<str>,
+    black: Option<str>,
+    result: Option<GameResult>,
+    eco: Option<str>,
+    date_from: Option<str>,
+    date_to: Option<str>,
+    min_elo: Option<i32>,
+    limit: Option<usize>,
+}
+
+impl GameQuery {
+    fn new() -> GameQuery {
+        return GameQuery {
+            player: None,
+            white: None,
+            black: None,
+            result: None,
+            eco: None,
+            date_from: None,
+            date_to: None,
+            min_elo: None,
+            limit: None,
+        };
+    }
+
+    fn player(mut self, name: &str) -> Self {
+        self.player = Some(name.to_string());
+        return self;
+    }
+
+    fn white(mut self, name: &str) -> Self {
+        self.white = Some(name.to_string());
+        return self;
+    }
+
+    fn black(mut self, name: &str) -> Self {
+        self.black = Some(name.to_string());
+        return self;
+    }
+
+    fn result(mut self, res: GameResult) -> Self {
+        self.result = Some(res);
+        return self;
+    }
+
+    fn eco(mut self, code: &str) -> Self {
+        self.eco = Some(code.to_string());
+        return self;
+    }
+
+    fn limit(mut self, n: usize) -> Self {
+        self.limit = Some(n);
+        return self;
+    }
+}
+
+// ============================================================================
+// PGN PARSING
+// ============================================================================
+
+fn parse_pgn(content: &str) -> Result<Vec<Game>, GameDbError> {
+    let mut games = Vec::new();
+    let mut current_headers: HashMap<String, String> = HashMap::new();
+    let mut current_moves = String::new();
+    let mut in_game = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        if line.is_empty() {
+            if in_game && !current_moves.is_empty() {
+                // End of game
+                if let Ok(game) = parse_single_game(&current_headers, &current_moves) {
+                    games.push(game);
+                }
+                current_headers.clear();
+                current_moves.clear();
+                in_game = false;
+            }
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            // Header
+            if let Some((key, value)) = parse_pgn_header(line) {
+                current_headers.insert(key, value);
+            }
+            in_game = true;
+        } else if !line.starts_with('%') {
+            // Move text (skip comments starting with %)
+            current_moves.push_str(line);
+            current_moves.push(' ');
+            in_game = true;
+        }
+    }
+
+    // Handle last game
+    if in_game && !current_moves.is_empty() {
+        if let Ok(game) = parse_single_game(&current_headers, &current_moves) {
+            games.push(game);
+        }
+    }
+
+    return Ok(games);
+}
+
+fn parse_pgn_header(line: &str) -> Option<(String, String)> {
+    // Format: [Key "Value"]
+    let line = line.trim_start_matches('[').trim_end_matches(']');
+    let mut parts = line.splitn(2, ' ');
+
+    let key = parts.next()?.to_string();
+    let value = parts.next()?
+        .trim_matches('"')
+        .to_string();
+
+    return Some((key, value));
+}
+
+fn parse_single_game(headers: &HashMap<String, String>, move_text: &str) -> Result<Game, GameDbError> {
+    // Parse result
+    let result_str = headers.get("Result").map(|s| s.as_str()).unwrap_or("*");
+    let result = match result_str {
+        "1-0" => GameResult::WhiteWins,
+        "0-1" => GameResult::BlackWins,
+        "1/2-1/2" => GameResult::Draw,
+        "*" => GameResult::InProgress,
+        _ => GameResult::Unknown,
+    };
+
+    // Parse moves
+    let mut board = if let Some(fen) = headers.get("FEN") {
+        parse_fen(fen).ok()
+    } else {
+        None
+    };
+
+    let initial_board = board.clone();
+    let mut current_board = board.unwrap_or(Board::starting_position());
+
+    let moves = parse_move_text(move_text, &mut current_board)?;
+
+    return Ok(Game {
+        event: headers.get("Event").cloned().unwrap_or_default(),
+        site: headers.get("Site").cloned().unwrap_or_default(),
+        date: headers.get("Date").cloned().unwrap_or_default(),
+        round: headers.get("Round").cloned().unwrap_or_default(),
+        white: headers.get("White").cloned().unwrap_or_default(),
+        black: headers.get("Black").cloned().unwrap_or_default(),
+        result: result,
+        white_elo: headers.get("WhiteElo").and_then(|s| s.parse().ok()),
+        black_elo: headers.get("BlackElo").and_then(|s| s.parse().ok()),
+        eco: headers.get("ECO").cloned(),
+        opening: headers.get("Opening").cloned(),
+        time_control: headers.get("TimeControl").cloned(),
+        moves: moves,
+        annotations: Vec::new(),
+        initial_position: initial_board,
+        source: "pgn".to_string(),
+        game_id: None,
+    });
+}
+
+fn parse_move_text(text: &str, board: &mut Board) -> Result<Vec<Move>, GameDbError> {
+    let mut moves = Vec::new();
+
+    // Remove comments and variations
+    let clean_text = remove_pgn_comments(text);
+
+    // Tokenize
+    let tokens: Vec<&str> = clean_text.split_whitespace().collect();
+
+    for token in tokens {
+        // Skip move numbers and results
+        if token.contains('.') && token.chars().next().map(|c| c.is_digit(10)).unwrap_or(false) {
+            continue;
+        }
+        if token == "1-0" || token == "0-1" || token == "1/2-1/2" || token == "*" {
+            break;
+        }
+
+        // Parse SAN move
+        if let Some(mv) = parse_san_move(board, token) {
+            moves.push(mv);
+            *board = make_move(*board, mv);
+        }
+    }
+
+    return Ok(moves);
+}
+
+fn remove_pgn_comments(text: &str) -> String {
+    let mut result = String::new();
+    let mut depth = 0;
+    let mut in_comment = false;
+
+    for c in text.chars() {
+        if c == '{' {
+            in_comment = true;
+        } else if c == '}' {
+            in_comment = false;
+        } else if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth = (depth - 1).max(0);
+        } else if !in_comment && depth == 0 {
+            result.push(c);
+        }
+    }
+
+    return result;
+}
+
+fn parse_san_move(board: &Board, san: &str) -> Option<Move> {
+    let san = san.trim_end_matches('+')
+        .trim_end_matches('#')
+        .trim_end_matches('!')
+        .trim_end_matches('?');
+
+    // Castling
+    if san == "O-O" || san == "0-0" {
+        let from = if board.side_to_move == Color::White { Square::E1 } else { Square::E8 };
+        let to = if board.side_to_move == Color::White { Square::G1 } else { Square::G8 };
+        return find_legal_move(board, from, to, None);
+    }
+
+    if san == "O-O-O" || san == "0-0-0" {
+        let from = if board.side_to_move == Color::White { Square::E1 } else { Square::E8 };
+        let to = if board.side_to_move == Color::White { Square::C1 } else { Square::C8 };
+        return find_legal_move(board, from, to, None);
+    }
+
+    // Regular move parsing
+    let chars: Vec<char> = san.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    // Determine piece type
+    let (piece_type, start_idx) = if chars[0].is_uppercase() && chars[0] != 'O' {
+        let pt = match chars[0] {
+            'K' => PieceType::King,
+            'Q' => PieceType::Queen,
+            'R' => PieceType::Rook,
+            'B' => PieceType::Bishop,
+            'N' => PieceType::Knight,
+            _ => return None,
+        };
+        (pt, 1)
+    } else {
+        (PieceType::Pawn, 0)
+    };
+
+    // Find destination square
+    let san_rest = &san[start_idx..];
+    let san_clean = san_rest.replace('x', "");
+
+    // Parse destination square
+    let dest_chars: Vec<char> = san_clean.chars().collect();
+    if dest_chars.len() < 2 {
+        return None;
+    }
+
+    // Check for promotion
+    let promotion = if san.contains('=') {
+        let promo_char = san.chars().last()?;
+        Some(match promo_char {
+            'Q' => PieceType::Queen,
+            'R' => PieceType::Rook,
+            'B' => PieceType::Bishop,
+            'N' => PieceType::Knight,
+            _ => PieceType::Queen,
+        })
+    } else {
+        None
+    };
+
+    // Find destination
+    let dest_file = dest_chars[dest_chars.len() - 2];
+    let dest_rank = dest_chars[dest_chars.len() - 1];
+
+    if dest_file < 'a' || dest_file > 'h' || dest_rank < '1' || dest_rank > '8' {
+        return None;
+    }
+
+    let to = Square::from_coords(
+        (dest_file as u8 - b'a') as i32,
+        (dest_rank as u8 - b'1') as i32
+    );
+
+    // Disambiguation
+    let disambig = if dest_chars.len() > 2 {
+        &san_clean[..san_clean.len() - 2]
+    } else {
+        ""
+    };
+
+    // Find matching move
+    let legal_moves = generate_legal_moves(board);
+    let mut matching: Vec<Move> = legal_moves.into_iter()
+        .filter(|mv| {
+            mv.to == to &&
+            board.piece_at(mv.from).map(|p| p.piece_type) == Some(piece_type) &&
+            mv.promotion == promotion
+        })
+        .collect();
+
+    // Apply disambiguation
+    if !disambig.is_empty() && matching.len() > 1 {
+        let disambig_chars: Vec<char> = disambig.chars().collect();
+        matching.retain(|mv| {
+            let from_file = (b'a' + mv.from.file() as u8) as char;
+            let from_rank = (b'1' + mv.from.rank() as u8) as char;
+
+            for c in &disambig_chars {
+                if *c >= 'a' && *c <= 'h' && from_file != *c {
+                    return false;
+                }
+                if *c >= '1' && *c <= '8' && from_rank != *c {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    return matching.into_iter().next();
+}
+
+fn find_legal_move(board: &Board, from: Square, to: Square, promo: Option<PieceType>) -> Option<Move> {
+    let legal = generate_legal_moves(board);
+    for mv in legal {
+        if mv.from == from && mv.to == to && mv.promotion == promo {
+            return Some(mv);
+        }
+    }
+    return None;
+}
+
+// ============================================================================
+// PGN FORMATTING
+// ============================================================================
+
+fn format_pgn(game: &Game) -> String {
+    let mut pgn = String::new();
+
+    // Headers
+    pgn.push_str(&format!("[Event \"{}\"]\n", game.event));
+    pgn.push_str(&format!("[Site \"{}\"]\n", game.site));
+    pgn.push_str(&format!("[Date \"{}\"]\n", game.date));
+    pgn.push_str(&format!("[Round \"{}\"]\n", game.round));
+    pgn.push_str(&format!("[White \"{}\"]\n", game.white));
+    pgn.push_str(&format!("[Black \"{}\"]\n", game.black));
+    pgn.push_str(&format!("[Result \"{}\"]\n", format_result(&game.result)));
+
+    if let Some(ref eco) = game.eco {
+        pgn.push_str(&format!("[ECO \"{}\"]\n", eco));
+    }
+    if let Some(elo) = game.white_elo {
+        pgn.push_str(&format!("[WhiteElo \"{}\"]\n", elo));
+    }
+    if let Some(elo) = game.black_elo {
+        pgn.push_str(&format!("[BlackElo \"{}\"]\n", elo));
+    }
+    if let Some(ref opening) = game.opening {
+        pgn.push_str(&format!("[Opening \"{}\"]\n", opening));
+    }
+
+    pgn.push('\n');
+
+    // Moves
+    let mut board = game.initial_position.clone()
+        .unwrap_or(Board::starting_position());
+
+    let mut line_length = 0;
+
+    for (i, mv) in game.moves.iter().enumerate() {
+        let ply = i + 1;
+        let move_number = (ply + 1) / 2;
+
+        // Move number
+        let move_text = if ply % 2 == 1 {
+            format!("{}. ", move_number)
+        } else if line_length == 0 {
+            format!("{}... ", move_number)
+        } else {
+            String::new()
+        };
+
+        // SAN notation
+        let san = move_to_san(&board, *mv);
+        let full_move = format!("{}{} ", move_text, san);
+
+        // Line wrapping
+        if line_length + full_move.len() > 80 {
+            pgn.push('\n');
+            line_length = 0;
+        }
+
+        pgn.push_str(&full_move);
+        line_length += full_move.len();
+
+        board = make_move(board, *mv);
+    }
+
+    // Result
+    pgn.push_str(&format_result(&game.result));
+    pgn.push('\n');
+
+    return pgn;
+}
+
+fn format_result(result: &GameResult) -> String {
+    match result {
+        GameResult::WhiteWins => "1-0".to_string(),
+        GameResult::BlackWins => "0-1".to_string(),
+        GameResult::Draw => "1/2-1/2".to_string(),
+        _ => "*".to_string(),
+    }
+}
+
+fn move_to_san(board: &Board, mv: Move) -> String {
+    // Castling
+    if mv.is_castle {
+        return if mv.to.file() > mv.from.file() {
+            "O-O".to_string()
+        } else {
+            "O-O-O".to_string()
+        };
+    }
+
+    let piece = board.piece_at(mv.from).unwrap();
+    let mut san = String::new();
+
+    // Piece letter
+    if piece.piece_type != PieceType::Pawn {
+        san.push(match piece.piece_type {
+            PieceType::King => 'K',
+            PieceType::Queen => 'Q',
+            PieceType::Rook => 'R',
+            PieceType::Bishop => 'B',
+            PieceType::Knight => 'N',
+            _ => '?',
+        });
+    }
+
+    // Disambiguation
+    let legal_moves = generate_legal_moves(board);
+    let same_type_moves: Vec<&Move> = legal_moves.iter()
+        .filter(|m| {
+            m.to == mv.to &&
+            board.piece_at(m.from).map(|p| p.piece_type) == Some(piece.piece_type) &&
+            m.from != mv.from
+        })
+        .collect();
+
+    if !same_type_moves.is_empty() {
+        let same_file = same_type_moves.iter().any(|m| m.from.file() == mv.from.file());
+        let same_rank = same_type_moves.iter().any(|m| m.from.rank() == mv.from.rank());
+
+        if !same_file {
+            san.push((b'a' + mv.from.file() as u8) as char);
+        } else if !same_rank {
+            san.push((b'1' + mv.from.rank() as u8) as char);
+        } else {
+            san.push((b'a' + mv.from.file() as u8) as char);
+            san.push((b'1' + mv.from.rank() as u8) as char);
+        }
+    }
+
+    // Capture
+    let is_capture = board.piece_at(mv.to).is_some() || mv.is_en_passant;
+    if is_capture {
+        if piece.piece_type == PieceType::Pawn && san.is_empty() {
+            san.push((b'a' + mv.from.file() as u8) as char);
+        }
+        san.push('x');
+    }
+
+    // Destination
+    san.push((b'a' + mv.to.file() as u8) as char);
+    san.push((b'1' + mv.to.rank() as u8) as char);
+
+    // Promotion
+    if let Some(promo) = mv.promotion {
+        san.push('=');
+        san.push(match promo {
+            PieceType::Queen => 'Q',
+            PieceType::Rook => 'R',
+            PieceType::Bishop => 'B',
+            PieceType::Knight => 'N',
+            _ => 'Q',
+        });
+    }
+
+    // Check/checkmate
+    let new_board = make_move(*board, mv);
+    if is_checkmate(&new_board) {
+        san.push('#');
+    } else if is_check(&new_board) {
+        san.push('+');
+    }
+
+    return san;
+}
+
+// ============================================================================
+// REMOTE DATABASE QUERIES
+// ============================================================================
+
+fn query_lichess_games(
+    http: &HttpClientPool,
+    username: &str,
+    max_games: i32,
+    since: Option<i64>,
+) -> Option<Vec<Game>> {
+    let mut url = format!(
+        "https://lichess.org/api/games/user/{}?max={}&pgnInJson=true",
+        username, max_games
+    );
+
+    if let Some(ts) = since {
+        url.push_str(&format!("&since={}", ts));
+    }
+
+    let response = http.get(&url)
+        .header("Accept", "application/x-ndjson")
+        .timeout(30000)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let text = response.text().ok()?;
+    let mut games = Vec::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let json = parse_json(line).ok()?;
+
+        let game = Game {
+            event: json["perf"]["name"].as_str().unwrap_or("").to_string(),
+            site: "lichess.org".to_string(),
+            date: format_timestamp(json["createdAt"].as_i64().unwrap_or(0)),
+            round: "-".to_string(),
+            white: json["players"]["white"]["user"]["name"].as_str().unwrap_or("?").to_string(),
+            black: json["players"]["black"]["user"]["name"].as_str().unwrap_or("?").to_string(),
+            result: parse_lichess_result(&json),
+            white_elo: json["players"]["white"]["rating"].as_i64().map(|x| x as i32),
+            black_elo: json["players"]["black"]["rating"].as_i64().map(|x| x as i32),
+            eco: json["opening"]["eco"].as_str().map(|s| s.to_string()),
+            opening: json["opening"]["name"].as_str().map(|s| s.to_string()),
+            time_control: json["clock"]["initial"].as_i64()
+                .map(|x| format!("{}", x)),
+            moves: parse_moves_from_string(json["moves"].as_str().unwrap_or("")),
+            annotations: Vec::new(),
+            initial_position: None,
+            source: "lichess".to_string(),
+            game_id: json["id"].as_str().map(|s| s.to_string()),
+        };
+
+        games.push(game);
+    }
+
+    return Some(games);
+}
+
+fn parse_lichess_result(json: &JsonValue) -> GameResult {
+    let winner = json["winner"].as_str();
+    match winner {
+        Some("white") => GameResult::WhiteWins,
+        Some("black") => GameResult::BlackWins,
+        None => GameResult::Draw,
+        _ => GameResult::Unknown,
+    }
+}
+
+fn parse_moves_from_string(moves_str: &str) -> Vec<Move> {
+    let mut board = Board::starting_position();
+    let mut moves = Vec::new();
+
+    for token in moves_str.split_whitespace() {
+        if let Some(mv) = parse_uci_move(token) {
+            if is_legal_move(&board, mv) {
+                moves.push(mv);
+                board = make_move(board, mv);
+            }
+        } else if let Some(mv) = parse_san_move(&board, token) {
+            moves.push(mv);
+            board = make_move(board, mv);
+        }
+    }
+
+    return moves;
+}
+
+fn format_timestamp(ts: i64) -> String {
+    // Convert Unix timestamp to date string YYYY.MM.DD
+    let secs = ts / 1000;
+    let days = secs / 86400 + 719468;
+
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    return format!("{}.{:02}.{:02}", year, m, d);
+}
+
+// ============================================================================
+// ERROR TYPES
+// ============================================================================
+
+enum GameDbError {
+    IoError(str),
+    ParseError(str),
+    NoPath,
+}
+
+impl std::fmt::Display for GameDbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            GameDbError::IoError(s) => write!(f, "IO error: {}", s),
+            GameDbError::ParseError(s) => write!(f, "Parse error: {}", s),
+            GameDbError::NoPath => write!(f, "No path set"),
+        }
+    }
+}
+

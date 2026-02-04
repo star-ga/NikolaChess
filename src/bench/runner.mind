@@ -1,0 +1,595 @@
+// NikolaChess - Benchmark Runner
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Executable benchmark runner for scientific testing of improvements.
+// Runs SPRT tests, collects performance metrics, generates reports.
+
+import std.io;
+import std.time;
+import std.fs;
+import std.json;
+import std.process;
+
+// ============================================================================
+// BENCHMARK POSITIONS (Diverse Test Suite)
+// ============================================================================
+
+const BENCHMARK_POSITIONS: [&str; 30] = [
+    // Opening positions
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",  // 1.e4
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1",  // 1.d4
+    "rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", // French
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2", // Sicilian
+
+    // Middlegame tactical
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",  // Italian
+    "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",     // Open games
+    "r2qkb1r/ppp2ppp/2n1bn2/3pp3/4P3/1PN2N2/PBPP1PPP/R2QKB1R w KQkq - 2 6", // Nimzo-like
+    "r1bq1rk1/ppp2ppp/2n1pn2/3p4/2PP4/2N2NP1/PP2PPBP/R1BQ1RK1 b - - 1 7",   // Catalan
+
+    // Complex middlegame
+    "r2q1rk1/1b1nbppp/p2ppn2/1p4B1/3NPP2/2N5/PPP1B1PP/R2Q1RK1 w - - 0 12",
+    "r4rk1/1pp2ppp/p1n1bn2/4p1B1/4P3/2N2N2/PPP2PPP/R3K2R w KQ - 2 10",
+    "r1b1kb1r/pp1n1ppp/1qn1p3/3pP3/3P4/2NB1N2/PP3PPP/R1BQK2R w KQkq - 2 9",
+    "r2qr1k1/1p1nbppp/p2pbn2/4p3/4P1P1/1NN1BP2/PPP1B2P/R2Q1RK1 w - - 1 13",
+
+    // Tactical puzzles
+    "r1b1k2r/ppppnppp/2n2q2/2b5/3NP3/2P1B3/PP3PPP/RN1QKB1R w KQkq - 4 7",
+    "r1bqk2r/ppp2ppp/2n1pn2/3p4/1bPP4/2N1PN2/PP3PPP/R1BQKB1R w KQkq - 4 6",
+    "r2q1rk1/pb1nbppp/1p2pn2/2pp4/3P1B2/2PBPN2/PP1N1PPP/R2Q1RK1 w - - 0 10",
+
+    // Endgames
+    "8/8/4k3/8/2K5/5Q2/8/8 w - - 0 1",              // KQ vs K
+    "8/8/4k3/8/2K5/8/8/5R2 w - - 0 1",              // KR vs K
+    "8/5k2/8/8/8/4K3/4P3/8 w - - 0 1",              // KP vs K
+    "8/8/3k4/8/3K4/3B4/4B3/8 w - - 0 1",            // KBB vs K
+    "8/8/4k3/2K5/8/8/3N1N2/8 w - - 0 1",            // KNN vs K (draw)
+
+    // Rook endgames
+    "8/8/8/5k2/8/2K5/8/R7 w - - 0 1",
+    "8/8/4k3/r7/8/4K3/4P3/4R3 w - - 0 1",           // Lucena-like
+    "8/5k2/R7/8/8/4K3/8/r7 w - - 0 1",              // Philidor-like
+
+    // Pawn endgames
+    "8/8/4k3/8/P7/4K3/8/8 w - - 0 1",
+    "8/p7/8/1P6/K7/8/7k/8 w - - 0 1",               // Outside passer
+
+    // Complex endgames
+    "8/1p3pk1/p1p2bp1/P1P5/1P2P3/6P1/5PK1/5B2 w - - 0 40",
+    "2r3k1/p4pp1/1p5p/3p4/3P4/1P4P1/P4P1P/2R3K1 w - - 0 25",
+    "8/pp3pk1/2p5/4P3/2P2P2/1P4K1/P7/8 w - - 0 35",
+
+    // Fortress detection
+    "8/8/8/3k4/8/8/2K5/8 w - - 0 1",                // KK draw
+    "8/8/8/8/8/3k4/3p4/3K4 w - - 0 1",              // Drawn with correct play
+];
+
+// ============================================================================
+// TEST SUITE RUNNER
+// ============================================================================
+
+struct TestSuiteRunner {
+    config: TestConfig,
+    engines: HashMap<String, Engine>,
+    results: Vec<TestResult>,
+    output_dir: String,
+}
+
+struct TestConfig {
+    time_control: TimeControl,
+    num_games_per_position: i32,
+    concurrent_games: i32,
+    sprt_config: SPRTConfig,
+    hash_mb: i32,
+    threads: i32,
+}
+
+impl TestConfig {
+    fn quick() -> TestConfig {
+        return TestConfig {
+            time_control: TimeControl { initial_ms: 10000, increment_ms: 100 },
+            num_games_per_position: 2,
+            concurrent_games: 4,
+            sprt_config: SPRTConfig::default(),
+            hash_mb: 256,
+            threads: 4,
+        };
+    }
+
+    fn standard() -> TestConfig {
+        return TestConfig {
+            time_control: TimeControl::blitz(),
+            num_games_per_position: 10,
+            concurrent_games: 8,
+            sprt_config: SPRTConfig::default(),
+            hash_mb: 1024,
+            threads: 8,
+        };
+    }
+
+    fn thorough() -> TestConfig {
+        return TestConfig {
+            time_control: TimeControl::rapid(),
+            num_games_per_position: 50,
+            concurrent_games: 4,
+            sprt_config: SPRTConfig { elo0: 0.0, elo1: 3.0, alpha: 0.01, beta: 0.01 },
+            hash_mb: 4096,
+            threads: 16,
+        };
+    }
+}
+
+struct TestResult {
+    test_name: String,
+    baseline_name: String,
+    variant_name: String,
+    sprt: SPRTState,
+    performance: PerformanceComparison,
+    games: Vec<GameRecord>,
+    status: TestStatus,
+    duration_secs: i64,
+}
+
+struct PerformanceComparison {
+    baseline_nps: i64,
+    variant_nps: i64,
+    baseline_depth: f64,
+    variant_depth: f64,
+    nps_improvement: f64,
+    depth_improvement: f64,
+}
+
+enum TestStatus {
+    Passed,
+    Failed,
+    Inconclusive,
+    Error(String),
+}
+
+impl TestSuiteRunner {
+    fn new(config: TestConfig, output_dir: &str) -> TestSuiteRunner {
+        return TestSuiteRunner {
+            config: config,
+            engines: HashMap::new(),
+            results: Vec::new(),
+            output_dir: output_dir.to_string(),
+        };
+    }
+
+    fn register_engine(&mut self, name: &str, engine: Engine) {
+        self.engines.insert(name.to_string(), engine);
+    }
+
+    fn run_test(&mut self, test_name: &str, baseline: &str, variant: &str) -> TestResult {
+        println!("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓");
+        println!("┃  TEST: {:54} ┃", test_name);
+        println!("┃  {} vs {}                                           ┃", baseline, variant);
+        println!("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛");
+
+        let start_time = Instant::now();
+
+        let baseline_engine = self.engines.get(baseline)
+            .expect(&format!("Engine not found: {}", baseline));
+        let variant_engine = self.engines.get(variant)
+            .expect(&format!("Engine not found: {}", variant));
+
+        let mut sprt = SPRTState::new(self.config.sprt_config.clone());
+        let mut games = Vec::new();
+        let mut baseline_total_nps = 0i64;
+        let mut variant_total_nps = 0i64;
+        let mut baseline_total_depth = 0.0f64;
+        let mut variant_total_depth = 0.0f64;
+        let mut game_count = 0;
+
+        // Play through positions
+        for (pos_idx, fen) in BENCHMARK_POSITIONS.iter().enumerate() {
+            if sprt.status() != SPRTStatus::Continue {
+                break;
+            }
+
+            for game_num in 0..self.config.num_games_per_position {
+                let swap_colors = game_num % 2 == 1;
+
+                let (white_engine, black_engine) = if swap_colors {
+                    (variant_engine, baseline_engine)
+                } else {
+                    (baseline_engine, variant_engine)
+                };
+
+                let game_result = self.play_game(fen, white_engine, black_engine);
+
+                // Update SPRT
+                let result_for_variant = if swap_colors {
+                    game_result.result
+                } else {
+                    invert_result(game_result.result)
+                };
+                sprt.update(result_for_variant);
+
+                // Track performance
+                if swap_colors {
+                    variant_total_nps += game_result.white_nps;
+                    baseline_total_nps += game_result.black_nps;
+                    variant_total_depth += game_result.white_avg_depth as f64;
+                    baseline_total_depth += game_result.black_avg_depth as f64;
+                } else {
+                    baseline_total_nps += game_result.white_nps;
+                    variant_total_nps += game_result.black_nps;
+                    baseline_total_depth += game_result.white_avg_depth as f64;
+                    variant_total_depth += game_result.black_avg_depth as f64;
+                }
+
+                games.push(game_result);
+                game_count += 1;
+
+                // Progress report
+                if game_count % 10 == 0 {
+                    let (lo, hi) = sprt.confidence_interval();
+                    println!(
+                        "  [{:4}] Elo: {:+5.1} [{:+.0}, {:+.0}] | LLR: {:5.2} | {}-{}-{}",
+                        game_count,
+                        sprt.estimated_elo(), lo, hi,
+                        sprt.llr,
+                        sprt.wins, sprt.draws, sprt.losses
+                    );
+                }
+
+                if sprt.status() != SPRTStatus::Continue {
+                    break;
+                }
+            }
+        }
+
+        let duration = start_time.elapsed().as_secs() as i64;
+
+        let status = match sprt.status() {
+            SPRTStatus::H1Accepted => TestStatus::Passed,
+            SPRTStatus::H0Accepted => TestStatus::Failed,
+            SPRTStatus::Continue => TestStatus::Inconclusive,
+        };
+
+        let n = game_count as f64;
+        let performance = PerformanceComparison {
+            baseline_nps: (baseline_total_nps as f64 / n) as i64,
+            variant_nps: (variant_total_nps as f64 / n) as i64,
+            baseline_depth: baseline_total_depth / n,
+            variant_depth: variant_total_depth / n,
+            nps_improvement: (variant_total_nps as f64 / baseline_total_nps as f64 - 1.0) * 100.0,
+            depth_improvement: (variant_total_depth / baseline_total_depth - 1.0) * 100.0,
+        };
+
+        let result = TestResult {
+            test_name: test_name.to_string(),
+            baseline_name: baseline.to_string(),
+            variant_name: variant.to_string(),
+            sprt: sprt,
+            performance: performance,
+            games: games,
+            status: status,
+            duration_secs: duration,
+        };
+
+        self.print_test_result(&result);
+        self.results.push(result.clone());
+
+        return result;
+    }
+
+    fn play_game(&self, fen: &str, white: &Engine, black: &Engine) -> GamePlayResult {
+        let mut board = Board::from_fen(fen).unwrap();
+        let mut moves = Vec::new();
+        let mut white_nps_sum = 0i64;
+        let mut black_nps_sum = 0i64;
+        let mut white_depth_sum = 0i32;
+        let mut black_depth_sum = 0i32;
+        let mut white_moves = 0i32;
+        let mut black_moves = 0i32;
+
+        let mut white_time = self.config.time_control.initial_ms;
+        let mut black_time = self.config.time_control.initial_ms;
+
+        loop {
+            // Check for game end
+            if is_game_over(&board) {
+                break;
+            }
+
+            let (current_engine, time_left) = if board.side_to_move == Color::White {
+                (white, &mut white_time)
+            } else {
+                (black, &mut black_time)
+            };
+
+            // Get move from engine
+            let start = Instant::now();
+            let search_result = current_engine.search(&board, *time_left);
+            let elapsed = start.elapsed().as_millis() as i64;
+
+            // Update time
+            *time_left -= elapsed;
+            *time_left += self.config.time_control.increment_ms;
+
+            // Track stats
+            if board.side_to_move == Color::White {
+                white_nps_sum += search_result.nps;
+                white_depth_sum += search_result.depth;
+                white_moves += 1;
+            } else {
+                black_nps_sum += search_result.nps;
+                black_depth_sum += search_result.depth;
+                black_moves += 1;
+            }
+
+            // Make move
+            board = make_move(board, search_result.best_move);
+            moves.push(search_result.best_move);
+
+            // Time forfeit
+            if *time_left <= 0 {
+                break;
+            }
+
+            // Draw by move limit (300 moves)
+            if moves.len() >= 600 {
+                break;
+            }
+        }
+
+        let result = determine_result(&board, white_time, black_time);
+
+        return GamePlayResult {
+            starting_fen: fen.to_string(),
+            moves: moves,
+            result: result,
+            white_nps: if white_moves > 0 { white_nps_sum / white_moves as i64 } else { 0 },
+            black_nps: if black_moves > 0 { black_nps_sum / black_moves as i64 } else { 0 },
+            white_avg_depth: if white_moves > 0 { white_depth_sum / white_moves } else { 0 },
+            black_avg_depth: if black_moves > 0 { black_depth_sum / black_moves } else { 0 },
+        };
+    }
+
+    fn print_test_result(&self, result: &TestResult) {
+        let status_str = match &result.status {
+            TestStatus::Passed => "✅ PASSED",
+            TestStatus::Failed => "❌ FAILED",
+            TestStatus::Inconclusive => "⚠️  INCONCLUSIVE",
+            TestStatus::Error(msg) => &format!("💥 ERROR: {}", msg),
+        };
+
+        println!();
+        println!("  ╔════════════════════════════════════════════════════════════╗");
+        println!("  ║  RESULT: {:50} ║", status_str);
+        println!("  ╠════════════════════════════════════════════════════════════╣");
+
+        let (lo, hi) = result.sprt.confidence_interval();
+        println!("  ║  Elo:    {:+.1} [{:+.1}, {:+.1}]                            ║",
+            result.sprt.estimated_elo(), lo, hi);
+        println!("  ║  Games:  {} ({}-{}-{})                              ║",
+            result.sprt.games_played(),
+            result.sprt.wins, result.sprt.draws, result.sprt.losses);
+        println!("  ║  LLR:    {:.2} [{:.2}, {:.2}]                          ║",
+            result.sprt.llr, result.sprt.lower_bound, result.sprt.upper_bound);
+        println!("  ╠════════════════════════════════════════════════════════════╣");
+        println!("  ║  Performance:                                              ║");
+        println!("  ║    NPS:   {} -> {} ({:+.1}%)                   ║",
+            result.performance.baseline_nps,
+            result.performance.variant_nps,
+            result.performance.nps_improvement);
+        println!("  ║    Depth: {:.1} -> {:.1} ({:+.1}%)                          ║",
+            result.performance.baseline_depth,
+            result.performance.variant_depth,
+            result.performance.depth_improvement);
+        println!("  ╠════════════════════════════════════════════════════════════╣");
+        println!("  ║  Duration: {} seconds                                  ║", result.duration_secs);
+        println!("  ╚════════════════════════════════════════════════════════════╝");
+        println!();
+    }
+
+    fn generate_report(&self) {
+        let report_path = format!("{}/benchmark_report.json", self.output_dir);
+        let html_path = format!("{}/benchmark_report.html", self.output_dir);
+
+        // JSON report
+        let json_report = json!({
+            "timestamp": Instant::now().elapsed().as_secs(),
+            "config": self.config,
+            "results": self.results,
+        });
+        fs::write(&report_path, json_report.to_string()).unwrap();
+
+        // HTML report
+        let html = self.generate_html_report();
+        fs::write(&html_path, html).unwrap();
+
+        println!("Reports saved:");
+        println!("  JSON: {}", report_path);
+        println!("  HTML: {}", html_path);
+    }
+
+    fn generate_html_report(&self) -> String {
+        let mut html = String::new();
+        html.push_str("<!DOCTYPE html><html><head>");
+        html.push_str("<title>NikolaChess Benchmark Report</title>");
+        html.push_str("<style>");
+        html.push_str("body { font-family: monospace; background: #1a1a1a; color: #eee; padding: 20px; }");
+        html.push_str("table { border-collapse: collapse; width: 100%; }");
+        html.push_str("th, td { border: 1px solid #444; padding: 8px; text-align: left; }");
+        html.push_str("th { background: #333; }");
+        html.push_str(".passed { color: #4f4; }");
+        html.push_str(".failed { color: #f44; }");
+        html.push_str(".inconclusive { color: #ff4; }");
+        html.push_str("</style></head><body>");
+
+        html.push_str("<h1>🏁 NikolaChess Benchmark Report</h1>");
+        html.push_str("<table><tr>");
+        html.push_str("<th>Test</th><th>Status</th><th>Elo</th><th>Games</th><th>NPS Change</th><th>Depth Change</th>");
+        html.push_str("</tr>");
+
+        for result in &self.results {
+            let status_class = match result.status {
+                TestStatus::Passed => "passed",
+                TestStatus::Failed => "failed",
+                _ => "inconclusive",
+            };
+            let status_text = match result.status {
+                TestStatus::Passed => "✅ PASSED",
+                TestStatus::Failed => "❌ FAILED",
+                TestStatus::Inconclusive => "⚠️ INCONCLUSIVE",
+                TestStatus::Error(_) => "💥 ERROR",
+            };
+
+            html.push_str(&format!("<tr class='{}'>", status_class));
+            html.push_str(&format!("<td>{}</td>", result.test_name));
+            html.push_str(&format!("<td>{}</td>", status_text));
+            html.push_str(&format!("<td>{:+.1}</td>", result.sprt.estimated_elo()));
+            html.push_str(&format!("<td>{}</td>", result.sprt.games_played()));
+            html.push_str(&format!("<td>{:+.1}%</td>", result.performance.nps_improvement));
+            html.push_str(&format!("<td>{:+.1}%</td>", result.performance.depth_improvement));
+            html.push_str("</tr>");
+        }
+
+        html.push_str("</table></body></html>");
+        return html;
+    }
+}
+
+struct GamePlayResult {
+    starting_fen: String,
+    moves: Vec<Move>,
+    result: GameResult,
+    white_nps: i64,
+    black_nps: i64,
+    white_avg_depth: i32,
+    black_avg_depth: i32,
+}
+
+fn is_game_over(board: &Board) -> bool {
+    if board.is_checkmate() || board.is_stalemate() {
+        return true;
+    }
+    if board.is_insufficient_material() {
+        return true;
+    }
+    if board.halfmove_clock >= 100 {
+        return true;  // 50-move rule
+    }
+    if board.is_threefold_repetition() {
+        return true;
+    }
+    return false;
+}
+
+fn determine_result(board: &Board, white_time: i64, black_time: i64) -> GameResult {
+    if white_time <= 0 {
+        return GameResult::Loss;  // White lost on time
+    }
+    if black_time <= 0 {
+        return GameResult::Win;   // Black lost on time
+    }
+    if board.is_checkmate() {
+        return if board.side_to_move == Color::White {
+            GameResult::Loss  // White is checkmated
+        } else {
+            GameResult::Win   // Black is checkmated
+        };
+    }
+    return GameResult::Draw;
+}
+
+fn invert_result(result: GameResult) -> GameResult {
+    match result {
+        GameResult::Win => GameResult::Loss,
+        GameResult::Loss => GameResult::Win,
+        GameResult::Draw => GameResult::Draw,
+    }
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+fn main() {
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║           NikolaChess Benchmark Suite v1.0                       ║");
+    println!("║           Scientific Testing of Search Improvements              ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+
+    let args: Vec<String> = std::env::args().collect();
+    let test_mode = args.get(1).map(|s| s.as_str()).unwrap_or("quick");
+
+    let config = match test_mode {
+        "quick" => TestConfig::quick(),
+        "standard" => TestConfig::standard(),
+        "thorough" => TestConfig::thorough(),
+        _ => {
+            println!("Usage: bench [quick|standard|thorough]");
+            return;
+        }
+    };
+
+    println!("Test mode: {}", test_mode);
+    println!();
+
+    let mut runner = TestSuiteRunner::new(config, "/home/n/.nikolachess/NikolaChess/bench_results");
+
+    // Register engines
+    // Baseline: Standard alpha-beta with CPU NNUE
+    runner.register_engine("baseline", create_baseline_engine());
+
+    // Variants to test
+    runner.register_engine("history_lmr", create_history_lmr_engine());
+    runner.register_engine("probcut", create_probcut_engine());
+    runner.register_engine("gpu_batch", create_gpu_batch_engine());
+    runner.register_engine("mcts", create_mcts_engine_variant());
+    runner.register_engine("hybrid", create_hybrid_engine_variant());
+    runner.register_engine("full", create_full_improvements_engine());
+
+    // Run tests
+    println!("Running improvement tests...\n");
+
+    runner.run_test("History-modulated LMR", "baseline", "history_lmr");
+    runner.run_test("ProbCut Pruning", "baseline", "probcut");
+    runner.run_test("GPU Batched NNUE", "baseline", "gpu_batch");
+    runner.run_test("GPU MCTS", "baseline", "mcts");
+    runner.run_test("Hybrid Search", "baseline", "hybrid");
+    runner.run_test("All Improvements", "baseline", "full");
+
+    // Multi-GPU scaling test
+    runner.run_test("MCTS 8-GPU vs 1-GPU", "mcts", "mcts_8gpu");
+
+    // Generate report
+    runner.generate_report();
+
+    println!("\n✅ Benchmark suite complete!");
+}
+
+fn create_baseline_engine() -> Engine {
+    return Engine::new(EngineConfig::baseline());
+}
+
+fn create_history_lmr_engine() -> Engine {
+    return Engine::new(EngineConfig::with_history_lmr());
+}
+
+fn create_probcut_engine() -> Engine {
+    return Engine::new(EngineConfig::with_probcut());
+}
+
+fn create_gpu_batch_engine() -> Engine {
+    return Engine::new(EngineConfig::with_gpu_batching(64, 1));
+}
+
+fn create_mcts_engine_variant() -> Engine {
+    return Engine::new(EngineConfig::with_mcts(1));
+}
+
+fn create_hybrid_engine_variant() -> Engine {
+    let config = HybridConfig::default();
+    return Engine::hybrid(config);
+}
+
+fn create_full_improvements_engine() -> Engine {
+    return Engine::new(EngineConfig::full_improvements());
+}

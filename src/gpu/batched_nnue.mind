@@ -1,0 +1,406 @@
+// NikolaChess - GPU-Batched NNUE Evaluation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// GPU-batched NNUE inference
+// for Lazy SMP parallelization. Batches evaluations across
+// all search threads into single GPU kernel calls.
+
+import std.sync;
+import std.collections;
+
+// ============================================================================
+// HALFKA NNUE ARCHITECTURE (GPU-OPTIMIZED)
+// ============================================================================
+
+const HALFKA_INPUT_SIZE: i32 = 45056;  // 64 * 64 * 11 (king-centric features)
+const L1_SIZE: i32 = 1024;
+const L2_SIZE: i32 = 8;
+const L3_SIZE: i32 = 32;
+
+struct NNUEWeights on(gpu0) {
+    // Feature transformer (input -> L1)
+    ft_weights: Tensor<f16, [HALFKA_INPUT_SIZE, L1_SIZE]>,
+    ft_biases: Tensor<f16, [L1_SIZE]>,
+
+    // Hidden layers
+    l1_weights: Tensor<f16, [L1_SIZE * 2, L2_SIZE]>,
+    l1_biases: Tensor<f16, [L2_SIZE]>,
+
+    l2_weights: Tensor<f16, [L2_SIZE, L3_SIZE]>,
+    l2_biases: Tensor<f16, [L3_SIZE]>,
+
+    // Output layer
+    output_weights: Tensor<f16, [L3_SIZE, 1]>,
+    output_bias: f16,
+}
+
+impl NNUEWeights {
+    fn load(path: &str) -> Result<NNUEWeights, Error> on(gpu0) {
+        // Load pre-trained weights from file
+        let data = read_binary(path)?;
+        return Self::deserialize(data);
+    }
+}
+
+// ============================================================================
+// ACCUMULATOR (Incremental Updates)
+// ============================================================================
+
+struct Accumulator on(gpu0) {
+    // Active features for white and black king positions
+    white_acc: Tensor<f16, [L1_SIZE]>,
+    black_acc: Tensor<f16, [L1_SIZE]>,
+    computed: bool,
+}
+
+impl Accumulator {
+    fn new() -> Accumulator on(gpu0) {
+        return Accumulator {
+            white_acc: Tensor::zeros(),
+            black_acc: Tensor::zeros(),
+            computed: false,
+        };
+    }
+
+    fn refresh(&mut self, board: &Board, weights: &NNUEWeights) on(gpu0) {
+        // Full recomputation of accumulator from position
+        let white_features = Self::extract_features(board, Color::White);
+        let black_features = Self::extract_features(board, Color::Black);
+
+        // Sparse feature multiplication
+        self.white_acc = weights.ft_biases.clone();
+        self.black_acc = weights.ft_biases.clone();
+
+        for idx in white_features {
+            self.white_acc += weights.ft_weights[idx];
+        }
+        for idx in black_features {
+            self.black_acc += weights.ft_weights[idx];
+        }
+
+        self.computed = true;
+    }
+
+    fn update_move(&mut self, mv: Move, board: &Board, weights: &NNUEWeights) on(gpu0) {
+        // Incremental update for a single move
+        let (add_white, rem_white) = Self::delta_features(mv, board, Color::White);
+        let (add_black, rem_black) = Self::delta_features(mv, board, Color::Black);
+
+        // Apply deltas (much faster than full refresh)
+        for idx in rem_white {
+            self.white_acc -= weights.ft_weights[idx];
+        }
+        for idx in add_white {
+            self.white_acc += weights.ft_weights[idx];
+        }
+        for idx in rem_black {
+            self.black_acc -= weights.ft_weights[idx];
+        }
+        for idx in add_black {
+            self.black_acc += weights.ft_weights[idx];
+        }
+    }
+
+    fn extract_features(board: &Board, perspective: Color) -> Vec<i32> {
+        let mut features = Vec::new();
+        let king_sq = board.king_square(perspective);
+
+        for sq in 0..64 {
+            if let Some(piece) = board.piece_at(Square(sq)) {
+                let idx = Self::feature_index(king_sq, Square(sq), piece, perspective);
+                features.push(idx);
+            }
+        }
+        return features;
+    }
+
+    fn feature_index(king_sq: Square, piece_sq: Square, piece: Piece, perspective: Color) -> i32 {
+        // HalfKA feature indexing
+        let k = if perspective == Color::White { king_sq.0 } else { king_sq.0 ^ 56 };
+        let p = if perspective == Color::White { piece_sq.0 } else { piece_sq.0 ^ 56 };
+        let pt = piece.piece_type as i32;
+        let c = if piece.color == perspective { 0 } else { 1 };
+
+        return k as i32 * 64 * 11 + p as i32 * 11 + pt + c * 6;
+    }
+
+    fn delta_features(mv: Move, board: &Board, perspective: Color) -> (Vec<i32>, Vec<i32>) {
+        // Calculate features added and removed by move
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+
+        let king_sq = board.king_square(perspective);
+        let moving_piece = board.piece_at(mv.from).unwrap();
+
+        // Remove piece from origin
+        removed.push(Self::feature_index(king_sq, mv.from, moving_piece, perspective));
+
+        // Add piece to destination (or promoted piece)
+        let final_piece = if let Some(promo) = mv.promotion {
+            Piece { piece_type: promo, color: moving_piece.color }
+        } else {
+            moving_piece
+        };
+        added.push(Self::feature_index(king_sq, mv.to, final_piece, perspective));
+
+        // Handle captures
+        if let Some(captured) = board.piece_at(mv.to) {
+            removed.push(Self::feature_index(king_sq, mv.to, captured, perspective));
+        }
+
+        // Handle en passant
+        if moving_piece.piece_type == PieceType::Pawn && mv.to == board.ep_square() {
+            let captured_sq = Square(mv.to.0 as i32 + if moving_piece.color == Color::White { -8 } else { 8 });
+            let captured = Piece { piece_type: PieceType::Pawn, color: !moving_piece.color };
+            removed.push(Self::feature_index(king_sq, captured_sq, captured, perspective));
+        }
+
+        // Handle castling rook movement
+        if moving_piece.piece_type == PieceType::King {
+            let delta = mv.to.0 as i32 - mv.from.0 as i32;
+            if delta.abs() == 2 {
+                let (rook_from, rook_to) = if delta > 0 {
+                    (Square(mv.from.0 + 3), Square(mv.from.0 + 1))  // Kingside
+                } else {
+                    (Square(mv.from.0 - 4), Square(mv.from.0 - 1))  // Queenside
+                };
+                let rook = Piece { piece_type: PieceType::Rook, color: moving_piece.color };
+                removed.push(Self::feature_index(king_sq, rook_from, rook, perspective));
+                added.push(Self::feature_index(king_sq, rook_to, rook, perspective));
+            }
+        }
+
+        return (added, removed);
+    }
+}
+
+// ============================================================================
+// BATCHED EVALUATION ENGINE
+// ============================================================================
+
+const MAX_BATCH_SIZE: i32 = 4096;
+
+struct BatchedEvaluator {
+    weights: NNUEWeights,
+    // Evaluation queue shared across threads
+    eval_queue: Mutex<EvalQueue>,
+    // Results broadcast channel
+    results: Mutex<HashMap<u64, i32>>,
+    // Batch processing trigger
+    batch_ready: CondVar,
+    // Configuration
+    batch_size: i32,
+    num_gpus: i32,
+}
+
+struct EvalQueue {
+    positions: Vec<(u64, Board, Accumulator)>,  // (hash, board, accumulator)
+    pending: i32,
+}
+
+impl BatchedEvaluator {
+    fn new(weights_path: &str, batch_size: i32, num_gpus: i32) -> BatchedEvaluator {
+        let weights = NNUEWeights::load(weights_path).expect("Failed to load NNUE weights");
+
+        return BatchedEvaluator {
+            weights: weights,
+            eval_queue: Mutex::new(EvalQueue {
+                positions: Vec::with_capacity(MAX_BATCH_SIZE as usize),
+                pending: 0,
+            }),
+            results: Mutex::new(HashMap::new()),
+            batch_ready: CondVar::new(),
+            batch_size: batch_size,
+            num_gpus: num_gpus,
+        };
+    }
+
+    fn queue_eval(&self, hash: u64, board: &Board, acc: &Accumulator) {
+        let mut queue = self.eval_queue.lock();
+        queue.positions.push((hash, board.clone(), acc.clone()));
+        queue.pending += 1;
+
+        // Trigger batch processing when threshold reached
+        if queue.pending >= self.batch_size {
+            self.batch_ready.notify_all();
+        }
+    }
+
+    fn get_result(&self, hash: u64) -> Option<i32> {
+        let results = self.results.lock();
+        return results.get(&hash).copied();
+    }
+
+    fn wait_for_result(&self, hash: u64) -> i32 {
+        loop {
+            if let Some(score) = self.get_result(hash) {
+                return score;
+            }
+            // Small spin wait, could use condition variable
+            std::thread::yield_now();
+        }
+    }
+
+    fn process_batch(&self) on(gpu0..gpu7) {
+        // Worker thread that processes batched evaluations
+        loop {
+            // Wait for batch to be ready
+            let batch = {
+                let mut queue = self.eval_queue.lock();
+                while queue.pending < self.batch_size {
+                    self.batch_ready.wait(&mut queue);
+                }
+                // Take the batch
+                let batch = queue.positions.drain(..).collect::<Vec<_>>();
+                queue.pending = 0;
+                batch
+            };
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            // Distribute across GPUs
+            let chunks = batch.chunks(batch.len() / self.num_gpus as usize + 1);
+            let results = parallel_for gpu_id in 0..self.num_gpus {
+                self.evaluate_chunk(&chunks[gpu_id as usize], gpu_id) on(gpu(gpu_id))
+            };
+
+            // Broadcast results back to search threads
+            let mut results_map = self.results.lock();
+            for (hash, score) in results.flatten() {
+                results_map.insert(hash, score);
+            }
+        }
+    }
+
+    fn evaluate_chunk(&self, chunk: &[(u64, Board, Accumulator)], _gpu_id: i32) -> Vec<(u64, i32)> on(gpu0) {
+        let n = chunk.len();
+
+        // Prepare batched input tensors
+        let mut white_accs = Tensor::<f16, [n, L1_SIZE]>::zeros() on(gpu0);
+        let mut black_accs = Tensor::<f16, [n, L1_SIZE]>::zeros() on(gpu0);
+
+        for (i, (_, _, acc)) in chunk.iter().enumerate() {
+            white_accs[i] = acc.white_acc.clone();
+            black_accs[i] = acc.black_acc.clone();
+        }
+
+        // Batched forward pass
+        let scores = self.batched_forward(white_accs, black_accs);
+
+        // Map back to hashes
+        return chunk.iter().enumerate()
+            .map(|(i, (hash, _, _))| (*hash, scores[i]))
+            .collect();
+    }
+
+    fn batched_forward(
+        &self,
+        white_accs: Tensor<f16, [N, L1_SIZE]>,
+        black_accs: Tensor<f16, [N, L1_SIZE]>,
+    ) -> Vec<i32> on(gpu0) {
+        // Concatenate white and black perspectives
+        // Shape: [N, L1_SIZE * 2]
+        let combined = concat(
+            clipped_relu(white_accs),
+            clipped_relu(black_accs)
+        );
+
+        // Layer 1: [N, L1_SIZE*2] @ [L1_SIZE*2, L2_SIZE] -> [N, L2_SIZE]
+        let l1_out = clipped_relu(
+            matmul(combined, self.weights.l1_weights) + self.weights.l1_biases
+        );
+
+        // Layer 2: [N, L2_SIZE] @ [L2_SIZE, L3_SIZE] -> [N, L3_SIZE]
+        let l2_out = clipped_relu(
+            matmul(l1_out, self.weights.l2_weights) + self.weights.l2_biases
+        );
+
+        // Output: [N, L3_SIZE] @ [L3_SIZE, 1] -> [N, 1]
+        let output = matmul(l2_out, self.weights.output_weights) + self.weights.output_bias;
+
+        // Convert to centipawns
+        return output.to_vec().iter()
+            .map(|x| (*x * 600.0) as i32)  // Scale to centipawns
+            .collect();
+    }
+}
+
+fn clipped_relu(x: Tensor<f16, Shape>) -> Tensor<f16, Shape> on(gpu0) {
+    // ClippedReLU: max(0, min(1, x))
+    return x.clamp(0.0, 1.0);
+}
+
+// ============================================================================
+// LAZY SMP INTEGRATION
+// ============================================================================
+
+struct LazySMPSearch {
+    evaluator: Arc<BatchedEvaluator>,
+    threads: Vec<SearchThread>,
+    stop: AtomicBool,
+}
+
+struct SearchThread {
+    id: i32,
+    evaluator: Arc<BatchedEvaluator>,
+    accumulator_stack: Vec<Accumulator>,
+}
+
+impl SearchThread {
+    fn search(&mut self, board: &Board, depth: i32, alpha: i32, beta: i32) -> i32 {
+        // ... alpha-beta search logic ...
+
+        // When we need an evaluation, queue it for batched GPU processing
+        let hash = board.hash();
+        let acc = &self.accumulator_stack[self.ply as usize];
+
+        // Queue for batched eval
+        self.evaluator.queue_eval(hash, board, acc);
+
+        // Continue searching other moves speculatively while waiting
+        // ... speculative search ...
+
+        // Eventually get the result
+        let score = self.evaluator.wait_for_result(hash);
+        return score;
+    }
+
+    fn make_move(&mut self, mv: Move, board: &Board) {
+        // Incremental accumulator update
+        let parent_acc = &self.accumulator_stack[self.ply as usize];
+        let mut child_acc = parent_acc.clone();
+        child_acc.update_move(mv, board, &self.evaluator.weights);
+        self.accumulator_stack.push(child_acc);
+        self.ply += 1;
+    }
+
+    fn unmake_move(&mut self) {
+        self.accumulator_stack.pop();
+        self.ply -= 1;
+    }
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+fn create_batched_evaluator(
+    weights_path: &str,
+    batch_size: i32,
+    num_gpus: i32
+) -> Arc<BatchedEvaluator> {
+    let evaluator = Arc::new(BatchedEvaluator::new(weights_path, batch_size, num_gpus));
+
+    // Start GPU batch processing threads
+    for gpu_id in 0..num_gpus {
+        let eval_clone = evaluator.clone();
+        spawn(move || {
+            eval_clone.process_batch() on(gpu(gpu_id));
+        });
+    }
+
+    return evaluator;
+}

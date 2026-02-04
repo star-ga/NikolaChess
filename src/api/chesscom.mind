@@ -1,0 +1,895 @@
+// NikolaChess - Chess.com Bot API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Chess.com API integration:
+// - Bot account management
+// - Game streaming
+// - Challenge handling
+// - PubSub for real-time events
+
+import std.sync;
+import std.time;
+
+// ============================================================================
+// CHESS.COM BOT
+// ============================================================================
+
+struct ChessComBot {
+    username: str,
+    http: HttpClientPool,
+    ws: Option<WebSocket>,
+    active_games: Vec<ChessComGame>,
+    settings: ChessComSettings,
+    engine: SearchEngine,
+    api: ChessAPI,
+    running: AtomicBool,
+}
+
+struct ChessComSettings {
+    // Challenge acceptance criteria
+    min_rating: i32,
+    max_rating: i32,
+    accept_rated: bool,
+    accept_casual: bool,
+    accept_bullet: bool,
+    accept_blitz: bool,
+    accept_rapid: bool,
+    accept_daily: bool,
+    max_concurrent_games: usize,
+
+    // Bot behavior
+    auto_accept_challenges: bool,
+    offer_draw_threshold: i32,  // Centipawns below which to offer draw
+    resign_threshold: i32,      // Centipawns to resign
+}
+
+impl ChessComSettings {
+    fn default() -> ChessComSettings {
+        return ChessComSettings {
+            min_rating: 0,
+            max_rating: 3500,
+            accept_rated: true,
+            accept_casual: true,
+            accept_bullet: true,
+            accept_blitz: true,
+            accept_rapid: true,
+            accept_daily: false,
+            max_concurrent_games: 4,
+            auto_accept_challenges: true,
+            offer_draw_threshold: -50,
+            resign_threshold: -1000,
+        };
+    }
+}
+
+struct ChessComGame {
+    game_id: str,
+    white: str,
+    black: str,
+    time_control: str,
+    rated: bool,
+    board: Board,
+    moves: Vec<Move>,
+    our_color: Color,
+    our_time_ms: i64,
+    opponent_time_ms: i64,
+    status: ChessComGameStatus,
+}
+
+enum ChessComGameStatus {
+    InProgress,
+    OurTurn,
+    TheirTurn,
+    Finished(ChessComResult),
+}
+
+enum ChessComResult {
+    Win,
+    Loss,
+    Draw,
+    Aborted,
+}
+
+// ============================================================================
+// BOT INITIALIZATION
+// ============================================================================
+
+fn ChessComBot::new(username: &str, api_config: APIConfig) -> ChessComBot {
+    return ChessComBot {
+        username: username.to_string(),
+        http: HttpClientPool::new(4),
+        ws: None,
+        active_games: Vec::new(),
+        settings: ChessComSettings::default(),
+        engine: SearchEngine::new(),
+        api: ChessAPI::new(api_config),
+        running: AtomicBool::new(false),
+    };
+}
+
+// ============================================================================
+// MAIN BOT LOOP
+// ============================================================================
+
+fn run_chesscom_bot(bot: &mut ChessComBot) -> Result<(), ChessComError> {
+    println!("Starting Chess.com bot as {}", bot.username);
+
+    bot.running.store(true, Ordering::SeqCst);
+
+    // Connect to Chess.com WebSocket for real-time events
+    connect_websocket(bot)?;
+
+    // Main loop
+    while bot.running.load(Ordering::SeqCst) {
+        // Process WebSocket messages
+        process_websocket_messages(bot)?;
+
+        // Process active games
+        process_active_games(bot)?;
+
+        // Small delay to prevent busy loop
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Disconnect
+    if let Some(ref mut ws) = bot.ws {
+        ws.close();
+    }
+
+    println!("Chess.com bot stopped");
+    return Ok(());
+}
+
+fn stop_chesscom_bot(bot: &mut ChessComBot) {
+    bot.running.store(false, Ordering::SeqCst);
+}
+
+// ============================================================================
+// WEBSOCKET CONNECTION
+// ============================================================================
+
+fn connect_websocket(bot: &mut ChessComBot) -> Result<(), ChessComError> {
+    // Chess.com uses WebSocket for real-time communication
+    let ws = WebSocket::connect("wss://live.chess.com/cometd")?;
+
+    // Send handshake
+    let handshake = json!({
+        "channel": "/meta/handshake",
+        "version": "1.0",
+        "supportedConnectionTypes": ["websocket"],
+        "minimumVersion": "1.0"
+    });
+
+    ws.send(&handshake.to_string())?;
+
+    // Wait for handshake response
+    let response = ws.receive()?;
+    let client_id = parse_client_id(&response)?;
+
+    // Subscribe to game events
+    let subscribe = json!({
+        "channel": "/meta/subscribe",
+        "clientId": client_id,
+        "subscription": format!("/game/user/{}", bot.username)
+    });
+
+    ws.send(&subscribe.to_string())?;
+
+    bot.ws = Some(ws);
+    return Ok(());
+}
+
+fn parse_client_id(response: &str) -> Result<String, ChessComError> {
+    let json = parse_json(response)
+        .map_err(|_| ChessComError::ParseError("Invalid handshake response".to_string()))?;
+
+    let client_id = json[0]["clientId"].as_str()
+        .ok_or(ChessComError::ParseError("Missing clientId".to_string()))?;
+
+    return Ok(client_id.to_string());
+}
+
+// ============================================================================
+// MESSAGE PROCESSING
+// ============================================================================
+
+fn process_websocket_messages(bot: &mut ChessComBot) -> Result<(), ChessComError> {
+    let ws = match bot.ws.as_mut() {
+        Some(ws) => ws,
+        None => return Err(ChessComError::NotConnected),
+    };
+
+    // Non-blocking receive
+    while let Some(msg) = ws.try_receive() {
+        let json = parse_json(&msg).ok();
+        if let Some(data) = json {
+            process_message(bot, &data)?;
+        }
+    }
+
+    return Ok(());
+}
+
+fn process_message(bot: &mut ChessComBot, data: &JsonValue) -> Result<(), ChessComError> {
+    // Chess.com messages are arrays
+    let messages = data.as_array().unwrap_or(&vec![data.clone()]);
+
+    for msg in messages {
+        let channel = msg["channel"].as_str().unwrap_or("");
+
+        match channel {
+            c if c.contains("/game/") => {
+                process_game_message(bot, msg)?;
+            }
+            c if c.contains("/challenge/") => {
+                process_challenge_message(bot, msg)?;
+            }
+            "/meta/connect" => {
+                // Connection keepalive, send response
+                send_connect(bot)?;
+            }
+            _ => {}
+        }
+    }
+
+    return Ok(());
+}
+
+fn process_game_message(bot: &mut ChessComBot, msg: &JsonValue) -> Result<(), ChessComError> {
+    let data = &msg["data"];
+    let game_id = data["game"]["id"].as_str().unwrap_or("");
+
+    // Check message type
+    let msg_type = data["type"].as_str().unwrap_or("");
+
+    match msg_type {
+        "gameState" | "move" => {
+            // Update game state
+            if let Some(game) = find_game_mut(&mut bot.active_games, game_id) {
+                update_game_state(game, data);
+
+                // Check if it's our turn
+                if is_our_turn(game, &bot.username) {
+                    make_bot_move(bot, game_id)?;
+                }
+            }
+        }
+        "gameStart" => {
+            // New game started
+            let game = parse_game_from_event(data, &bot.username)?;
+            bot.active_games.push(game);
+            println!("Game started: {}", game_id);
+
+            // If it's our turn, make a move
+            if let Some(game) = find_game(&bot.active_games, game_id) {
+                if is_our_turn(game, &bot.username) {
+                    make_bot_move(bot, game_id)?;
+                }
+            }
+        }
+        "gameEnd" => {
+            // Game ended
+            let result = parse_game_result(data);
+            println!("Game {} ended: {:?}", game_id, result);
+
+            // Remove from active games
+            bot.active_games.retain(|g| g.game_id != game_id);
+        }
+        _ => {}
+    }
+
+    return Ok(());
+}
+
+fn process_challenge_message(bot: &mut ChessComBot, msg: &JsonValue) -> Result<(), ChessComError> {
+    let data = &msg["data"];
+
+    if data["type"].as_str() == Some("challengeCreated") {
+        let challenge_id = data["challenge"]["id"].as_str().unwrap_or("");
+        let challenger = data["challenge"]["challenger"]["username"].as_str().unwrap_or("");
+        let rating = data["challenge"]["challenger"]["rating"].as_i64().unwrap_or(1500) as i32;
+        let time_control = data["challenge"]["timeControl"]["initial"].as_i64().unwrap_or(600) as i32;
+        let is_rated = data["challenge"]["rated"].as_bool().unwrap_or(true);
+
+        println!("Challenge received from {} ({})", challenger, rating);
+
+        // Check if we should accept
+        if should_accept_challenge(bot, rating, time_control, is_rated) {
+            accept_challenge(bot, challenge_id)?;
+        } else {
+            decline_challenge(bot, challenge_id)?;
+        }
+    }
+
+    return Ok(());
+}
+
+fn should_accept_challenge(bot: &ChessComBot, rating: i32, time_control: i32, is_rated: bool) -> bool {
+    // Check concurrent games limit
+    if bot.active_games.len() >= bot.settings.max_concurrent_games {
+        return false;
+    }
+
+    // Check rating
+    if rating < bot.settings.min_rating || rating > bot.settings.max_rating {
+        return false;
+    }
+
+    // Check rated/casual
+    if is_rated && !bot.settings.accept_rated {
+        return false;
+    }
+    if !is_rated && !bot.settings.accept_casual {
+        return false;
+    }
+
+    // Check time control
+    if time_control < 180 && !bot.settings.accept_bullet {
+        return false;
+    }
+    if time_control >= 180 && time_control < 600 && !bot.settings.accept_blitz {
+        return false;
+    }
+    if time_control >= 600 && time_control < 1800 && !bot.settings.accept_rapid {
+        return false;
+    }
+
+    return bot.settings.auto_accept_challenges;
+}
+
+// ============================================================================
+// GAME MANAGEMENT
+// ============================================================================
+
+fn make_bot_move(bot: &mut ChessComBot, game_id: &str) -> Result<(), ChessComError> {
+    let game = find_game(&bot.active_games, game_id)
+        .ok_or(ChessComError::GameNotFound)?;
+
+    // Check opening book
+    if let Some(book_move) = probe_opening_book(&bot.api, &game.board) {
+        send_move(bot, game_id, book_move.mv)?;
+        return Ok(());
+    }
+
+    // Check tablebase
+    let piece_count = game.board.piece_count();
+    if piece_count <= 7 {
+        if let Some(tb_result) = probe_tablebase(&bot.api, &game.board) {
+            if let Some(mv) = tb_result.best_move {
+                send_move(bot, game_id, mv)?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Calculate time for search
+    let time_ms = calculate_move_time(game);
+
+    // Run search
+    let params = SearchParams {
+        depth: 100,
+        time_ms: time_ms,
+        nodes: 0,
+        infinite: false,
+        multi_pv: 1,
+    };
+
+    let result = search_position(&bot.engine, &game.board, params);
+
+    // Check if we should resign
+    if result.score_cp < bot.settings.resign_threshold && result.score_mate.is_none() {
+        resign_game(bot, game_id)?;
+        return Ok(());
+    }
+
+    // Check if we should offer draw
+    if result.score_cp.abs() < bot.settings.offer_draw_threshold.abs() {
+        // Consider offering draw if position is equal
+    }
+
+    // Send the move
+    send_move(bot, game_id, result.best_move)?;
+
+    return Ok(());
+}
+
+fn calculate_move_time(game: &ChessComGame) -> i64 {
+    // Use 1/30th of remaining time
+    let base_time = game.our_time_ms / 30;
+
+    // Minimum and maximum bounds
+    let min_time = 100;  // 100ms minimum
+    let max_time = 30000;  // 30s maximum
+
+    return base_time.max(min_time).min(max_time);
+}
+
+fn send_move(bot: &mut ChessComBot, game_id: &str, mv: Move) -> Result<(), ChessComError> {
+    let move_str = move_to_uci(&mv);
+
+    let msg = json!({
+        "channel": format!("/game/{}/move", game_id),
+        "data": {
+            "move": move_str
+        }
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    // Update local game state
+    if let Some(game) = find_game_mut(&mut bot.active_games, game_id) {
+        game.board = make_move(game.board, mv);
+        game.moves.push(mv);
+        game.status = ChessComGameStatus::TheirTurn;
+    }
+
+    return Ok(());
+}
+
+// ============================================================================
+// CHALLENGE MANAGEMENT
+// ============================================================================
+
+fn accept_challenge(bot: &mut ChessComBot, challenge_id: &str) -> Result<(), ChessComError> {
+    let msg = json!({
+        "channel": format!("/challenge/{}/accept", challenge_id),
+        "data": {}
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    println!("Accepted challenge {}", challenge_id);
+    return Ok(());
+}
+
+fn decline_challenge(bot: &mut ChessComBot, challenge_id: &str) -> Result<(), ChessComError> {
+    let msg = json!({
+        "channel": format!("/challenge/{}/decline", challenge_id),
+        "data": {}
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    println!("Declined challenge {}", challenge_id);
+    return Ok(());
+}
+
+fn resign_game(bot: &mut ChessComBot, game_id: &str) -> Result<(), ChessComError> {
+    let msg = json!({
+        "channel": format!("/game/{}/resign", game_id),
+        "data": {}
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    println!("Resigned game {}", game_id);
+    return Ok(());
+}
+
+fn offer_draw(bot: &mut ChessComBot, game_id: &str) -> Result<(), ChessComError> {
+    let msg = json!({
+        "channel": format!("/game/{}/draw", game_id),
+        "data": {
+            "type": "offer"
+        }
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    return Ok(());
+}
+
+fn abort_game(bot: &mut ChessComBot, game_id: &str) -> Result<(), ChessComError> {
+    let msg = json!({
+        "channel": format!("/game/{}/abort", game_id),
+        "data": {}
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    return Ok(());
+}
+
+// ============================================================================
+// ACTIVE GAMES PROCESSING
+// ============================================================================
+
+fn process_active_games(bot: &mut ChessComBot) -> Result<(), ChessComError> {
+    // Check for games where it's our turn but we haven't made a move
+    let game_ids: Vec<String> = bot.active_games.iter()
+        .filter(|g| matches!(g.status, ChessComGameStatus::OurTurn))
+        .map(|g| g.game_id.clone())
+        .collect();
+
+    for game_id in game_ids {
+        make_bot_move(bot, &game_id)?;
+    }
+
+    return Ok(());
+}
+
+fn send_connect(bot: &mut ChessComBot) -> Result<(), ChessComError> {
+    // Send connect message to keep WebSocket alive
+    let msg = json!({
+        "channel": "/meta/connect",
+        "connectionType": "websocket"
+    });
+
+    if let Some(ref mut ws) = bot.ws {
+        ws.send(&msg.to_string())?;
+    }
+
+    return Ok(());
+}
+
+// ============================================================================
+// PUBLIC API FUNCTIONS
+// ============================================================================
+
+fn get_player_profile(http: &HttpClientPool, username: &str) -> Option<ChessComPlayer> {
+    let url = format!("https://api.chess.com/pub/player/{}", username);
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    return Some(ChessComPlayer {
+        username: json["username"].as_str()?.to_string(),
+        title: json["title"].as_str().map(|s| s.to_string()),
+        status: json["status"].as_str()?.to_string(),
+        is_streamer: json["is_streamer"].as_bool().unwrap_or(false),
+        country: json["country"].as_str().map(|s| s.to_string()),
+        joined: json["joined"].as_i64().unwrap_or(0),
+    });
+}
+
+fn get_player_stats(http: &HttpClientPool, username: &str) -> Option<ChessComStats> {
+    let url = format!("https://api.chess.com/pub/player/{}/stats", username);
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    return Some(ChessComStats {
+        bullet_rating: json["chess_bullet"]["last"]["rating"].as_i64().map(|x| x as i32),
+        blitz_rating: json["chess_blitz"]["last"]["rating"].as_i64().map(|x| x as i32),
+        rapid_rating: json["chess_rapid"]["last"]["rating"].as_i64().map(|x| x as i32),
+        daily_rating: json["chess_daily"]["last"]["rating"].as_i64().map(|x| x as i32),
+        puzzle_rating: json["tactics"]["highest"]["rating"].as_i64().map(|x| x as i32),
+    });
+}
+
+fn get_player_games(
+    http: &HttpClientPool,
+    username: &str,
+    year: i32,
+    month: i32
+) -> Option<Vec<ChessComArchiveGame>> {
+    let url = format!(
+        "https://api.chess.com/pub/player/{}/games/{}/{:02}",
+        username, year, month
+    );
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+    let games_arr = json["games"].as_array()?;
+
+    let mut games = Vec::new();
+    for g in games_arr {
+        games.push(ChessComArchiveGame {
+            url: g["url"].as_str()?.to_string(),
+            pgn: g["pgn"].as_str()?.to_string(),
+            time_control: g["time_control"].as_str()?.to_string(),
+            end_time: g["end_time"].as_i64()?,
+            rated: g["rated"].as_bool().unwrap_or(true),
+            white_username: g["white"]["username"].as_str()?.to_string(),
+            white_rating: g["white"]["rating"].as_i64()? as i32,
+            black_username: g["black"]["username"].as_str()?.to_string(),
+            black_rating: g["black"]["rating"].as_i64()? as i32,
+            result: parse_result_string(g["white"]["result"].as_str()?),
+        });
+    }
+
+    return Some(games);
+}
+
+fn get_titled_players(http: &HttpClientPool, title: &str) -> Option<Vec<String>> {
+    let url = format!("https://api.chess.com/pub/titled/{}", title);
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+    let players = json["players"].as_array()?;
+
+    let mut result = Vec::new();
+    for p in players {
+        if let Some(name) = p.as_str() {
+            result.push(name.to_string());
+        }
+    }
+
+    return Some(result);
+}
+
+fn get_leaderboards(http: &HttpClientPool) -> Option<ChessComLeaderboards> {
+    let url = "https://api.chess.com/pub/leaderboards";
+
+    let response = http.get(url)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    return Some(ChessComLeaderboards {
+        live_bullet: parse_leaderboard(&json["live_bullet"]),
+        live_blitz: parse_leaderboard(&json["live_blitz"]),
+        live_rapid: parse_leaderboard(&json["live_rapid"]),
+        daily: parse_leaderboard(&json["daily"]),
+        tactics: parse_leaderboard(&json["tactics"]),
+    });
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct ChessComPlayer {
+    username: str,
+    title: Option<str>,
+    status: str,
+    is_streamer: bool,
+    country: Option<str>,
+    joined: i64,
+}
+
+struct ChessComStats {
+    bullet_rating: Option<i32>,
+    blitz_rating: Option<i32>,
+    rapid_rating: Option<i32>,
+    daily_rating: Option<i32>,
+    puzzle_rating: Option<i32>,
+}
+
+struct ChessComArchiveGame {
+    url: str,
+    pgn: str,
+    time_control: str,
+    end_time: i64,
+    rated: bool,
+    white_username: str,
+    white_rating: i32,
+    black_username: str,
+    black_rating: i32,
+    result: GameResult,
+}
+
+struct ChessComLeaderboards {
+    live_bullet: Vec<LeaderboardEntry>,
+    live_blitz: Vec<LeaderboardEntry>,
+    live_rapid: Vec<LeaderboardEntry>,
+    daily: Vec<LeaderboardEntry>,
+    tactics: Vec<LeaderboardEntry>,
+}
+
+struct LeaderboardEntry {
+    username: str,
+    rating: i32,
+    rank: i32,
+    title: Option<str>,
+}
+
+enum ChessComError {
+    NotConnected,
+    GameNotFound,
+    WebSocketError(str),
+    HttpError(str),
+    ParseError(str),
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn find_game<'a>(games: &'a [ChessComGame], game_id: &str) -> Option<&'a ChessComGame> {
+    for g in games {
+        if g.game_id == game_id {
+            return Some(g);
+        }
+    }
+    return None;
+}
+
+fn find_game_mut<'a>(games: &'a mut [ChessComGame], game_id: &str) -> Option<&'a mut ChessComGame> {
+    for g in games {
+        if g.game_id == game_id {
+            return Some(g);
+        }
+    }
+    return None;
+}
+
+fn is_our_turn(game: &ChessComGame, username: &str) -> bool {
+    let our_color = if game.white == username {
+        Color::White
+    } else {
+        Color::Black
+    };
+
+    return game.board.side_to_move == our_color;
+}
+
+fn update_game_state(game: &mut ChessComGame, data: &JsonValue) {
+    // Update time
+    if let Some(wtime) = data["wtime"].as_i64() {
+        if game.our_color == Color::White {
+            game.our_time_ms = wtime;
+        } else {
+            game.opponent_time_ms = wtime;
+        }
+    }
+
+    if let Some(btime) = data["btime"].as_i64() {
+        if game.our_color == Color::Black {
+            game.our_time_ms = btime;
+        } else {
+            game.opponent_time_ms = btime;
+        }
+    }
+
+    // Update moves
+    if let Some(last_move) = data["move"].as_str() {
+        if let Some(mv) = parse_uci_move(last_move) {
+            game.board = make_move(game.board, mv);
+            game.moves.push(mv);
+        }
+    }
+
+    // Update status
+    game.status = if is_our_turn(game, &game.white) == (game.our_color == Color::White) {
+        ChessComGameStatus::OurTurn
+    } else {
+        ChessComGameStatus::TheirTurn
+    };
+}
+
+fn parse_game_from_event(data: &JsonValue, username: &str) -> Result<ChessComGame, ChessComError> {
+    let game_data = &data["game"];
+
+    let white = game_data["white"]["username"].as_str()
+        .ok_or(ChessComError::ParseError("Missing white username".to_string()))?;
+    let black = game_data["black"]["username"].as_str()
+        .ok_or(ChessComError::ParseError("Missing black username".to_string()))?;
+
+    let our_color = if white == username {
+        Color::White
+    } else {
+        Color::Black
+    };
+
+    return Ok(ChessComGame {
+        game_id: game_data["id"].as_str().unwrap_or("").to_string(),
+        white: white.to_string(),
+        black: black.to_string(),
+        time_control: game_data["timeControl"]["initial"].as_i64()
+            .map(|x| format!("{}", x))
+            .unwrap_or("600".to_string()),
+        rated: game_data["rated"].as_bool().unwrap_or(true),
+        board: Board::starting_position(),
+        moves: Vec::new(),
+        our_color: our_color,
+        our_time_ms: game_data["timeControl"]["initial"].as_i64().unwrap_or(600) * 1000,
+        opponent_time_ms: game_data["timeControl"]["initial"].as_i64().unwrap_or(600) * 1000,
+        status: if our_color == Color::White {
+            ChessComGameStatus::OurTurn
+        } else {
+            ChessComGameStatus::TheirTurn
+        },
+    });
+}
+
+fn parse_game_result(data: &JsonValue) -> ChessComResult {
+    let result = data["result"].as_str().unwrap_or("");
+    match result {
+        "win" => ChessComResult::Win,
+        "lose" => ChessComResult::Loss,
+        "draw" | "stalemate" | "repetition" | "insufficient" => ChessComResult::Draw,
+        "aborted" => ChessComResult::Aborted,
+        _ => ChessComResult::Draw,
+    }
+}
+
+fn parse_result_string(s: &str) -> GameResult {
+    match s {
+        "win" => GameResult::WhiteWins,
+        "lose" => GameResult::BlackWins,
+        "draw" | "stalemate" | "repetition" | "insufficient" | "agreed" => GameResult::Draw,
+        _ => GameResult::Unknown,
+    }
+}
+
+fn parse_leaderboard(data: &JsonValue) -> Vec<LeaderboardEntry> {
+    let mut entries = Vec::new();
+
+    if let Some(arr) = data.as_array() {
+        for (i, entry) in arr.iter().enumerate() {
+            entries.push(LeaderboardEntry {
+                username: entry["username"].as_str().unwrap_or("").to_string(),
+                rating: entry["score"].as_i64().unwrap_or(0) as i32,
+                rank: (i + 1) as i32,
+                title: entry["title"].as_str().map(|s| s.to_string()),
+            });
+        }
+    }
+
+    return entries;
+}
+
+fn move_to_uci(mv: &Move) -> String {
+    let from_file = (b'a' + mv.from.file() as u8) as char;
+    let from_rank = (b'1' + mv.from.rank() as u8) as char;
+    let to_file = (b'a' + mv.to.file() as u8) as char;
+    let to_rank = (b'1' + mv.to.rank() as u8) as char;
+
+    let mut s = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);
+
+    if let Some(promo) = mv.promotion {
+        let promo_char = match promo {
+            PieceType::Queen => 'q',
+            PieceType::Rook => 'r',
+            PieceType::Bishop => 'b',
+            PieceType::Knight => 'n',
+            _ => 'q',
+        };
+        s.push(promo_char);
+    }
+
+    return s;
+}
+

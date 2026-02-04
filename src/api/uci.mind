@@ -1,0 +1,850 @@
+// NikolaChess - UCI Protocol Implementation
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Full UCI (Universal Chess Interface) protocol implementation
+// Supports all standard UCI commands plus custom extensions
+
+import std.io;
+import std.time;
+import std.thread;
+
+// ============================================================================
+// UCI ENGINE STATE
+// ============================================================================
+
+struct UCIEngine {
+    name: str,
+    author: str,
+    version: str,
+
+    // Options
+    options: UCIOptions,
+
+    // Search state
+    board: Board,
+    searching: bool,
+    stop_flag: AtomicBool,
+    ponder_flag: AtomicBool,
+
+    // Engine components
+    search: SearchState,
+    api: ChessAPI,
+
+    // Debug
+    debug_mode: bool,
+}
+
+struct UCIOptions {
+    hash: usize,              // Hash table size in MB
+    threads: usize,           // Number of search threads
+    multi_pv: usize,          // Number of PV lines
+    ponder: bool,             // Pondering enabled
+    own_book: bool,           // Use own opening book
+    book_file: str,           // Opening book path
+    syzygy_path: str,         // Syzygy tablebase path
+    syzygy_probe_limit: i32,  // Max pieces for TB probe in search
+    move_overhead: i64,       // Move overhead in ms
+    contempt: i32,            // Contempt factor
+    analysis_mode: bool,      // Analysis mode (disable some pruning)
+
+    // NikolaChess custom options
+    use_nnue: bool,           // Use NNUE evaluation
+    nnue_path: str,           // NNUE weights path
+    use_cloud_eval: bool,     // Use cloud evaluation
+    use_lichess_api: bool,    // Use Lichess APIs
+    use_chessdb_api: bool,    // Use ChessDB APIs
+    lan_tablebase: bool,      // Use LAN tablebase server
+    lan_host: str,            // LAN server host
+    lan_port: u16,            // LAN server port
+}
+
+fn default_options() -> UCIOptions {
+    return UCIOptions {
+        hash: 256,
+        threads: 1,
+        multi_pv: 1,
+        ponder: false,
+        own_book: true,
+        book_file: "./books/book.bin".to_string(),
+        syzygy_path: "./syzygy".to_string(),
+        syzygy_probe_limit: 7,
+        move_overhead: 10,
+        contempt: 24,
+        analysis_mode: false,
+
+        use_nnue: true,
+        nnue_path: "./models/nikola.nknn".to_string(),
+        use_cloud_eval: false,
+        use_lichess_api: true,
+        use_chessdb_api: true,
+        lan_tablebase: false,
+        lan_host: "192.168.1.100".to_string(),
+        lan_port: 7777,
+    };
+}
+
+// ============================================================================
+// UCI MAIN LOOP
+// ============================================================================
+
+fn uci_main() {
+    let mut engine = create_uci_engine();
+
+    loop {
+        let line = io.stdin.read_line();
+        if line.is_none() {
+            break;
+        }
+
+        let line = line.unwrap().trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let handled = process_uci_command(&mut engine, &line);
+        if !handled {
+            if engine.debug_mode {
+                println!("info string Unknown command: {}", line);
+            }
+        }
+
+        // Check for quit
+        if line == "quit" {
+            break;
+        }
+    }
+}
+
+fn create_uci_engine() -> UCIEngine {
+    let options = default_options();
+    let api_config = APIConfig::from_uci_options(&options);
+
+    return UCIEngine {
+        name: "NikolaChess".to_string(),
+        author: "STARGA, Inc.".to_string(),
+        version: "1.0.0".to_string(),
+        options: options,
+        board: Board::startpos(),
+        searching: false,
+        stop_flag: AtomicBool::new(false),
+        ponder_flag: AtomicBool::new(false),
+        search: create_search_state(),
+        api: create_api(api_config),
+        debug_mode: false,
+    };
+}
+
+// ============================================================================
+// COMMAND PROCESSING
+// ============================================================================
+
+fn process_uci_command(engine: &mut UCIEngine, line: &str) -> bool {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.is_empty() {
+        return true;
+    }
+
+    let cmd = parts[0];
+
+    match cmd {
+        "uci" => {
+            cmd_uci(engine);
+            return true;
+        }
+        "debug" => {
+            if parts.len() > 1 {
+                engine.debug_mode = parts[1] == "on";
+            }
+            return true;
+        }
+        "isready" => {
+            println!("readyok");
+            return true;
+        }
+        "setoption" => {
+            cmd_setoption(engine, &parts);
+            return true;
+        }
+        "register" => {
+            // Registration not required
+            return true;
+        }
+        "ucinewgame" => {
+            cmd_ucinewgame(engine);
+            return true;
+        }
+        "position" => {
+            cmd_position(engine, &parts);
+            return true;
+        }
+        "go" => {
+            cmd_go(engine, &parts);
+            return true;
+        }
+        "stop" => {
+            cmd_stop(engine);
+            return true;
+        }
+        "ponderhit" => {
+            cmd_ponderhit(engine);
+            return true;
+        }
+        "quit" => {
+            cmd_stop(engine);
+            return true;
+        }
+
+        // Custom NikolaChess commands
+        "d" | "display" => {
+            print_board(&engine.board);
+            return true;
+        }
+        "eval" => {
+            cmd_eval(engine);
+            return true;
+        }
+        "probe" => {
+            cmd_probe(engine);
+            return true;
+        }
+        "bench" => {
+            cmd_bench(engine, &parts);
+            return true;
+        }
+        "perft" => {
+            cmd_perft(engine, &parts);
+            return true;
+        }
+
+        _ => return false,
+    }
+}
+
+// ============================================================================
+// UCI COMMAND HANDLERS
+// ============================================================================
+
+fn cmd_uci(engine: &UCIEngine) {
+    println!("id name {} {}", engine.name, engine.version);
+    println!("id author {}", engine.author);
+    println!("");
+
+    // Standard options
+    println!("option name Hash type spin default {} min 1 max 65536", engine.options.hash);
+    println!("option name Threads type spin default {} min 1 max 512", engine.options.threads);
+    println!("option name MultiPV type spin default {} min 1 max 500", engine.options.multi_pv);
+    println!("option name Ponder type check default {}", if engine.options.ponder { "true" } else { "false" });
+    println!("option name OwnBook type check default {}", if engine.options.own_book { "true" } else { "false" });
+    println!("option name Book File type string default {}", engine.options.book_file);
+    println!("option name SyzygyPath type string default {}", engine.options.syzygy_path);
+    println!("option name SyzygyProbeLimit type spin default {} min 0 max 8", engine.options.syzygy_probe_limit);
+    println!("option name Move Overhead type spin default {} min 0 max 5000", engine.options.move_overhead);
+    println!("option name Contempt type spin default {} min -100 max 100", engine.options.contempt);
+    println!("option name UCI_AnalyseMode type check default {}", if engine.options.analysis_mode { "true" } else { "false" });
+
+    // NikolaChess custom options
+    println!("option name Use NNUE type check default {}", if engine.options.use_nnue { "true" } else { "false" });
+    println!("option name NNUE Path type string default {}", engine.options.nnue_path);
+    println!("option name Use Cloud Eval type check default {}", if engine.options.use_cloud_eval { "true" } else { "false" });
+    println!("option name Use Lichess API type check default {}", if engine.options.use_lichess_api { "true" } else { "false" });
+    println!("option name Use ChessDB API type check default {}", if engine.options.use_chessdb_api { "true" } else { "false" });
+    println!("option name LAN Tablebase type check default {}", if engine.options.lan_tablebase { "true" } else { "false" });
+    println!("option name LAN Host type string default {}", engine.options.lan_host);
+    println!("option name LAN Port type spin default {} min 1 max 65535", engine.options.lan_port);
+
+    println!("uciok");
+}
+
+fn cmd_setoption(engine: &mut UCIEngine, parts: &[&str]) {
+    // Parse: setoption name <name> [value <value>]
+    let mut name_idx = 0;
+    let mut value_idx = 0;
+
+    for (i, &part) in parts.iter().enumerate() {
+        if part == "name" {
+            name_idx = i + 1;
+        } else if part == "value" {
+            value_idx = i + 1;
+        }
+    }
+
+    if name_idx == 0 {
+        return;
+    }
+
+    // Extract name (may have spaces)
+    let name_end = if value_idx > 0 { value_idx - 1 } else { parts.len() };
+    let name = parts[name_idx..name_end].join(" ");
+
+    // Extract value
+    let value = if value_idx > 0 && value_idx < parts.len() {
+        parts[value_idx..].join(" ")
+    } else {
+        String::new()
+    };
+
+    // Set option
+    set_option(engine, &name, &value);
+}
+
+fn set_option(engine: &mut UCIEngine, name: &str, value: &str) {
+    match name.to_lowercase().as_str() {
+        "hash" => {
+            engine.options.hash = value.parse().unwrap_or(256);
+            resize_hash(&mut engine.search, engine.options.hash);
+        }
+        "threads" => {
+            engine.options.threads = value.parse().unwrap_or(1);
+        }
+        "multipv" => {
+            engine.options.multi_pv = value.parse().unwrap_or(1);
+        }
+        "ponder" => {
+            engine.options.ponder = value == "true";
+        }
+        "ownbook" => {
+            engine.options.own_book = value == "true";
+        }
+        "book file" => {
+            engine.options.book_file = value.to_string();
+        }
+        "syzygypath" => {
+            engine.options.syzygy_path = value.to_string();
+            reload_tablebases(&mut engine.api, &value);
+        }
+        "syzygyprobelimit" => {
+            engine.options.syzygy_probe_limit = value.parse().unwrap_or(7);
+        }
+        "move overhead" => {
+            engine.options.move_overhead = value.parse().unwrap_or(10);
+        }
+        "contempt" => {
+            engine.options.contempt = value.parse().unwrap_or(24);
+        }
+        "uci_analysemode" => {
+            engine.options.analysis_mode = value == "true";
+        }
+        "use nnue" => {
+            engine.options.use_nnue = value == "true";
+        }
+        "nnue path" => {
+            engine.options.nnue_path = value.to_string();
+            reload_nnue(&mut engine.search, &value);
+        }
+        "use cloud eval" => {
+            engine.options.use_cloud_eval = value == "true";
+        }
+        "use lichess api" => {
+            engine.options.use_lichess_api = value == "true";
+        }
+        "use chessdb api" => {
+            engine.options.use_chessdb_api = value == "true";
+        }
+        "lan tablebase" => {
+            engine.options.lan_tablebase = value == "true";
+        }
+        "lan host" => {
+            engine.options.lan_host = value.to_string();
+        }
+        "lan port" => {
+            engine.options.lan_port = value.parse().unwrap_or(7777);
+        }
+        _ => {
+            if engine.debug_mode {
+                println!("info string Unknown option: {}", name);
+            }
+        }
+    }
+}
+
+fn cmd_ucinewgame(engine: &mut UCIEngine) {
+    engine.board = Board::startpos();
+    clear_hash(&mut engine.search);
+    reset_stats(&mut engine.api);
+}
+
+fn cmd_position(engine: &mut UCIEngine, parts: &[&str]) {
+    // Parse: position [startpos | fen <fen>] [moves <move1> <move2> ...]
+    let mut pos = 1;
+
+    if pos >= parts.len() {
+        return;
+    }
+
+    // Set starting position
+    if parts[pos] == "startpos" {
+        engine.board = Board::startpos();
+        pos += 1;
+    } else if parts[pos] == "fen" {
+        pos += 1;
+        // Collect FEN string (up to "moves" or end)
+        let mut fen_parts = Vec::new();
+        while pos < parts.len() && parts[pos] != "moves" {
+            fen_parts.push(parts[pos]);
+            pos += 1;
+        }
+        let fen = fen_parts.join(" ");
+        engine.board = from_fen(&fen).unwrap_or(Board::startpos());
+    }
+
+    // Apply moves
+    if pos < parts.len() && parts[pos] == "moves" {
+        pos += 1;
+        while pos < parts.len() {
+            if let Some(mv) = parse_uci_move_in_position(&engine.board, parts[pos]) {
+                engine.board = make_move(engine.board, mv);
+            }
+            pos += 1;
+        }
+    }
+}
+
+fn cmd_go(engine: &mut UCIEngine, parts: &[&str]) {
+    // Parse go parameters
+    let mut params = GoParams::default();
+
+    let mut i = 1;
+    while i < parts.len() {
+        match parts[i] {
+            "searchmoves" => {
+                i += 1;
+                while i < parts.len() && !is_go_keyword(parts[i]) {
+                    if let Some(mv) = parse_uci_move_in_position(&engine.board, parts[i]) {
+                        params.search_moves.push(mv);
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            "ponder" => {
+                params.ponder = true;
+            }
+            "wtime" => {
+                i += 1;
+                params.wtime = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "btime" => {
+                i += 1;
+                params.btime = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "winc" => {
+                i += 1;
+                params.winc = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "binc" => {
+                i += 1;
+                params.binc = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "movestogo" => {
+                i += 1;
+                params.movestogo = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "depth" => {
+                i += 1;
+                params.depth = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "nodes" => {
+                i += 1;
+                params.nodes = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "mate" => {
+                i += 1;
+                params.mate = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "movetime" => {
+                i += 1;
+                params.movetime = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "infinite" => {
+                params.infinite = true;
+            }
+            "perft" => {
+                i += 1;
+                let depth = parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                run_perft(&engine.board, depth);
+                return;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Start search
+    start_search(engine, params);
+}
+
+fn is_go_keyword(s: &str) -> bool {
+    matches!(s, "searchmoves" | "ponder" | "wtime" | "btime" | "winc" | "binc" |
+               "movestogo" | "depth" | "nodes" | "mate" | "movetime" | "infinite" | "perft")
+}
+
+fn cmd_stop(engine: &mut UCIEngine) {
+    engine.stop_flag.store(true, Ordering::SeqCst);
+}
+
+fn cmd_ponderhit(engine: &mut UCIEngine) {
+    engine.ponder_flag.store(false, Ordering::SeqCst);
+}
+
+// ============================================================================
+// GO PARAMETERS
+// ============================================================================
+
+struct GoParams {
+    search_moves: Vec<Move>,
+    ponder: bool,
+    wtime: i64,
+    btime: i64,
+    winc: i64,
+    binc: i64,
+    movestogo: i32,
+    depth: i32,
+    nodes: i64,
+    mate: i32,
+    movetime: i64,
+    infinite: bool,
+}
+
+fn GoParams::default() -> GoParams {
+    return GoParams {
+        search_moves: Vec::new(),
+        ponder: false,
+        wtime: 0,
+        btime: 0,
+        winc: 0,
+        binc: 0,
+        movestogo: 0,
+        depth: 0,
+        nodes: 0,
+        mate: 0,
+        movetime: 0,
+        infinite: false,
+    };
+}
+
+// ============================================================================
+// SEARCH EXECUTION
+// ============================================================================
+
+fn start_search(engine: &mut UCIEngine, params: GoParams) {
+    engine.stop_flag.store(false, Ordering::SeqCst);
+    engine.searching = true;
+
+    // Calculate time allocation
+    let time_ms = calculate_time(&engine.board, &params, &engine.options);
+    let depth = if params.depth > 0 { params.depth } else { 64 };
+
+    // Check opening book first
+    if engine.options.own_book && !params.infinite {
+        if let Some(book_result) = probe_opening(&mut engine.api, engine.board, &engine.options.book_file) {
+            if !book_result.moves.is_empty() {
+                let book_move = select_book_move(&book_result.moves);
+                println!("bestmove {}", move_to_uci(book_move));
+                engine.searching = false;
+                return;
+            }
+        }
+    }
+
+    // Run search in separate thread
+    let board = engine.board.clone();
+    let stop_flag = engine.stop_flag.clone();
+    let search = engine.search.clone();
+    let api = engine.api.clone();
+    let options = engine.options.clone();
+    let multi_pv = options.multi_pv;
+
+    thread.spawn(move || {
+        let result = run_search(
+            &mut search,
+            &mut api,
+            board,
+            depth,
+            time_ms,
+            &stop_flag,
+            multi_pv,
+            &options
+        );
+
+        // Output best move
+        let best_move_str = move_to_uci(result.best_move);
+        if let Some(ponder_move) = result.pv.get(1) {
+            println!("bestmove {} ponder {}", best_move_str, move_to_uci(*ponder_move));
+        } else {
+            println!("bestmove {}", best_move_str);
+        }
+    });
+}
+
+fn calculate_time(board: &Board, params: &GoParams, options: &UCIOptions) -> i64 {
+    if params.infinite {
+        return i64::MAX;
+    }
+
+    if params.movetime > 0 {
+        return params.movetime - options.move_overhead;
+    }
+
+    let (our_time, our_inc) = if board.side_to_move == 0 {
+        (params.wtime, params.winc)
+    } else {
+        (params.btime, params.binc)
+    };
+
+    if our_time == 0 {
+        return 10000;  // Default 10 seconds
+    }
+
+    let moves_to_go = if params.movestogo > 0 {
+        params.movestogo
+    } else {
+        30  // Estimate 30 moves remaining
+    };
+
+    let base_time = our_time / moves_to_go as i64;
+    let time_with_inc = base_time + our_inc * 3 / 4;
+
+    // Never use more than 1/3 of remaining time
+    let max_time = our_time / 3;
+    let allocated = time_with_inc.min(max_time);
+
+    return (allocated - options.move_overhead).max(10);
+}
+
+fn run_search(
+    search: &mut SearchState,
+    api: &mut ChessAPI,
+    board: Board,
+    max_depth: i32,
+    time_ms: i64,
+    stop_flag: &AtomicBool,
+    multi_pv: usize,
+    options: &UCIOptions
+) -> SearchResult {
+    // Run iterative deepening search
+    search_iterative(search, api, board, max_depth, time_ms, stop_flag, multi_pv, options)
+}
+
+fn search_iterative(
+    search: &mut SearchState,
+    api: &mut ChessAPI,
+    board: Board,
+    max_depth: i32,
+    time_ms: i64,
+    stop_flag: &AtomicBool,
+    multi_pv: usize,
+    options: &UCIOptions
+) -> SearchResult {
+    let start = time.now_ms();
+    let mut best_result = SearchResult::default();
+
+    for depth in 1..=max_depth {
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let elapsed = time.now_ms() - start;
+        if elapsed > time_ms {
+            break;
+        }
+
+        // Search at this depth
+        let result = search_root(search, api, board, depth, stop_flag, options);
+
+        if !stop_flag.load(Ordering::SeqCst) {
+            best_result = result;
+
+            // Output info
+            let elapsed = time.now_ms() - start;
+            let nps = if elapsed > 0 {
+                (best_result.nodes * 1000) / elapsed
+            } else {
+                0
+            };
+
+            print_uci_info(depth, &best_result, elapsed, nps);
+        }
+
+        // Time management: if we've used > 50% of time, don't start new iteration
+        let elapsed = time.now_ms() - start;
+        if elapsed > time_ms / 2 {
+            break;
+        }
+    }
+
+    return best_result;
+}
+
+fn print_uci_info(depth: i32, result: &SearchResult, time_ms: i64, nps: i64) {
+    let score_str = if let Some(mate) = result.mate_in {
+        format!("mate {}", mate)
+    } else {
+        format!("cp {}", result.score)
+    };
+
+    let pv_str = result.pv.iter()
+        .map(|m| move_to_uci(*m))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!("info depth {} seldepth {} score {} nodes {} time {} nps {} pv {}",
+             depth, result.seldepth, score_str, result.nodes, time_ms, nps, pv_str);
+}
+
+// ============================================================================
+// CUSTOM COMMANDS
+// ============================================================================
+
+fn cmd_eval(engine: &mut UCIEngine) {
+    let score = evaluate_position(&engine.search, &engine.board);
+    println!("info string Static eval: {} cp", score);
+
+    // Try cloud eval
+    if let Some(cloud) = probe_cloud(&mut engine.api, board_to_fen(&engine.board)) {
+        println!("info string Cloud eval: {} cp (depth {})", cloud.score_cp, cloud.depth);
+    }
+
+    // Try tablebase
+    let pieces = popcount(engine.board.occupancy[0] | engine.board.occupancy[1]);
+    if pieces <= 7 {
+        if let Some(tb) = probe_syzygy(&mut engine.api.syzygy, engine.board) {
+            println!("info string Tablebase: WDL={} DTZ={}", tb.wdl, tb.dtz);
+        }
+    }
+}
+
+fn cmd_probe(engine: &mut UCIEngine) {
+    let result = probe_position(&mut engine.api, engine.board);
+
+    match result {
+        ProbeResult::Tablebase(tb) => {
+            println!("info string Tablebase hit ({}): WDL={} DTZ={} best={}",
+                     tb.source, tb.wdl, tb.dtz, move_to_uci(tb.best_move));
+        }
+        ProbeResult::Book(book) => {
+            println!("info string Book hit ({}):", book.source);
+            for (i, mv) in book.moves.iter().take(5).enumerate() {
+                println!("info string   {}. {} (weight={}, win={:.1}%)",
+                         i + 1, move_to_uci(mv.mv), mv.weight, calc_win_rate(mv) * 100.0);
+            }
+        }
+        ProbeResult::CloudEval(cloud) => {
+            println!("info string Cloud eval ({}): {} cp depth={} pv={}",
+                     cloud.source, cloud.score_cp, cloud.depth,
+                     cloud.pv.iter().map(|m| move_to_uci(*m)).collect::<Vec<_>>().join(" "));
+        }
+        ProbeResult::None => {
+            println!("info string No probe result");
+        }
+        _ => {}
+    }
+}
+
+fn cmd_bench(engine: &mut UCIEngine, parts: &[&str]) {
+    let depth = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(12);
+    run_benchmark(&mut engine.search, depth);
+}
+
+fn cmd_perft(engine: &mut UCIEngine, parts: &[&str]) {
+    let depth = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+    run_perft(&engine.board, depth);
+}
+
+fn run_perft(board: &Board, depth: i32) {
+    let start = time.now_ms();
+    let nodes = perft(board, depth);
+    let elapsed = time.now_ms() - start;
+    let nps = if elapsed > 0 { (nodes * 1000) / elapsed as u64 } else { 0 };
+
+    println!("info string Perft({}) = {} nodes in {}ms ({} nps)", depth, nodes, elapsed, nps);
+}
+
+fn perft(board: &Board, depth: i32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = generate_moves(*board);
+    if depth == 1 {
+        return moves.len() as u64;
+    }
+
+    let mut nodes: u64 = 0;
+    for mv in moves {
+        let new_board = make_move(*board, mv);
+        nodes += perft(&new_board, depth - 1);
+    }
+
+    return nodes;
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn move_to_uci(mv: Move) -> String {
+    let from_file = (mv.from % 8) as u8 + b'a';
+    let from_rank = (mv.from / 8) as u8 + b'1';
+    let to_file = (mv.to % 8) as u8 + b'a';
+    let to_rank = (mv.to / 8) as u8 + b'1';
+
+    let mut uci = format!("{}{}{}{}", from_file as char, from_rank as char,
+                          to_file as char, to_rank as char);
+
+    if mv.promotion != 0 {
+        let promo_char = match mv.promotion % 6 {
+            KNIGHT => 'n',
+            BISHOP => 'b',
+            ROOK => 'r',
+            QUEEN => 'q',
+            _ => ' ',
+        };
+        uci.push(promo_char);
+    }
+
+    return uci;
+}
+
+fn parse_uci_move_in_position(board: &Board, uci: &str) -> Option<Move> {
+    if uci.len() < 4 {
+        return None;
+    }
+
+    let from_file = (uci.as_bytes()[0] - b'a') as i32;
+    let from_rank = (uci.as_bytes()[1] - b'1') as i32;
+    let to_file = (uci.as_bytes()[2] - b'a') as i32;
+    let to_rank = (uci.as_bytes()[3] - b'1') as i32;
+
+    if from_file < 0 || from_file > 7 || from_rank < 0 || from_rank > 7 ||
+       to_file < 0 || to_file > 7 || to_rank < 0 || to_rank > 7 {
+        return None;
+    }
+
+    let from = from_rank * 8 + from_file;
+    let to = to_rank * 8 + to_file;
+
+    let promotion = if uci.len() > 4 {
+        match uci.as_bytes()[4] {
+            b'n' => KNIGHT,
+            b'b' => BISHOP,
+            b'r' => ROOK,
+            b'q' => QUEEN,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
+    // Find matching legal move
+    let moves = generate_moves(*board);
+    for mv in moves {
+        if mv.from == from && mv.to == to {
+            if promotion == 0 || mv.promotion == promotion {
+                return Some(mv);
+            }
+        }
+    }
+
+    return None;
+}

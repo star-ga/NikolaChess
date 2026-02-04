@@ -1,0 +1,806 @@
+// NikolaChess - Player Database API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Player information and statistics:
+// - Lichess player API
+// - Chess.com player API
+// - FIDE ratings lookup
+// - Player statistics and history
+
+import std.sync;
+import std.time;
+
+// ============================================================================
+// PLAYER STRUCTURE
+// ============================================================================
+
+struct Player {
+    username: str,
+    real_name: Option<str>,
+    title: Option<str>,         // GM, IM, FM, CM, WGM, etc.
+    fide_id: Option<i32>,
+    country: Option<str>,
+    bio: Option<str>,
+    created_at: i64,
+    last_seen: i64,
+    is_online: bool,
+    is_streaming: bool,
+    patron: bool,               // Lichess patron
+    verified: bool,
+
+    // Ratings
+    ratings: PlayerRatings,
+
+    // Statistics
+    stats: PlayerStats,
+
+    // Source
+    source: str,
+}
+
+struct PlayerRatings {
+    bullet: Option<Rating>,
+    blitz: Option<Rating>,
+    rapid: Option<Rating>,
+    classical: Option<Rating>,
+    correspondence: Option<Rating>,
+    puzzle: Option<Rating>,
+    fide_standard: Option<i32>,
+    fide_rapid: Option<i32>,
+    fide_blitz: Option<i32>,
+}
+
+struct Rating {
+    rating: i32,
+    rd: i32,        // Rating deviation
+    prog: i32,      // Progress (change)
+    games: i32,     // Number of games
+    prov: bool,     // Provisional
+}
+
+struct PlayerStats {
+    total_games: i64,
+    wins: i64,
+    losses: i64,
+    draws: i64,
+    time_playing: i64,  // Total time in seconds
+    peak_rating: Option<PeakRating>,
+}
+
+struct PeakRating {
+    rating: i32,
+    date: str,
+    time_control: str,
+}
+
+// ============================================================================
+// PLAYER LOOKUP
+// ============================================================================
+
+struct PlayerLookup {
+    http: HttpClientPool,
+    cache: LRUCache<String, Player>,
+    cache_ttl_ms: i64,
+}
+
+impl PlayerLookup {
+    fn new() -> PlayerLookup {
+        return PlayerLookup {
+            http: HttpClientPool::new(4),
+            cache: LRUCache::new(10000),
+            cache_ttl_ms: 300000,  // 5 minute cache
+        };
+    }
+
+    fn get_player(&mut self, username: &str, source: &str) -> Option<Player> {
+        // Check cache
+        let cache_key = format!("{}:{}", source, username.to_lowercase());
+        if let Some(cached) = self.cache.get(&cache_key) {
+            return Some(cached.clone());
+        }
+
+        // Fetch from source
+        let player = match source {
+            "lichess" => fetch_lichess_player(&self.http, username),
+            "chesscom" => fetch_chesscom_player(&self.http, username),
+            "fide" => fetch_fide_player(&self.http, username),
+            _ => None,
+        };
+
+        // Cache result
+        if let Some(ref p) = player {
+            self.cache.insert(cache_key, p.clone());
+        }
+
+        return player;
+    }
+
+    fn search_players(&self, query: &str, source: &str) -> Vec<PlayerSearchResult> {
+        match source {
+            "lichess" => search_lichess_players(&self.http, query),
+            "chesscom" => search_chesscom_players(&self.http, query),
+            "fide" => search_fide_players(&self.http, query),
+            _ => Vec::new(),
+        }
+    }
+
+    fn get_rating_history(&self, username: &str, source: &str) -> Option<RatingHistory> {
+        match source {
+            "lichess" => fetch_lichess_rating_history(&self.http, username),
+            _ => None,
+        }
+    }
+}
+
+struct PlayerSearchResult {
+    username: str,
+    real_name: Option<str>,
+    title: Option<str>,
+    rating: Option<i32>,
+    source: str,
+}
+
+// ============================================================================
+// LICHESS API
+// ============================================================================
+
+fn fetch_lichess_player(http: &HttpClientPool, username: &str) -> Option<Player> {
+    let url = format!("https://lichess.org/api/user/{}", username);
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    let perfs = &json["perfs"];
+
+    let ratings = PlayerRatings {
+        bullet: parse_lichess_rating(&perfs["bullet"]),
+        blitz: parse_lichess_rating(&perfs["blitz"]),
+        rapid: parse_lichess_rating(&perfs["rapid"]),
+        classical: parse_lichess_rating(&perfs["classical"]),
+        correspondence: parse_lichess_rating(&perfs["correspondence"]),
+        puzzle: parse_lichess_rating(&perfs["puzzle"]),
+        fide_standard: None,
+        fide_rapid: None,
+        fide_blitz: None,
+    };
+
+    let count = &json["count"];
+    let stats = PlayerStats {
+        total_games: count["all"].as_i64().unwrap_or(0),
+        wins: count["win"].as_i64().unwrap_or(0),
+        losses: count["loss"].as_i64().unwrap_or(0),
+        draws: count["draw"].as_i64().unwrap_or(0),
+        time_playing: json["playTime"]["total"].as_i64().unwrap_or(0),
+        peak_rating: None,
+    };
+
+    return Some(Player {
+        username: json["username"].as_str()?.to_string(),
+        real_name: json["profile"]["realName"].as_str().map(|s| s.to_string()),
+        title: json["title"].as_str().map(|s| s.to_string()),
+        fide_id: json["profile"]["fideRating"].as_i64().map(|x| x as i32),
+        country: json["profile"]["country"].as_str().map(|s| s.to_string()),
+        bio: json["profile"]["bio"].as_str().map(|s| s.to_string()),
+        created_at: json["createdAt"].as_i64().unwrap_or(0),
+        last_seen: json["seenAt"].as_i64().unwrap_or(0),
+        is_online: json["online"].as_bool().unwrap_or(false),
+        is_streaming: json["streaming"].as_bool().unwrap_or(false),
+        patron: json["patron"].as_bool().unwrap_or(false),
+        verified: json["verified"].as_bool().unwrap_or(false),
+        ratings: ratings,
+        stats: stats,
+        source: "lichess".to_string(),
+    });
+}
+
+fn parse_lichess_rating(json: &JsonValue) -> Option<Rating> {
+    let rating = json["rating"].as_i64()? as i32;
+
+    return Some(Rating {
+        rating: rating,
+        rd: json["rd"].as_i64().unwrap_or(0) as i32,
+        prog: json["prog"].as_i64().unwrap_or(0) as i32,
+        games: json["games"].as_i64().unwrap_or(0) as i32,
+        prov: json["prov"].as_bool().unwrap_or(false),
+    });
+}
+
+fn search_lichess_players(http: &HttpClientPool, query: &str) -> Vec<PlayerSearchResult> {
+    let url = format!("https://lichess.org/api/player/autocomplete?term={}", url_encode(query));
+
+    let response = match http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(5000)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if response.status != 200 {
+        return Vec::new();
+    }
+
+    let json = match response.json() {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+
+    if let Some(arr) = json.as_array() {
+        for item in arr {
+            results.push(PlayerSearchResult {
+                username: item.as_str().unwrap_or("").to_string(),
+                real_name: None,
+                title: None,
+                rating: None,
+                source: "lichess".to_string(),
+            });
+        }
+    }
+
+    return results;
+}
+
+fn fetch_lichess_rating_history(http: &HttpClientPool, username: &str) -> Option<RatingHistory> {
+    let url = format!("https://lichess.org/api/user/{}/rating-history", username);
+
+    let response = http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+    let arr = json.as_array()?;
+
+    let mut history = RatingHistory {
+        bullet: Vec::new(),
+        blitz: Vec::new(),
+        rapid: Vec::new(),
+        classical: Vec::new(),
+    };
+
+    for entry in arr {
+        let name = entry["name"].as_str().unwrap_or("");
+        let points = entry["points"].as_array();
+
+        if let Some(pts) = points {
+            let data: Vec<RatingPoint> = pts.iter()
+                .filter_map(|p| {
+                    let arr = p.as_array()?;
+                    if arr.len() >= 4 {
+                        Some(RatingPoint {
+                            year: arr[0].as_i64()? as i32,
+                            month: arr[1].as_i64()? as i32,
+                            day: arr[2].as_i64()? as i32,
+                            rating: arr[3].as_i64()? as i32,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            match name {
+                "Bullet" => history.bullet = data,
+                "Blitz" => history.blitz = data,
+                "Rapid" => history.rapid = data,
+                "Classical" => history.classical = data,
+                _ => {}
+            }
+        }
+    }
+
+    return Some(history);
+}
+
+// ============================================================================
+// CHESS.COM API
+// ============================================================================
+
+fn fetch_chesscom_player(http: &HttpClientPool, username: &str) -> Option<Player> {
+    // Fetch profile
+    let profile_url = format!("https://api.chess.com/pub/player/{}", username);
+    let profile_response = http.get(&profile_url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send()
+        .ok()?;
+
+    if profile_response.status != 200 {
+        return None;
+    }
+
+    let profile = profile_response.json().ok()?;
+
+    // Fetch stats
+    let stats_url = format!("https://api.chess.com/pub/player/{}/stats", username);
+    let stats_response = http.get(&stats_url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send();
+
+    let stats_json = stats_response.ok()
+        .and_then(|r| if r.status == 200 { r.json().ok() } else { None });
+
+    let ratings = if let Some(ref stats) = stats_json {
+        PlayerRatings {
+            bullet: parse_chesscom_rating(&stats["chess_bullet"]),
+            blitz: parse_chesscom_rating(&stats["chess_blitz"]),
+            rapid: parse_chesscom_rating(&stats["chess_rapid"]),
+            classical: None,
+            correspondence: parse_chesscom_rating(&stats["chess_daily"]),
+            puzzle: parse_chesscom_rating(&stats["tactics"]),
+            fide_standard: profile["fide"].as_i64().map(|x| x as i32),
+            fide_rapid: None,
+            fide_blitz: None,
+        }
+    } else {
+        PlayerRatings {
+            bullet: None,
+            blitz: None,
+            rapid: None,
+            classical: None,
+            correspondence: None,
+            puzzle: None,
+            fide_standard: None,
+            fide_rapid: None,
+            fide_blitz: None,
+        }
+    };
+
+    let player_stats = if let Some(ref stats) = stats_json {
+        let bullet = &stats["chess_bullet"]["record"];
+        let blitz = &stats["chess_blitz"]["record"];
+        let rapid = &stats["chess_rapid"]["record"];
+
+        let total_wins = bullet["win"].as_i64().unwrap_or(0) +
+            blitz["win"].as_i64().unwrap_or(0) +
+            rapid["win"].as_i64().unwrap_or(0);
+
+        let total_losses = bullet["loss"].as_i64().unwrap_or(0) +
+            blitz["loss"].as_i64().unwrap_or(0) +
+            rapid["loss"].as_i64().unwrap_or(0);
+
+        let total_draws = bullet["draw"].as_i64().unwrap_or(0) +
+            blitz["draw"].as_i64().unwrap_or(0) +
+            rapid["draw"].as_i64().unwrap_or(0);
+
+        PlayerStats {
+            total_games: total_wins + total_losses + total_draws,
+            wins: total_wins,
+            losses: total_losses,
+            draws: total_draws,
+            time_playing: 0,
+            peak_rating: None,
+        }
+    } else {
+        PlayerStats {
+            total_games: 0,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            time_playing: 0,
+            peak_rating: None,
+        }
+    };
+
+    return Some(Player {
+        username: profile["username"].as_str()?.to_string(),
+        real_name: profile["name"].as_str().map(|s| s.to_string()),
+        title: profile["title"].as_str().map(|s| s.to_string()),
+        fide_id: None,
+        country: extract_country_from_url(profile["country"].as_str()),
+        bio: None,
+        created_at: profile["joined"].as_i64().unwrap_or(0) * 1000,
+        last_seen: profile["last_online"].as_i64().unwrap_or(0) * 1000,
+        is_online: profile["status"].as_str() == Some("online"),
+        is_streaming: profile["is_streamer"].as_bool().unwrap_or(false),
+        patron: false,
+        verified: profile["verified"].as_bool().unwrap_or(false),
+        ratings: ratings,
+        stats: player_stats,
+        source: "chesscom".to_string(),
+    });
+}
+
+fn parse_chesscom_rating(json: &JsonValue) -> Option<Rating> {
+    let last = &json["last"];
+    let rating = last["rating"].as_i64()? as i32;
+
+    return Some(Rating {
+        rating: rating,
+        rd: last["rd"].as_i64().unwrap_or(0) as i32,
+        prog: 0,
+        games: json["record"]["win"].as_i64().unwrap_or(0) as i32 +
+               json["record"]["loss"].as_i64().unwrap_or(0) as i32 +
+               json["record"]["draw"].as_i64().unwrap_or(0) as i32,
+        prov: false,
+    });
+}
+
+fn extract_country_from_url(url: Option<&str>) -> Option<String> {
+    // Chess.com returns country as URL like "https://api.chess.com/pub/country/US"
+    url.and_then(|u| u.rsplit('/').next().map(|s| s.to_string()))
+}
+
+fn search_chesscom_players(http: &HttpClientPool, query: &str) -> Vec<PlayerSearchResult> {
+    // Chess.com doesn't have a direct search API
+    // We can try to fetch the player directly
+    if let Some(player) = fetch_chesscom_player(http, query) {
+        return vec![PlayerSearchResult {
+            username: player.username,
+            real_name: player.real_name,
+            title: player.title,
+            rating: player.ratings.blitz.map(|r| r.rating),
+            source: "chesscom".to_string(),
+        }];
+    }
+    return Vec::new();
+}
+
+// ============================================================================
+// FIDE API
+// ============================================================================
+
+fn fetch_fide_player(http: &HttpClientPool, query: &str) -> Option<Player> {
+    // FIDE doesn't have a public API, but we can scrape some data
+    // This is a simplified implementation
+
+    // Try to parse as FIDE ID
+    let fide_id: Option<i32> = query.parse().ok();
+
+    if let Some(id) = fide_id {
+        return fetch_fide_player_by_id(http, id);
+    }
+
+    // Search by name
+    let results = search_fide_players(http, query);
+    if let Some(first) = results.into_iter().next() {
+        // We don't have the full profile from search
+        return None;
+    }
+
+    return None;
+}
+
+fn fetch_fide_player_by_id(http: &HttpClientPool, fide_id: i32) -> Option<Player> {
+    // Note: This would require scraping FIDE website or using unofficial APIs
+    // For now, return basic info
+
+    let url = format!(
+        "https://ratings.fide.com/profile/{}",
+        fide_id
+    );
+
+    // FIDE doesn't provide JSON API, would need HTML scraping
+    // This is a placeholder for the structure
+
+    return None;
+}
+
+fn search_fide_players(http: &HttpClientPool, query: &str) -> Vec<PlayerSearchResult> {
+    // FIDE search would require scraping
+    // Placeholder implementation
+    return Vec::new();
+}
+
+// ============================================================================
+// RATING HISTORY
+// ============================================================================
+
+struct RatingHistory {
+    bullet: Vec<RatingPoint>,
+    blitz: Vec<RatingPoint>,
+    rapid: Vec<RatingPoint>,
+    classical: Vec<RatingPoint>,
+}
+
+struct RatingPoint {
+    year: i32,
+    month: i32,
+    day: i32,
+    rating: i32,
+}
+
+impl RatingHistory {
+    fn get_latest(&self, time_control: &str) -> Option<i32> {
+        let history = match time_control {
+            "bullet" => &self.bullet,
+            "blitz" => &self.blitz,
+            "rapid" => &self.rapid,
+            "classical" => &self.classical,
+            _ => return None,
+        };
+
+        history.last().map(|p| p.rating)
+    }
+
+    fn get_peak(&self, time_control: &str) -> Option<(i32, String)> {
+        let history = match time_control {
+            "bullet" => &self.bullet,
+            "blitz" => &self.blitz,
+            "rapid" => &self.rapid,
+            "classical" => &self.classical,
+            _ => return None,
+        };
+
+        history.iter()
+            .max_by_key(|p| p.rating)
+            .map(|p| (p.rating, format!("{}-{:02}-{:02}", p.year, p.month, p.day)))
+    }
+
+    fn get_change(&self, time_control: &str, days: i32) -> Option<i32> {
+        let history = match time_control {
+            "bullet" => &self.bullet,
+            "blitz" => &self.blitz,
+            "rapid" => &self.rapid,
+            "classical" => &self.classical,
+            _ => return None,
+        };
+
+        if history.len() < 2 {
+            return None;
+        }
+
+        let current = history.last()?.rating;
+
+        // Find rating from `days` ago
+        let target_idx = history.len().saturating_sub(days as usize);
+        let past = history.get(target_idx)?.rating;
+
+        return Some(current - past);
+    }
+}
+
+// ============================================================================
+// TITLED PLAYERS
+// ============================================================================
+
+struct TitledPlayersCache {
+    players: HashMap<String, Vec<String>>,
+    last_updated: HashMap<String, Instant>,
+    ttl: Duration,
+}
+
+impl TitledPlayersCache {
+    fn new() -> TitledPlayersCache {
+        return TitledPlayersCache {
+            players: HashMap::new(),
+            last_updated: HashMap::new(),
+            ttl: Duration::from_secs(3600),  // 1 hour cache
+        };
+    }
+
+    fn get_titled(&mut self, http: &HttpClientPool, title: &str, source: &str) -> Vec<String> {
+        let cache_key = format!("{}:{}", source, title);
+
+        // Check cache
+        if let Some(updated) = self.last_updated.get(&cache_key) {
+            if updated.elapsed() < self.ttl {
+                if let Some(players) = self.players.get(&cache_key) {
+                    return players.clone();
+                }
+            }
+        }
+
+        // Fetch from source
+        let players = match source {
+            "lichess" => fetch_lichess_titled(http, title),
+            "chesscom" => fetch_chesscom_titled(http, title),
+            _ => Vec::new(),
+        };
+
+        // Update cache
+        self.players.insert(cache_key.clone(), players.clone());
+        self.last_updated.insert(cache_key, Instant::now());
+
+        return players;
+    }
+}
+
+fn fetch_lichess_titled(http: &HttpClientPool, title: &str) -> Vec<String> {
+    let url = format!("https://lichess.org/api/player/titled?titles={}", title);
+
+    let response = match http.get(&url)
+        .header("Accept", "application/x-ndjson")
+        .timeout(30000)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if response.status != 200 {
+        return Vec::new();
+    }
+
+    let text = match response.text() {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut players = Vec::new();
+    for line in text.lines() {
+        if let Ok(json) = parse_json(line) {
+            if let Some(username) = json["username"].as_str() {
+                players.push(username.to_string());
+            }
+        }
+    }
+
+    return players;
+}
+
+fn fetch_chesscom_titled(http: &HttpClientPool, title: &str) -> Vec<String> {
+    let url = format!("https://api.chess.com/pub/titled/{}", title);
+
+    let response = match http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if response.status != 200 {
+        return Vec::new();
+    }
+
+    let json = match response.json() {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut players = Vec::new();
+    if let Some(arr) = json["players"].as_array() {
+        for p in arr {
+            if let Some(name) = p.as_str() {
+                players.push(name.to_string());
+            }
+        }
+    }
+
+    return players;
+}
+
+// ============================================================================
+// LEADERBOARDS
+// ============================================================================
+
+fn get_lichess_leaderboard(http: &HttpClientPool, time_control: &str, count: i32) -> Vec<LeaderboardEntry> {
+    let url = format!(
+        "https://lichess.org/api/player/top/{}/{}",
+        count, time_control
+    );
+
+    let response = match http.get(&url)
+        .header("Accept", "application/json")
+        .timeout(10000)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    if response.status != 200 {
+        return Vec::new();
+    }
+
+    let json = match response.json() {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entries = Vec::new();
+    if let Some(users) = json["users"].as_array() {
+        for (i, user) in users.iter().enumerate() {
+            entries.push(LeaderboardEntry {
+                rank: (i + 1) as i32,
+                username: user["username"].as_str().unwrap_or("").to_string(),
+                title: user["title"].as_str().map(|s| s.to_string()),
+                rating: user["perfs"][time_control]["rating"].as_i64().unwrap_or(0) as i32,
+                source: "lichess".to_string(),
+            });
+        }
+    }
+
+    return entries;
+}
+
+struct LeaderboardEntry {
+    rank: i32,
+    username: str,
+    title: Option<str>,
+    rating: i32,
+    source: str,
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn format_title(title: Option<&str>) -> String {
+    match title {
+        Some("GM") => "Grandmaster".to_string(),
+        Some("IM") => "International Master".to_string(),
+        Some("FM") => "FIDE Master".to_string(),
+        Some("CM") => "Candidate Master".to_string(),
+        Some("NM") => "National Master".to_string(),
+        Some("WGM") => "Woman Grandmaster".to_string(),
+        Some("WIM") => "Woman International Master".to_string(),
+        Some("WFM") => "Woman FIDE Master".to_string(),
+        Some("WCM") => "Woman Candidate Master".to_string(),
+        Some(t) => t.to_string(),
+        None => String::new(),
+    }
+}
+
+fn print_player_info(player: &Player) {
+    println!("=== {} ===", player.username);
+
+    if let Some(ref name) = player.real_name {
+        println!("Name: {}", name);
+    }
+
+    if let Some(ref title) = player.title {
+        println!("Title: {} ({})", title, format_title(Some(title)));
+    }
+
+    if let Some(ref country) = player.country {
+        println!("Country: {}", country);
+    }
+
+    println!("\nRatings:");
+    if let Some(ref r) = player.ratings.bullet {
+        println!("  Bullet:   {} (RD: {}, {} games)", r.rating, r.rd, r.games);
+    }
+    if let Some(ref r) = player.ratings.blitz {
+        println!("  Blitz:    {} (RD: {}, {} games)", r.rating, r.rd, r.games);
+    }
+    if let Some(ref r) = player.ratings.rapid {
+        println!("  Rapid:    {} (RD: {}, {} games)", r.rating, r.rd, r.games);
+    }
+    if let Some(ref r) = player.ratings.classical {
+        println!("  Classical:{} (RD: {}, {} games)", r.rating, r.rd, r.games);
+    }
+
+    println!("\nStatistics:");
+    println!("  Total games: {}", player.stats.total_games);
+    println!("  Wins:   {} ({:.1}%)",
+             player.stats.wins,
+             100.0 * player.stats.wins as f32 / player.stats.total_games.max(1) as f32);
+    println!("  Losses: {} ({:.1}%)",
+             player.stats.losses,
+             100.0 * player.stats.losses as f32 / player.stats.total_games.max(1) as f32);
+    println!("  Draws:  {} ({:.1}%)",
+             player.stats.draws,
+             100.0 * player.stats.draws as f32 / player.stats.total_games.max(1) as f32);
+
+    if player.is_online {
+        println!("\nStatus: ONLINE");
+    }
+    if player.is_streaming {
+        println!("Currently streaming!");
+    }
+
+    println!("\nSource: {}", player.source);
+}
+

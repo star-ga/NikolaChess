@@ -1,0 +1,890 @@
+// NikolaChess - Syzygy Tablebase API
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Complete Syzygy support:
+// - Local files (7-man, 8-man partial)
+// - LAN server (dedicated tablebase machine)
+// - Remote APIs (Lichess 7-man, ChessDB 7-man + 8-man)
+// - DTZ probing for optimal play
+// - DTM probing where available
+
+import std.ffi;
+import std.io;
+import std.net;
+import std.sync;
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const SYZYGY_MAX_PIECES_LOCAL: i32 = 7;      // Standard local files
+const SYZYGY_MAX_PIECES_EXTENDED: i32 = 8;   // ChessDB has some 8-man
+const SYZYGY_CACHE_SIZE: usize = 4_000_000;  // 4M positions
+
+// WDL values
+const WDL_LOSS: i32 = -2;
+const WDL_BLESSED_LOSS: i32 = -1;
+const WDL_DRAW: i32 = 0;
+const WDL_CURSED_WIN: i32 = 1;
+const WDL_WIN: i32 = 2;
+
+// ============================================================================
+// FATHOM FFI (Local Syzygy via C library)
+// ============================================================================
+
+#[link(name = "fathom")]
+extern "C" {
+    // Initialize tablebases from path
+    fn tb_init(path: *const c_char) -> bool;
+
+    // Free tablebase memory
+    fn tb_free();
+
+    // Check if position is in tablebase
+    fn tb_probe_wdl(
+        white: u64,
+        black: u64,
+        kings: u64,
+        queens: u64,
+        rooks: u64,
+        bishops: u64,
+        knights: u64,
+        pawns: u64,
+        ep: u32,
+        turn: bool
+    ) -> i32;
+
+    // Probe with DTZ
+    fn tb_probe_root(
+        white: u64,
+        black: u64,
+        kings: u64,
+        queens: u64,
+        rooks: u64,
+        bishops: u64,
+        knights: u64,
+        pawns: u64,
+        rule50: u32,
+        castling: u32,
+        ep: u32,
+        turn: bool,
+        results: *mut TbRootMoves
+    ) -> u32;
+
+    // Get largest tablebase size
+    fn tb_largest() -> u32;
+}
+
+// Root move result from Fathom
+#[repr(C)]
+struct TbRootMove {
+    move_data: u32,
+    pv: [u32; 256],
+    pv_length: u32,
+    wdl: i32,
+    dtz: i32,
+}
+
+#[repr(C)]
+struct TbRootMoves {
+    size: u32,
+    moves: [TbRootMove; 256],
+}
+
+// ============================================================================
+// SYZYGY RESULT
+// ============================================================================
+
+struct SyzygyResult {
+    wdl: i32,              // Win/Draw/Loss (-2 to +2)
+    dtz: i32,              // Distance to zeroing
+    dtm: Option<i32>,      // Distance to mate (if available)
+    best_move: Move,       // Best move for this position
+    pv: Vec<Move>,         // Principal variation
+    source: SyzygySource,  // Where result came from
+    probe_time_us: i64,    // Probe time in microseconds
+}
+
+enum SyzygySource {
+    Local,                 // Local Fathom files
+    LAN,                   // LAN server
+    Lichess,               // tablebase.lichess.ovh
+    ChessDB,               // chessdb.cn (supports 8-man)
+    Lomonosov,             // Lomonosov DTM tables
+    Cache,                 // From cache
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+struct SyzygyConfig {
+    // Local files
+    local_path: Option<str>,
+    local_7man_path: Option<str>,
+    local_8man_path: Option<str>,     // Partial 8-man if available
+
+    // LAN server
+    lan_enabled: bool,
+    lan_host: str,
+    lan_port: u16,
+    lan_timeout_ms: i64,
+
+    // Remote APIs
+    lichess_enabled: bool,
+    lichess_url: str,
+    lichess_timeout_ms: i64,
+
+    chessdb_enabled: bool,
+    chessdb_url: str,
+    chessdb_timeout_ms: i64,
+
+    lomonosov_enabled: bool,
+    lomonosov_url: str,
+    lomonosov_timeout_ms: i64,
+
+    // 8-man support
+    enable_8man: bool,
+
+    // Cache
+    cache_size: usize,
+    cache_ttl_seconds: i64,
+
+    // Probing strategy
+    probe_dtz: bool,       // Always probe DTZ (slower but optimal)
+    probe_dtm: bool,       // Try to get DTM where available
+}
+
+fn default_syzygy_config() -> SyzygyConfig {
+    return SyzygyConfig {
+        // Local
+        local_path: Some("./syzygy"),
+        local_7man_path: Some("./syzygy/7man"),
+        local_8man_path: None,
+
+        // LAN
+        lan_enabled: false,
+        lan_host: "192.168.1.100",
+        lan_port: 7777,
+        lan_timeout_ms: 50,
+
+        // Remote
+        lichess_enabled: true,
+        lichess_url: "https://tablebase.lichess.ovh/standard",
+        lichess_timeout_ms: 2000,
+
+        chessdb_enabled: true,
+        chessdb_url: "https://www.chessdb.cn/cdb.php",
+        chessdb_timeout_ms: 3000,
+
+        lomonosov_enabled: false,
+        lomonosov_url: "http://tb7.chessok.com",
+        lomonosov_timeout_ms: 5000,
+
+        // 8-man
+        enable_8man: true,
+
+        // Cache
+        cache_size: SYZYGY_CACHE_SIZE,
+        cache_ttl_seconds: 86400,  // 24 hours
+
+        // Strategy
+        probe_dtz: true,
+        probe_dtm: false,
+    };
+}
+
+// ============================================================================
+// SYZYGY UNIFIED CLIENT
+// ============================================================================
+
+struct SyzygyUnified {
+    config: SyzygyConfig,
+
+    // Local Fathom
+    local_loaded: bool,
+    local_max_pieces: i32,
+
+    // LAN connection
+    lan_socket: Option<TcpStream>,
+    lan_connected: bool,
+    lan_reconnect_time: i64,
+
+    // HTTP client
+    http: HttpClient,
+
+    // Cache
+    cache: LRUCache<u64, SyzygyResult>,
+
+    // Statistics
+    stats: SyzygyStats,
+
+    // Lock for thread safety
+    lock: Mutex<()>,
+}
+
+struct SyzygyStats {
+    local_probes: i64,
+    local_hits: i64,
+    lan_probes: i64,
+    lan_hits: i64,
+    lichess_probes: i64,
+    lichess_hits: i64,
+    chessdb_probes: i64,
+    chessdb_hits: i64,
+    chessdb_8man_probes: i64,
+    chessdb_8man_hits: i64,
+    cache_hits: i64,
+    total_probe_time_us: i64,
+}
+
+fn create_syzygy_unified(config: &SyzygyConfig) -> SyzygyUnified {
+    let mut syzygy = SyzygyUnified {
+        config: config.clone(),
+        local_loaded: false,
+        local_max_pieces: 0,
+        lan_socket: None,
+        lan_connected: false,
+        lan_reconnect_time: 0,
+        http: HttpClient::new(),
+        cache: LRUCache::new(config.cache_size),
+        stats: SyzygyStats::default(),
+        lock: Mutex::new(()),
+    };
+
+    // Initialize local Fathom
+    if let Some(path) = &config.local_path {
+        if init_fathom(path) {
+            syzygy.local_loaded = true;
+            syzygy.local_max_pieces = unsafe { tb_largest() as i32 };
+            println!("Syzygy: Local {}-man tables loaded from {}",
+                     syzygy.local_max_pieces, path);
+        }
+    }
+
+    // Connect to LAN server
+    if config.lan_enabled {
+        if connect_lan(&mut syzygy) {
+            println!("Syzygy: LAN server connected at {}:{}",
+                     config.lan_host, config.lan_port);
+        }
+    }
+
+    return syzygy;
+}
+
+fn init_fathom(path: &str) -> bool {
+    let c_path = str_to_cstr(path);
+    return unsafe { tb_init(c_path) };
+}
+
+fn connect_lan(syzygy: &mut SyzygyUnified) -> bool {
+    let addr = format!("{}:{}", syzygy.config.lan_host, syzygy.config.lan_port);
+    match net.tcp_connect(&addr, syzygy.config.lan_timeout_ms) {
+        Ok(socket) => {
+            syzygy.lan_socket = Some(socket);
+            syzygy.lan_connected = true;
+            return true;
+        },
+        Err(_) => {
+            syzygy.lan_connected = false;
+            return false;
+        }
+    }
+}
+
+// ============================================================================
+// MAIN PROBE FUNCTION
+// ============================================================================
+
+fn probe(syzygy: &mut SyzygyUnified, board: Board) -> Option<SyzygyResult> {
+    let _guard = syzygy.lock.lock();
+    let start = time.now_us();
+    let hash = board.hash;
+    let pieces = popcount(board.occupancy[0] | board.occupancy[1]) as i32;
+
+    // Check piece count limits
+    if pieces > SYZYGY_MAX_PIECES_EXTENDED {
+        return None;
+    }
+
+    // 8-man only available via ChessDB
+    if pieces == 8 && !syzygy.config.enable_8man {
+        return None;
+    }
+
+    // 1. Check cache
+    if let Some(cached) = syzygy.cache.get(hash) {
+        syzygy.stats.cache_hits += 1;
+        return Some(cached.clone());
+    }
+
+    let mut result: Option<SyzygyResult> = None;
+
+    // 2. Try LOCAL (fastest, ≤7 pieces)
+    if pieces <= syzygy.local_max_pieces && syzygy.local_loaded {
+        syzygy.stats.local_probes += 1;
+        result = probe_local(board, syzygy.config.probe_dtz);
+        if result.is_some() {
+            syzygy.stats.local_hits += 1;
+            result.as_mut().unwrap().source = SyzygySource::Local;
+        }
+    }
+
+    // 3. Try LAN server (fast, any piece count supported by server)
+    if result.is_none() && syzygy.lan_connected {
+        syzygy.stats.lan_probes += 1;
+        result = probe_lan(syzygy, board);
+        if result.is_some() {
+            syzygy.stats.lan_hits += 1;
+            result.as_mut().unwrap().source = SyzygySource::LAN;
+        }
+    }
+
+    // 4. Try Lichess (≤7 pieces only)
+    if result.is_none() && pieces <= 7 && syzygy.config.lichess_enabled {
+        syzygy.stats.lichess_probes += 1;
+        result = probe_lichess(syzygy, board);
+        if result.is_some() {
+            syzygy.stats.lichess_hits += 1;
+            result.as_mut().unwrap().source = SyzygySource::Lichess;
+        }
+    }
+
+    // 5. Try ChessDB (7-man + partial 8-man)
+    if result.is_none() && syzygy.config.chessdb_enabled {
+        if pieces == 8 {
+            syzygy.stats.chessdb_8man_probes += 1;
+        } else {
+            syzygy.stats.chessdb_probes += 1;
+        }
+        result = probe_chessdb(syzygy, board);
+        if result.is_some() {
+            if pieces == 8 {
+                syzygy.stats.chessdb_8man_hits += 1;
+            } else {
+                syzygy.stats.chessdb_hits += 1;
+            }
+            result.as_mut().unwrap().source = SyzygySource::ChessDB;
+        }
+    }
+
+    // Update timing and cache
+    if let Some(ref mut r) = result {
+        r.probe_time_us = time.now_us() - start;
+        syzygy.stats.total_probe_time_us += r.probe_time_us;
+        syzygy.cache.insert(hash, r.clone());
+    }
+
+    return result;
+}
+
+// ============================================================================
+// LOCAL FATHOM PROBE
+// ============================================================================
+
+fn probe_local(board: Board, probe_dtz: bool) -> Option<SyzygyResult> {
+    let white = board.occupancy[0];
+    let black = board.occupancy[1];
+    let kings = board.pieces[KING] | board.pieces[KING + 6];
+    let queens = board.pieces[QUEEN] | board.pieces[QUEEN + 6];
+    let rooks = board.pieces[ROOK] | board.pieces[ROOK + 6];
+    let bishops = board.pieces[BISHOP] | board.pieces[BISHOP + 6];
+    let knights = board.pieces[KNIGHT] | board.pieces[KNIGHT + 6];
+    let pawns = board.pieces[PAWN] | board.pieces[PAWN + 6];
+    let ep = if board.ep_square >= 0 { board.ep_square as u32 } else { 0 };
+    let turn = board.side_to_move == 0;  // true = white to move
+
+    if probe_dtz {
+        // Full DTZ probe with best move
+        let mut results = TbRootMoves { size: 0, moves: [TbRootMove::default(); 256] };
+
+        let count = unsafe {
+            tb_probe_root(
+                white, black, kings, queens, rooks, bishops, knights, pawns,
+                board.halfmove as u32, 0, ep, turn,
+                &mut results
+            )
+        };
+
+        if count == 0 {
+            return None;
+        }
+
+        // Find best move
+        let mut best_idx = 0;
+        let mut best_score = -1000000;
+
+        for i in 0..results.size as usize {
+            let mv = &results.moves[i];
+            let score = wdl_to_score(mv.wdl, mv.dtz);
+            if score > best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+
+        let best = &results.moves[best_idx];
+        let best_move = decode_fathom_move(best.move_data);
+
+        // Extract PV
+        let mut pv = Vec::new();
+        for i in 0..best.pv_length as usize {
+            if best.pv[i] != 0 {
+                pv.push(decode_fathom_move(best.pv[i]));
+            }
+        }
+
+        return Some(SyzygyResult {
+            wdl: best.wdl,
+            dtz: best.dtz,
+            dtm: None,
+            best_move: best_move,
+            pv: pv,
+            source: SyzygySource::Local,
+            probe_time_us: 0,
+        });
+    } else {
+        // Quick WDL probe only
+        let wdl = unsafe {
+            tb_probe_wdl(
+                white, black, kings, queens, rooks, bishops, knights, pawns,
+                ep, turn
+            )
+        };
+
+        if wdl == -3 {  // TB_RESULT_FAILED
+            return None;
+        }
+
+        return Some(SyzygyResult {
+            wdl: wdl,
+            dtz: 0,
+            dtm: None,
+            best_move: MOVE_NULL,
+            pv: Vec::new(),
+            source: SyzygySource::Local,
+            probe_time_us: 0,
+        });
+    }
+}
+
+fn wdl_to_score(wdl: i32, dtz: i32) -> i32 {
+    match wdl {
+        WDL_WIN => 30000 - abs(dtz),
+        WDL_CURSED_WIN => 20000 - abs(dtz),
+        WDL_DRAW => 0,
+        WDL_BLESSED_LOSS => -20000 + abs(dtz),
+        WDL_LOSS => -30000 + abs(dtz),
+        _ => 0,
+    }
+}
+
+fn decode_fathom_move(data: u32) -> Move {
+    // Fathom move encoding: from(6) | to(6) | promo(4)
+    let from = (data & 0x3F) as i32;
+    let to = ((data >> 6) & 0x3F) as i32;
+    let promo = ((data >> 12) & 0xF) as i32;
+
+    return Move {
+        from: from,
+        to: to,
+        piece: 0,  // Will be filled by caller
+        capture: 0,
+        promotion: promo,
+        flags: 0,
+        data: 0,
+    };
+}
+
+// ============================================================================
+// LAN SERVER PROBE
+// ============================================================================
+
+fn probe_lan(syzygy: &mut SyzygyUnified, board: Board) -> Option<SyzygyResult> {
+    let socket = syzygy.lan_socket.as_mut()?;
+    let fen = board_to_fen(board);
+
+    // Send request
+    let request = format!("PROBE {} DTZ\n", fen);
+    if socket.write_all(request.as_bytes()).is_err() {
+        syzygy.lan_connected = false;
+        return None;
+    }
+
+    // Read response with timeout
+    let response = socket.read_line_timeout(syzygy.config.lan_timeout_ms)?;
+
+    // Parse response: "WDL 2 DTZ 15 MOVE e2e4 PV e2e4 e7e5 ..."
+    parse_lan_response(&response)
+}
+
+fn parse_lan_response(response: &str) -> Option<SyzygyResult> {
+    if response.starts_with("MISS") || response.starts_with("ERROR") {
+        return None;
+    }
+
+    let parts: Vec<&str> = response.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+
+    let wdl = parts.get(1)?.parse::<i32>().ok()?;
+    let dtz = parts.get(3)?.parse::<i32>().ok()?;
+    let best_move = parse_uci_move(parts.get(5)?)?;
+
+    // Parse PV if available
+    let mut pv = Vec::new();
+    if let Some(pv_idx) = parts.iter().position(|&s| s == "PV") {
+        for i in (pv_idx + 1)..parts.len() {
+            if let Some(mv) = parse_uci_move(parts[i]) {
+                pv.push(mv);
+            }
+        }
+    }
+
+    return Some(SyzygyResult {
+        wdl: wdl,
+        dtz: dtz,
+        dtm: None,
+        best_move: best_move,
+        pv: pv,
+        source: SyzygySource::LAN,
+        probe_time_us: 0,
+    });
+}
+
+// ============================================================================
+// LICHESS API PROBE (7-man only)
+// ============================================================================
+
+fn probe_lichess(syzygy: &mut SyzygyUnified, board: Board) -> Option<SyzygyResult> {
+    let fen = board_to_fen(board);
+    let url = format!("{}?fen={}", syzygy.config.lichess_url, url_encode(&fen));
+
+    let response = syzygy.http.get(&url)
+        .timeout(syzygy.config.lichess_timeout_ms)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let json = response.json().ok()?;
+
+    // Parse category to WDL
+    let wdl = match json["category"].as_str()? {
+        "win" => WDL_WIN,
+        "maybe-win" | "cursed-win" => WDL_CURSED_WIN,
+        "draw" | "unknown" => WDL_DRAW,
+        "maybe-loss" | "blessed-loss" => WDL_BLESSED_LOSS,
+        "loss" => WDL_LOSS,
+        _ => return None,
+    };
+
+    let dtz = json["dtz"].as_i64().unwrap_or(0) as i32;
+    let dtm = json["dtm"].as_i64().map(|x| x as i32);
+
+    // Get best move from moves array
+    let best_move = if let Some(moves) = json["moves"].as_array() {
+        if !moves.is_empty() {
+            parse_uci_move(moves[0]["uci"].as_str()?)?
+        } else {
+            MOVE_NULL
+        }
+    } else {
+        MOVE_NULL
+    };
+
+    // Build PV from mainline
+    let mut pv = Vec::new();
+    let mut current_fen = fen.clone();
+    for _ in 0..20 {  // Max 20 moves in PV
+        let pv_url = format!("{}?fen={}", syzygy.config.lichess_url, url_encode(&current_fen));
+        if let Ok(pv_resp) = syzygy.http.get(&pv_url).timeout(500).send() {
+            if let Ok(pv_json) = pv_resp.json() {
+                if let Some(moves) = pv_json["moves"].as_array() {
+                    if !moves.is_empty() {
+                        if let Some(mv) = parse_uci_move(moves[0]["uci"].as_str().unwrap_or("")) {
+                            pv.push(mv);
+                            // Would need to apply move to get next FEN
+                            break;  // Simplified: just get first move
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    return Some(SyzygyResult {
+        wdl: wdl,
+        dtz: dtz,
+        dtm: dtm,
+        best_move: best_move,
+        pv: pv,
+        source: SyzygySource::Lichess,
+        probe_time_us: 0,
+    });
+}
+
+// ============================================================================
+// CHESSDB API PROBE (7-man + partial 8-man)
+// ============================================================================
+
+fn probe_chessdb(syzygy: &mut SyzygyUnified, board: Board) -> Option<SyzygyResult> {
+    let fen = board_to_fen(board);
+
+    // ChessDB API: action=queryall for full info
+    let url = format!("{}?action=queryall&board={}",
+                      syzygy.config.chessdb_url, url_encode(&fen));
+
+    let response = syzygy.http.get(&url)
+        .timeout(syzygy.config.chessdb_timeout_ms)
+        .send()
+        .ok()?;
+
+    if response.status != 200 {
+        return None;
+    }
+
+    let text = response.text().ok()?;
+
+    // ChessDB returns pipe-separated format:
+    // move:score:depth:...
+    // or "unknown" if not in database
+
+    if text.starts_with("unknown") || text.is_empty() {
+        return None;
+    }
+
+    // Parse first line for best move
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Parse moves
+    let mut moves: Vec<(Move, i32)> = Vec::new();
+    for line in &lines {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 2 {
+            if let Some(mv) = parse_uci_move(parts[0]) {
+                let score = parts[1].parse::<i32>().unwrap_or(0);
+                moves.push((mv, score));
+            }
+        }
+    }
+
+    if moves.is_empty() {
+        return None;
+    }
+
+    // Sort by score (higher = better)
+    moves.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let best_move = moves[0].0;
+    let best_score = moves[0].1;
+
+    // Convert score to WDL
+    let wdl = if best_score > 20000 {
+        WDL_WIN
+    } else if best_score > 10000 {
+        WDL_CURSED_WIN
+    } else if best_score > -10000 {
+        WDL_DRAW
+    } else if best_score > -20000 {
+        WDL_BLESSED_LOSS
+    } else {
+        WDL_LOSS
+    };
+
+    // DTZ approximation from score
+    let dtz = if wdl == WDL_WIN || wdl == WDL_LOSS {
+        (30000 - abs(best_score)).max(1)
+    } else {
+        0
+    };
+
+    return Some(SyzygyResult {
+        wdl: wdl,
+        dtz: dtz,
+        dtm: None,
+        best_move: best_move,
+        pv: vec![best_move],
+        source: SyzygySource::ChessDB,
+        probe_time_us: 0,
+    });
+}
+
+// ============================================================================
+// LAN SERVER IMPLEMENTATION
+// ============================================================================
+
+// Run this on your dedicated tablebase server
+fn run_syzygy_server(config: SyzygyServerConfig) {
+    println!("Starting Syzygy LAN server on port {}", config.port);
+
+    // Initialize local tablebases
+    if !init_fathom(&config.syzygy_path) {
+        println!("ERROR: Failed to load tablebases from {}", config.syzygy_path);
+        return;
+    }
+
+    let max_pieces = unsafe { tb_largest() };
+    println!("Loaded {}-man tablebases", max_pieces);
+
+    // Start TCP listener
+    let listener = net.tcp_listen(&format!("0.0.0.0:{}", config.port)).unwrap();
+    println!("Server listening on 0.0.0.0:{}", config.port);
+
+    // Accept connections
+    loop {
+        match listener.accept() {
+            Ok(socket) => {
+                // Handle in new thread
+                let cfg = config.clone();
+                thread.spawn(move || {
+                    handle_syzygy_client(socket, &cfg);
+                });
+            },
+            Err(e) => {
+                println!("Accept error: {}", e);
+            }
+        }
+    }
+}
+
+struct SyzygyServerConfig {
+    port: u16,
+    syzygy_path: str,
+    max_clients: usize,
+    timeout_ms: i64,
+}
+
+fn handle_syzygy_client(mut socket: TcpStream, config: &SyzygyServerConfig) {
+    println!("Client connected: {}", socket.peer_addr());
+
+    loop {
+        // Read request
+        let line = match socket.read_line_timeout(config.timeout_ms) {
+            Some(l) => l,
+            None => break,
+        };
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse command
+        if line.starts_with("PROBE ") {
+            let rest = &line[6..];
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            let fen = parts[0];
+            let flags = parts.get(1).unwrap_or(&"");
+
+            // Parse FEN and probe
+            let board = match from_fen(fen) {
+                Ok(b) => b,
+                Err(_) => {
+                    socket.write_all(b"ERROR Invalid FEN\n");
+                    continue;
+                }
+            };
+
+            let probe_dtz = flags.contains("DTZ");
+
+            match probe_local(board, probe_dtz) {
+                Some(result) => {
+                    let response = format!(
+                        "WDL {} DTZ {} MOVE {} PV {}\n",
+                        result.wdl,
+                        result.dtz,
+                        move_to_uci(result.best_move),
+                        result.pv.iter().map(|m| move_to_uci(*m)).collect::<Vec<_>>().join(" ")
+                    );
+                    socket.write_all(response.as_bytes());
+                },
+                None => {
+                    socket.write_all(b"MISS\n");
+                }
+            }
+        } else if line == "PING" {
+            socket.write_all(b"PONG\n");
+        } else if line == "INFO" {
+            let max = unsafe { tb_largest() };
+            let response = format!("INFO max_pieces={}\n", max);
+            socket.write_all(response.as_bytes());
+        } else if line == "QUIT" {
+            break;
+        } else {
+            socket.write_all(b"ERROR Unknown command\n");
+        }
+    }
+
+    println!("Client disconnected");
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+fn print_syzygy_stats(syzygy: &SyzygyUnified) {
+    let total_probes = syzygy.stats.local_probes + syzygy.stats.lan_probes +
+                       syzygy.stats.lichess_probes + syzygy.stats.chessdb_probes +
+                       syzygy.stats.chessdb_8man_probes;
+
+    let total_hits = syzygy.stats.local_hits + syzygy.stats.lan_hits +
+                     syzygy.stats.lichess_hits + syzygy.stats.chessdb_hits +
+                     syzygy.stats.chessdb_8man_hits;
+
+    println!("=== Syzygy Tablebase Statistics ===");
+    println!("");
+    println!("Local:     {} probes, {} hits ({:.1}%)",
+             syzygy.stats.local_probes, syzygy.stats.local_hits,
+             100.0 * syzygy.stats.local_hits as f32 / syzygy.stats.local_probes.max(1) as f32);
+    println!("LAN:       {} probes, {} hits ({:.1}%)",
+             syzygy.stats.lan_probes, syzygy.stats.lan_hits,
+             100.0 * syzygy.stats.lan_hits as f32 / syzygy.stats.lan_probes.max(1) as f32);
+    println!("Lichess:   {} probes, {} hits ({:.1}%)",
+             syzygy.stats.lichess_probes, syzygy.stats.lichess_hits,
+             100.0 * syzygy.stats.lichess_hits as f32 / syzygy.stats.lichess_probes.max(1) as f32);
+    println!("ChessDB:   {} probes, {} hits ({:.1}%)",
+             syzygy.stats.chessdb_probes, syzygy.stats.chessdb_hits,
+             100.0 * syzygy.stats.chessdb_hits as f32 / syzygy.stats.chessdb_probes.max(1) as f32);
+    println!("8-man:     {} probes, {} hits ({:.1}%)",
+             syzygy.stats.chessdb_8man_probes, syzygy.stats.chessdb_8man_hits,
+             100.0 * syzygy.stats.chessdb_8man_hits as f32 / syzygy.stats.chessdb_8man_probes.max(1) as f32);
+    println!("");
+    println!("Cache:     {} hits", syzygy.stats.cache_hits);
+    println!("Total:     {} probes, {} hits ({:.1}%)",
+             total_probes, total_hits,
+             100.0 * total_hits as f32 / total_probes.max(1) as f32);
+    println!("Avg time:  {:.1}µs",
+             syzygy.stats.total_probe_time_us as f32 / total_probes.max(1) as f32);
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn url_encode(s: &str) -> String {
+    s.replace(" ", "%20")
+     .replace("/", "%2F")
+     .replace("?", "%3F")
+     .replace("=", "%3D")
+     .replace("&", "%26")
+}
+
+fn str_to_cstr(s: &str) -> *const c_char {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);  // Null terminator
+    bytes.as_ptr() as *const c_char
+}
+
+fn abs(x: i32) -> i32 {
+    if x < 0 { -x } else { x }
+}

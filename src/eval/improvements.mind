@@ -1,0 +1,522 @@
+// NikolaChess - Evaluation Improvements
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Advanced evaluation improvements:
+// - Draw-aware fortress evaluator
+// - Tapered phase evaluation
+// - Dynamic contempt
+
+import std.math;
+
+// ============================================================================
+// GAME PHASE CALCULATION
+// ============================================================================
+
+const PHASE_MIDGAME: i32 = 256;
+const PHASE_ENDGAME: i32 = 0;
+
+// Phase weights per piece type
+const PHASE_PAWN: i32 = 0;
+const PHASE_KNIGHT: i32 = 1;
+const PHASE_BISHOP: i32 = 1;
+const PHASE_ROOK: i32 = 2;
+const PHASE_QUEEN: i32 = 4;
+
+// Total phase at game start (no pawns counted)
+const PHASE_TOTAL: i32 = 4 * PHASE_KNIGHT + 4 * PHASE_BISHOP + 4 * PHASE_ROOK + 2 * PHASE_QUEEN;  // = 24
+
+fn calculate_game_phase(board: &Board) -> i32 {
+    let mut phase = 0i32;
+
+    // Count non-pawn pieces
+    phase += popcount(board.knights()) as i32 * PHASE_KNIGHT;
+    phase += popcount(board.bishops()) as i32 * PHASE_BISHOP;
+    phase += popcount(board.rooks()) as i32 * PHASE_ROOK;
+    phase += popcount(board.queens()) as i32 * PHASE_QUEEN;
+
+    // Scale to 0-256 range
+    let scaled = (phase * PHASE_MIDGAME) / PHASE_TOTAL;
+    return scaled.clamp(PHASE_ENDGAME, PHASE_MIDGAME);
+}
+
+// ============================================================================
+// TAPERED EVALUATION
+// ============================================================================
+
+struct TaperedEval {
+    midgame: i32,
+    endgame: i32,
+}
+
+impl TaperedEval {
+    fn new(mg: i32, eg: i32) -> TaperedEval {
+        return TaperedEval { midgame: mg, endgame: eg };
+    }
+
+    fn zero() -> TaperedEval {
+        return TaperedEval { midgame: 0, endgame: 0 };
+    }
+
+    fn interpolate(&self, phase: i32) -> i32 {
+        // phase: 256 = midgame, 0 = endgame
+        return (self.midgame * phase + self.endgame * (PHASE_MIDGAME - phase)) / PHASE_MIDGAME;
+    }
+}
+
+impl std::ops::Add for TaperedEval {
+    type Output = TaperedEval;
+    fn add(self, other: TaperedEval) -> TaperedEval {
+        return TaperedEval {
+            midgame: self.midgame + other.midgame,
+            endgame: self.endgame + other.endgame,
+        };
+    }
+}
+
+impl std::ops::Sub for TaperedEval {
+    type Output = TaperedEval;
+    fn sub(self, other: TaperedEval) -> TaperedEval {
+        return TaperedEval {
+            midgame: self.midgame - other.midgame,
+            endgame: self.endgame - other.endgame,
+        };
+    }
+}
+
+fn tapered_evaluate(board: &Board, nnue_mg: i32, nnue_eg: i32) -> i32 {
+    let phase = calculate_game_phase(board);
+    let eval = TaperedEval::new(nnue_mg, nnue_eg);
+    return eval.interpolate(phase);
+}
+
+// ============================================================================
+// FORTRESS DETECTION
+// ============================================================================
+
+struct FortressDetector {
+    // Fortress damping factor (0.0 = full draw, 1.0 = no damping)
+    damping_factor: f32,
+}
+
+impl FortressDetector {
+    fn new() -> FortressDetector {
+        return FortressDetector {
+            damping_factor: 0.2,  // Reduce eval to 20% when fortress detected
+        };
+    }
+}
+
+fn detect_fortress(board: &Board) -> Option<FortressType> {
+    let dominated_pawns = board.pawns();
+    let dominated_knights = board.knights();
+    let white_pieces = board.occupancy[Color::White as usize];
+    let black_pieces = board.occupancy[Color::Black as usize];
+
+    // 1. Insufficient material
+    if is_insufficient_material(board) {
+        return Some(FortressType::InsufficientMaterial);
+    }
+
+    // 2. Wrong rook pawn (bishop + rook pawn, wrong color bishop)
+    if detect_wrong_rook_pawn(board) {
+        return Some(FortressType::WrongRookPawn);
+    }
+
+    // 3. Opposite color bishops with blocked pawns
+    if detect_opposite_bishop_fortress(board) {
+        return Some(FortressType::OppositeColorBishops);
+    }
+
+    // 4. Rook + pawn vs Rook (Philidor/Lucena patterns)
+    if detect_rook_endgame_fortress(board) {
+        return Some(FortressType::RookEndgame);
+    }
+
+    // 5. Knight vs pawns (wrong side)
+    if detect_knight_fortress(board) {
+        return Some(FortressType::KnightFortress);
+    }
+
+    return None;
+}
+
+enum FortressType {
+    InsufficientMaterial,
+    WrongRookPawn,
+    OppositeColorBishops,
+    RookEndgame,
+    KnightFortress,
+    PerpetualRisk,
+}
+
+fn is_insufficient_material(board: &Board) -> bool {
+    let dominated_pawns = board.pawns();
+    if dominated_pawns != 0 {
+        return false;  // Pawns present
+    }
+
+    let total_pieces = popcount(board.occupancy[0] | board.occupancy[1]);
+
+    // K vs K
+    if total_pieces == 2 {
+        return true;
+    }
+
+    // K+minor vs K
+    if total_pieces == 3 {
+        let dominated_minors = board.knights() | board.bishops();
+        if dominated_minors != 0 && board.rooks() == 0 && board.queens() == 0 {
+            return true;
+        }
+    }
+
+    // K+B vs K+B (same color)
+    if total_pieces == 4 {
+        let wb = board.bishops() & board.occupancy[Color::White as usize];
+        let bb = board.bishops() & board.occupancy[Color::Black as usize];
+
+        if popcount(wb) == 1 && popcount(bb) == 1 {
+            // Check if same color squares
+            let light_squares = 0x55AA55AA55AA55AAu64;
+            let wb_light = (wb & light_squares) != 0;
+            let bb_light = (bb & light_squares) != 0;
+
+            if wb_light == bb_light {
+                return true;  // Same color bishops
+            }
+        }
+    }
+
+    return false;
+}
+
+fn detect_wrong_rook_pawn(board: &Board) -> bool {
+    let dominated_pawns = board.pawns();
+    let dominated_bishops = board.bishops();
+    let dominated_rooks = board.rooks();
+    let dominated_queens = board.queens();
+    let dominated_knights = board.knights();
+
+    // Need exactly one pawn, one bishop, no other pieces (except kings)
+    if popcount(dominated_pawns) != 1 || popcount(dominated_bishops) != 1 {
+        return false;
+    }
+    if dominated_rooks != 0 || dominated_queens != 0 || dominated_knights != 0 {
+        return false;
+    }
+
+    // Check if pawn is on a-file or h-file
+    let a_file = 0x0101010101010101u64;
+    let h_file = 0x8080808080808080u64;
+
+    if (dominated_pawns & a_file) == 0 && (dominated_pawns & h_file) == 0 {
+        return false;  // Not a rook pawn
+    }
+
+    // Check if bishop is wrong color for promotion square
+    let light_squares = 0x55AA55AA55AA55AAu64;
+    let bishop_on_light = (dominated_bishops & light_squares) != 0;
+
+    // a-pawn promotes on a8 (dark) or a1 (light)
+    // h-pawn promotes on h8 (light) or h1 (dark)
+    let pawn_sq = dominated_pawns.trailing_zeros() as i32;
+    let pawn_file = pawn_sq % 8;
+
+    // Determine promotion square color
+    let promo_on_light = if pawn_file == 0 {
+        // a-file: a8 is dark (black square), a1 is light
+        let is_white_pawn = (dominated_pawns & board.occupancy[Color::White as usize]) != 0;
+        !is_white_pawn  // White promotes to dark a8, Black to light a1
+    } else {
+        // h-file: h8 is light, h1 is dark
+        let is_white_pawn = (dominated_pawns & board.occupancy[Color::White as usize]) != 0;
+        is_white_pawn  // White promotes to light h8, Black to dark h1
+    };
+
+    // Wrong color = bishop color != promotion square color
+    return bishop_on_light != promo_on_light;
+}
+
+fn detect_opposite_bishop_fortress(board: &Board) -> bool {
+    let dominated_bishops = board.bishops();
+
+    // Need exactly 2 bishops, one per side
+    if popcount(dominated_bishops) != 2 {
+        return false;
+    }
+
+    let wb = dominated_bishops & board.occupancy[Color::White as usize];
+    let bb = dominated_bishops & board.occupancy[Color::Black as usize];
+
+    if popcount(wb) != 1 || popcount(bb) != 1 {
+        return false;
+    }
+
+    // Check opposite colors
+    let light_squares = 0x55AA55AA55AA55AAu64;
+    let wb_light = (wb & light_squares) != 0;
+    let bb_light = (bb & light_squares) != 0;
+
+    if wb_light == bb_light {
+        return false;  // Same color
+    }
+
+    // Check for blocked pawn structure
+    let dominated_pawns = board.pawns();
+    let wp = dominated_pawns & board.occupancy[Color::White as usize];
+    let bp = dominated_pawns & board.occupancy[Color::Black as usize];
+
+    // Pawns are "blocked" if they're on adjacent files facing each other
+    // Simplified: if pawn count is similar and material is low
+    let pawn_diff = (popcount(wp) as i32 - popcount(bp) as i32).abs();
+
+    if pawn_diff <= 1 && board.rooks() == 0 && board.queens() == 0 && board.knights() == 0 {
+        return true;
+    }
+
+    return false;
+}
+
+fn detect_rook_endgame_fortress(board: &Board) -> bool {
+    // R+P vs R endgame detection
+    let dominated_rooks = board.rooks();
+    let dominated_pawns = board.pawns();
+
+    if popcount(dominated_rooks) != 2 || board.queens() != 0 || board.bishops() != 0 || board.knights() != 0 {
+        return false;
+    }
+
+    // One rook per side
+    let wr = dominated_rooks & board.occupancy[Color::White as usize];
+    let br = dominated_rooks & board.occupancy[Color::Black as usize];
+
+    if popcount(wr) != 1 || popcount(br) != 1 {
+        return false;
+    }
+
+    // One or zero pawns
+    if popcount(dominated_pawns) > 1 {
+        return false;
+    }
+
+    // These positions are often drawish
+    return popcount(dominated_pawns) == 1;
+}
+
+fn detect_knight_fortress(board: &Board) -> bool {
+    // Knight vs pawns - certain configurations are drawn
+    // Simplified detection
+    return false;  // TODO: Implement full knight fortress detection
+}
+
+fn apply_fortress_adjustment(eval: i32, board: &Board, detector: &FortressDetector) -> i32 {
+    if let Some(fortress_type) = detect_fortress(board) {
+        let damping = match fortress_type {
+            FortressType::InsufficientMaterial => 0.0,
+            FortressType::WrongRookPawn => 0.1,
+            FortressType::OppositeColorBishops => detector.damping_factor,
+            FortressType::RookEndgame => 0.3,
+            FortressType::KnightFortress => 0.25,
+            FortressType::PerpetualRisk => 0.4,
+        };
+
+        return (eval as f32 * damping) as i32;
+    }
+
+    return eval;
+}
+
+// ============================================================================
+// DYNAMIC CONTEMPT
+// ============================================================================
+
+struct DynamicContempt {
+    base_contempt: i32,
+    opponent_elo: Option<i32>,
+    our_elo: Option<i32>,
+    endgame_reduction: i32,
+    imbalance_bonus: i32,
+}
+
+impl DynamicContempt {
+    fn new() -> DynamicContempt {
+        return DynamicContempt {
+            base_contempt: 10,      // Small default contempt for White
+            opponent_elo: None,
+            our_elo: None,
+            endgame_reduction: 15,
+            imbalance_bonus: 10,
+        };
+    }
+
+    fn set_opponent_elo(&mut self, elo: i32) {
+        self.opponent_elo = Some(elo);
+    }
+
+    fn set_our_elo(&mut self, elo: i32) {
+        self.our_elo = Some(elo);
+    }
+}
+
+fn calculate_dynamic_contempt(
+    board: &Board,
+    base_eval: i32,
+    contempt: &DynamicContempt,
+) -> i32 {
+    let mut adjustment = contempt.base_contempt;
+
+    // 1. Opponent strength adjustment
+    if let (Some(our_elo), Some(opp_elo)) = (contempt.our_elo, contempt.opponent_elo) {
+        let elo_diff = our_elo - opp_elo;
+
+        if elo_diff < -200 {
+            // Much stronger opponent: reduce contempt (accept draws)
+            adjustment -= 15;
+        } else if elo_diff < -50 {
+            // Stronger opponent
+            adjustment -= 10;
+        } else if elo_diff > 200 {
+            // Much weaker opponent: increase contempt (avoid draws)
+            adjustment += 20;
+        } else if elo_diff > 50 {
+            // Weaker opponent
+            adjustment += 10;
+        }
+    }
+
+    // 2. Position imbalance adjustment
+    if base_eval.abs() > 100 {
+        // Sharp position with clear advantage/disadvantage
+        adjustment += contempt.imbalance_bonus;
+    }
+
+    // 3. Endgame adjustment
+    let phase = calculate_game_phase(board);
+    if phase < 64 {  // Deep endgame
+        adjustment = (adjustment - contempt.endgame_reduction).max(0);
+    } else if phase < 128 {  // Early endgame
+        adjustment = (adjustment - contempt.endgame_reduction / 2).max(0);
+    }
+
+    // 4. Apply contempt from side to move perspective
+    let contempt_value = if board.side_to_move == Color::White {
+        adjustment
+    } else {
+        -adjustment
+    };
+
+    return base_eval + contempt_value;
+}
+
+// ============================================================================
+// PERPETUAL CHECK DETECTION
+// ============================================================================
+
+fn detect_perpetual_risk(board: &Board, eval: i32) -> bool {
+    // High eval but opponent has active pieces near our king
+    if eval.abs() < 200 {
+        return false;  // Position is balanced
+    }
+
+    let dominated_side = if eval > 0 { Color::White } else { Color::Black };
+    let defending_side = dominated_side.opposite();
+
+    let king_sq = board.king_square(dominated_side);
+
+    // Check opponent's piece activity near our king
+    let opp_queens = board.queens() & board.occupancy[defending_side as usize];
+    let opp_rooks = board.rooks() & board.occupancy[defending_side as usize];
+
+    if opp_queens == 0 {
+        return false;  // No queens, perpetual unlikely
+    }
+
+    // King exposure check
+    let king_zone = king_attack_zone(king_sq);
+    let attacks_on_king = count_attacks_to_zone(board, defending_side, king_zone);
+
+    // If many attacks near king, perpetual risk is high
+    return attacks_on_king >= 3;
+}
+
+fn king_attack_zone(king_sq: Square) -> u64 {
+    // 3x3 zone around the king
+    let king_bb = 1u64 << king_sq.0;
+    let mut zone = king_bb;
+
+    // Expand in all directions
+    zone |= (zone << 1) & 0xFEFEFEFEFEFEFEFEu64;  // East
+    zone |= (zone >> 1) & 0x7F7F7F7F7F7F7F7Fu64;  // West
+    zone |= zone << 8;  // North
+    zone |= zone >> 8;  // South
+
+    return zone;
+}
+
+fn count_attacks_to_zone(board: &Board, attacker: Color, zone: u64) -> i32 {
+    // Simplified attack counting
+    let mut attacks = 0i32;
+
+    let attacker_pieces = board.occupancy[attacker as usize];
+
+    // Queen attacks
+    let queens = board.queens() & attacker_pieces;
+    attacks += popcount(queens) as i32 * 3;  // Queens are dangerous
+
+    // Rook attacks
+    let rooks = board.rooks() & attacker_pieces;
+    attacks += popcount(rooks) as i32;
+
+    // Bishop attacks
+    let bishops = board.bishops() & attacker_pieces;
+    attacks += popcount(bishops) as i32;
+
+    return attacks;
+}
+
+// ============================================================================
+// INTEGRATED EVALUATION IMPROVEMENTS
+// ============================================================================
+
+struct EvalImprovements {
+    fortress_detector: FortressDetector,
+    contempt: DynamicContempt,
+    use_tapered_eval: bool,
+    use_fortress_detection: bool,
+    use_dynamic_contempt: bool,
+}
+
+impl EvalImprovements {
+    fn new() -> EvalImprovements {
+        return EvalImprovements {
+            fortress_detector: FortressDetector::new(),
+            contempt: DynamicContempt::new(),
+            use_tapered_eval: true,
+            use_fortress_detection: true,
+            use_dynamic_contempt: true,
+        };
+    }
+
+    fn apply(&self, board: &Board, nnue_eval: i32) -> i32 {
+        let mut eval = nnue_eval;
+
+        // 1. Fortress adjustment
+        if self.use_fortress_detection {
+            eval = apply_fortress_adjustment(eval, board, &self.fortress_detector);
+        }
+
+        // 2. Perpetual risk damping
+        if detect_perpetual_risk(board, eval) {
+            eval = (eval as f32 * 0.7) as i32;
+        }
+
+        // 3. Dynamic contempt
+        if self.use_dynamic_contempt {
+            eval = calculate_dynamic_contempt(board, eval, &self.contempt);
+        }
+
+        return eval;
+    }
+}
+

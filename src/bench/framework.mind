@@ -1,0 +1,670 @@
+// NikolaChess - Benchmarking Framework
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Scientific benchmarking to validate improvement techniques:
+// - SPRT (Sequential Probability Ratio Test) for Elo measurement
+// - A/B testing framework for comparing implementations
+// - Performance profiling (nodes/sec, depth, GPU utilization)
+
+import std.math;
+import std.time;
+import std.random;
+
+// ============================================================================
+// SPRT (Sequential Probability Ratio Test)
+// For statistically significant Elo difference detection
+// ============================================================================
+
+struct SPRTConfig {
+    elo0: f64,           // H0: Elo difference (null hypothesis, e.g., 0)
+    elo1: f64,           // H1: Elo difference (alternative, e.g., 5)
+    alpha: f64,          // Type I error rate (false positive)
+    beta: f64,           // Type II error rate (false negative)
+}
+
+impl SPRTConfig {
+    fn default() -> SPRTConfig {
+        return SPRTConfig {
+            elo0: 0.0,       // Null: no improvement
+            elo1: 5.0,       // Alternative: 5 Elo gain
+            alpha: 0.05,     // 5% false positive rate
+            beta: 0.05,      // 5% false negative rate
+        };
+    }
+
+    fn for_major_improvement() -> SPRTConfig {
+        return SPRTConfig {
+            elo0: 0.0,
+            elo1: 20.0,      // Testing for 20+ Elo gain
+            alpha: 0.01,
+            beta: 0.01,
+        };
+    }
+}
+
+struct SPRTState {
+    config: SPRTConfig,
+    wins: i32,
+    losses: i32,
+    draws: i32,
+    llr: f64,            // Log-likelihood ratio
+    lower_bound: f64,    // ln(beta / (1 - alpha))
+    upper_bound: f64,    // ln((1 - beta) / alpha)
+}
+
+impl SPRTState {
+    fn new(config: SPRTConfig) -> SPRTState {
+        let lower = (config.beta / (1.0 - config.alpha)).ln();
+        let upper = ((1.0 - config.beta) / config.alpha).ln();
+
+        return SPRTState {
+            config: config,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            llr: 0.0,
+            lower_bound: lower,
+            upper_bound: upper,
+        };
+    }
+
+    fn elo_to_score(elo: f64) -> f64 {
+        return 1.0 / (1.0 + 10.0.powf(-elo / 400.0));
+    }
+
+    fn update(&mut self, result: GameResult) {
+        match result {
+            GameResult::Win => self.wins += 1,
+            GameResult::Loss => self.losses += 1,
+            GameResult::Draw => self.draws += 1,
+        }
+
+        // Calculate LLR using trinomial model
+        let total = (self.wins + self.losses + self.draws) as f64;
+        if total < 1.0 {
+            return;
+        }
+
+        let w = self.wins as f64 / total;
+        let l = self.losses as f64 / total;
+        let d = self.draws as f64 / total;
+
+        let s0 = Self::elo_to_score(self.config.elo0);
+        let s1 = Self::elo_to_score(self.config.elo1);
+
+        // Pentanomial approximation for LLR
+        let score = w + d * 0.5;
+        if score > 0.0 && score < 1.0 {
+            let var = w * (1.0 - score).powi(2) + d * (0.5 - score).powi(2) + l * score.powi(2);
+            if var > 0.0 {
+                self.llr = total * ((s1 - s0) * (2.0 * score - s0 - s1)) / (2.0 * var);
+            }
+        }
+    }
+
+    fn status(&self) -> SPRTStatus {
+        if self.llr >= self.upper_bound {
+            return SPRTStatus::H1Accepted;  // Improvement confirmed
+        } else if self.llr <= self.lower_bound {
+            return SPRTStatus::H0Accepted;  // No improvement
+        }
+        return SPRTStatus::Continue;
+    }
+
+    fn games_played(&self) -> i32 {
+        return self.wins + self.losses + self.draws;
+    }
+
+    fn estimated_elo(&self) -> f64 {
+        let total = self.games_played() as f64;
+        if total < 1.0 {
+            return 0.0;
+        }
+        let score = (self.wins as f64 + self.draws as f64 * 0.5) / total;
+        if score <= 0.0 || score >= 1.0 {
+            return 0.0;
+        }
+        return -400.0 * (1.0 / score - 1.0).log10();
+    }
+
+    fn confidence_interval(&self) -> (f64, f64) {
+        let total = self.games_played() as f64;
+        if total < 10.0 {
+            return (-1000.0, 1000.0);
+        }
+        let score = (self.wins as f64 + self.draws as f64 * 0.5) / total;
+        let stderr = (score * (1.0 - score) / total).sqrt();
+        let z = 1.96;  // 95% confidence
+        let lo = (score - z * stderr).max(0.001);
+        let hi = (score + z * stderr).min(0.999);
+        return (
+            -400.0 * (1.0 / lo - 1.0).log10(),
+            -400.0 * (1.0 / hi - 1.0).log10()
+        );
+    }
+}
+
+enum SPRTStatus {
+    Continue,
+    H0Accepted,  // No significant improvement
+    H1Accepted,  // Improvement confirmed
+}
+
+enum GameResult {
+    Win,
+    Loss,
+    Draw,
+}
+
+// ============================================================================
+// A/B TEST FRAMEWORK
+// Compare two engine configurations
+// ============================================================================
+
+struct ABTestConfig {
+    name: String,
+    description: String,
+    baseline: EngineConfig,
+    variant: EngineConfig,
+    time_control: TimeControl,
+    opening_book: Option<String>,
+    position_file: Option<String>,
+    sprt: SPRTConfig,
+    max_games: i32,
+}
+
+struct EngineConfig {
+    name: String,
+    // Search parameters
+    use_mcts: bool,
+    use_gpu_batching: bool,
+    batch_size: i32,
+    num_threads: i32,
+    num_gpus: i32,
+    // LMR settings
+    lmr_enabled: bool,
+    history_lmr: bool,
+    // Pruning
+    probcut_enabled: bool,
+    // Evaluation
+    nnue_gpu: bool,
+    dynamic_contempt: bool,
+    fortress_detection: bool,
+}
+
+impl EngineConfig {
+    fn baseline() -> EngineConfig {
+        return EngineConfig {
+            name: "Baseline".to_string(),
+            use_mcts: false,
+            use_gpu_batching: false,
+            batch_size: 1,
+            num_threads: 8,
+            num_gpus: 0,
+            lmr_enabled: true,
+            history_lmr: false,
+            probcut_enabled: false,
+            nnue_gpu: false,
+            dynamic_contempt: false,
+            fortress_detection: false,
+        };
+    }
+
+    fn with_history_lmr() -> EngineConfig {
+        let mut cfg = Self::baseline();
+        cfg.name = "History-LMR".to_string();
+        cfg.history_lmr = true;
+        return cfg;
+    }
+
+    fn with_probcut() -> EngineConfig {
+        let mut cfg = Self::baseline();
+        cfg.name = "ProbCut".to_string();
+        cfg.probcut_enabled = true;
+        return cfg;
+    }
+
+    fn with_gpu_batching(batch_size: i32, num_gpus: i32) -> EngineConfig {
+        let mut cfg = Self::baseline();
+        cfg.name = format!("GPU-Batch-{}-{}gpu", batch_size, num_gpus);
+        cfg.use_gpu_batching = true;
+        cfg.batch_size = batch_size;
+        cfg.num_gpus = num_gpus;
+        cfg.nnue_gpu = true;
+        return cfg;
+    }
+
+    fn with_mcts(num_gpus: i32) -> EngineConfig {
+        return EngineConfig {
+            name: format!("MCTS-{}gpu", num_gpus),
+            use_mcts: true,
+            use_gpu_batching: true,
+            batch_size: 256,
+            num_threads: 4,
+            num_gpus: num_gpus,
+            lmr_enabled: false,
+            history_lmr: false,
+            probcut_enabled: false,
+            nnue_gpu: true,
+            dynamic_contempt: true,
+            fortress_detection: true,
+        };
+    }
+
+    fn full_improvements() -> EngineConfig {
+        return EngineConfig {
+            name: "Full-Improvements".to_string(),
+            use_mcts: false,
+            use_gpu_batching: true,
+            batch_size: 64,
+            num_threads: 16,
+            num_gpus: 1,
+            lmr_enabled: true,
+            history_lmr: true,
+            probcut_enabled: true,
+            nnue_gpu: true,
+            dynamic_contempt: true,
+            fortress_detection: true,
+        };
+    }
+}
+
+struct TimeControl {
+    initial_ms: i64,
+    increment_ms: i64,
+}
+
+impl TimeControl {
+    fn bullet() -> TimeControl {
+        return TimeControl { initial_ms: 60000, increment_ms: 0 };
+    }
+
+    fn blitz() -> TimeControl {
+        return TimeControl { initial_ms: 180000, increment_ms: 2000 };
+    }
+
+    fn rapid() -> TimeControl {
+        return TimeControl { initial_ms: 900000, increment_ms: 10000 };
+    }
+
+    fn fixed_nodes(nodes: i64) -> TimeControl {
+        // Special encoding for fixed node count
+        return TimeControl { initial_ms: -nodes, increment_ms: 0 };
+    }
+}
+
+// ============================================================================
+// BENCHMARK SUITE
+// Predefined tests for each improvement technique
+// ============================================================================
+
+struct BenchmarkSuite {
+    tests: Vec<ABTestConfig>,
+}
+
+impl BenchmarkSuite {
+    fn llm_consensus_tests() -> BenchmarkSuite {
+        let mut tests = Vec::new();
+
+        // Test 1: History-modulated LMR
+        tests.push(ABTestConfig {
+            name: "history_lmr".to_string(),
+            description: "History-modulated LMR vs baseline LMR".to_string(),
+            baseline: EngineConfig::baseline(),
+            variant: EngineConfig::with_history_lmr(),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::default(),
+            max_games: 10000,
+        });
+
+        // Test 2: ProbCut pruning
+        tests.push(ABTestConfig {
+            name: "probcut".to_string(),
+            description: "ProbCut pruning vs no ProbCut".to_string(),
+            baseline: EngineConfig::baseline(),
+            variant: EngineConfig::with_probcut(),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::default(),
+            max_games: 10000,
+        });
+
+        // Test 3: GPU-batched NNUE inference
+        tests.push(ABTestConfig {
+            name: "gpu_batch_64".to_string(),
+            description: "GPU-batched NNUE (batch=64) vs CPU NNUE".to_string(),
+            baseline: EngineConfig::baseline(),
+            variant: EngineConfig::with_gpu_batching(64, 1),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::for_major_improvement(),
+            max_games: 5000,
+        });
+
+        // Test 4: Full MCTS replacement
+        tests.push(ABTestConfig {
+            name: "mcts_gpu".to_string(),
+            description: "GPU MCTS vs alpha-beta".to_string(),
+            baseline: EngineConfig::baseline(),
+            variant: EngineConfig::with_mcts(1),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::for_major_improvement(),
+            max_games: 5000,
+        });
+
+        // Test 5: Multi-GPU scaling
+        tests.push(ABTestConfig {
+            name: "multi_gpu_scaling".to_string(),
+            description: "8-GPU MCTS vs 1-GPU MCTS".to_string(),
+            baseline: EngineConfig::with_mcts(1),
+            variant: EngineConfig::with_mcts(8),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::for_major_improvement(),
+            max_games: 3000,
+        });
+
+        // Test 6: All improvements combined
+        tests.push(ABTestConfig {
+            name: "full_improvements".to_string(),
+            description: "All improvements combined vs baseline".to_string(),
+            baseline: EngineConfig::baseline(),
+            variant: EngineConfig::full_improvements(),
+            time_control: TimeControl::blitz(),
+            opening_book: Some("varied.epd".to_string()),
+            position_file: None,
+            sprt: SPRTConfig::for_major_improvement(),
+            max_games: 5000,
+        });
+
+        return BenchmarkSuite { tests };
+    }
+}
+
+// ============================================================================
+// PERFORMANCE PROFILER
+// Measure nodes/sec, GPU utilization, memory
+// ============================================================================
+
+struct PerformanceMetrics {
+    nodes_searched: i64,
+    time_ms: i64,
+    depth_reached: i32,
+    selective_depth: i32,
+    gpu_utilization: f64,     // 0.0 - 1.0
+    gpu_memory_mb: i64,
+    batch_efficiency: f64,    // Actual vs theoretical throughput
+    cache_hit_rate: f64,
+}
+
+impl PerformanceMetrics {
+    fn nodes_per_second(&self) -> i64 {
+        if self.time_ms <= 0 {
+            return 0;
+        }
+        return self.nodes_searched * 1000 / self.time_ms;
+    }
+
+    fn print_summary(&self) {
+        println!("Performance Metrics:");
+        println!("  Nodes:      {} ({} nps)", self.nodes_searched, self.nodes_per_second());
+        println!("  Depth:      {} (sel {})", self.depth_reached, self.selective_depth);
+        println!("  Time:       {} ms", self.time_ms);
+        println!("  GPU util:   {:.1}%", self.gpu_utilization * 100.0);
+        println!("  GPU mem:    {} MB", self.gpu_memory_mb);
+        println!("  Batch eff:  {:.1}%", self.batch_efficiency * 100.0);
+        println!("  Cache hits: {:.1}%", self.cache_hit_rate * 100.0);
+    }
+}
+
+struct Profiler {
+    start_time: Instant,
+    samples: Vec<PerformanceMetrics>,
+}
+
+impl Profiler {
+    fn new() -> Profiler {
+        return Profiler {
+            start_time: Instant::now(),
+            samples: Vec::new(),
+        };
+    }
+
+    fn sample(&mut self, metrics: PerformanceMetrics) {
+        self.samples.push(metrics);
+    }
+
+    fn average(&self) -> PerformanceMetrics {
+        if self.samples.is_empty() {
+            return PerformanceMetrics {
+                nodes_searched: 0, time_ms: 0, depth_reached: 0,
+                selective_depth: 0, gpu_utilization: 0.0, gpu_memory_mb: 0,
+                batch_efficiency: 0.0, cache_hit_rate: 0.0,
+            };
+        }
+
+        let n = self.samples.len() as i64;
+        let mut sum = PerformanceMetrics {
+            nodes_searched: 0, time_ms: 0, depth_reached: 0,
+            selective_depth: 0, gpu_utilization: 0.0, gpu_memory_mb: 0,
+            batch_efficiency: 0.0, cache_hit_rate: 0.0,
+        };
+
+        for s in &self.samples {
+            sum.nodes_searched += s.nodes_searched;
+            sum.time_ms += s.time_ms;
+            sum.depth_reached += s.depth_reached;
+            sum.selective_depth += s.selective_depth;
+            sum.gpu_utilization += s.gpu_utilization;
+            sum.gpu_memory_mb += s.gpu_memory_mb;
+            sum.batch_efficiency += s.batch_efficiency;
+            sum.cache_hit_rate += s.cache_hit_rate;
+        }
+
+        return PerformanceMetrics {
+            nodes_searched: sum.nodes_searched / n,
+            time_ms: sum.time_ms / n,
+            depth_reached: sum.depth_reached / n as i32,
+            selective_depth: sum.selective_depth / n as i32,
+            gpu_utilization: sum.gpu_utilization / n as f64,
+            gpu_memory_mb: sum.gpu_memory_mb / n,
+            batch_efficiency: sum.batch_efficiency / n as f64,
+            cache_hit_rate: sum.cache_hit_rate / n as f64,
+        };
+    }
+}
+
+// ============================================================================
+// BENCHMARK RUNNER
+// Orchestrates test execution and result collection
+// ============================================================================
+
+struct BenchmarkRunner {
+    suite: BenchmarkSuite,
+    results: HashMap<String, BenchmarkResult>,
+    output_dir: String,
+}
+
+struct BenchmarkResult {
+    test_name: String,
+    sprt_state: SPRTState,
+    baseline_metrics: PerformanceMetrics,
+    variant_metrics: PerformanceMetrics,
+    games: Vec<GameRecord>,
+    status: BenchmarkStatus,
+}
+
+struct GameRecord {
+    opening: String,
+    result: GameResult,
+    baseline_time_ms: i64,
+    variant_time_ms: i64,
+    moves: i32,
+}
+
+enum BenchmarkStatus {
+    Running,
+    Passed,      // H1 accepted (improvement confirmed)
+    Failed,      // H0 accepted (no improvement)
+    Inconclusive,
+}
+
+impl BenchmarkRunner {
+    fn new(suite: BenchmarkSuite, output_dir: &str) -> BenchmarkRunner {
+        return BenchmarkRunner {
+            suite: suite,
+            results: HashMap::new(),
+            output_dir: output_dir.to_string(),
+        };
+    }
+
+    fn run_all(&mut self) {
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║     NikolaChess Benchmark Suite - Improvement Tests          ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!();
+
+        for test in &self.suite.tests {
+            self.run_test(test);
+        }
+
+        self.print_summary();
+        self.save_results();
+    }
+
+    fn run_test(&mut self, test: &ABTestConfig) {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("TEST: {}", test.name);
+        println!("DESC: {}", test.description);
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+        let mut sprt = SPRTState::new(test.sprt.clone());
+        let mut games = Vec::new();
+
+        while sprt.status() == SPRTStatus::Continue && sprt.games_played() < test.max_games {
+            // Play game pair (baseline white, then variant white)
+            let result1 = self.play_game(&test.baseline, &test.variant, true);
+            sprt.update(result1.result);
+            games.push(result1);
+
+            let result2 = self.play_game(&test.variant, &test.baseline, false);
+            sprt.update(Self::invert_result(result2.result));
+            games.push(result2);
+
+            // Progress update every 100 games
+            if sprt.games_played() % 100 == 0 {
+                let (lo, hi) = sprt.confidence_interval();
+                println!(
+                    "  Games: {} | Elo: {:.1} [{:.1}, {:.1}] | LLR: {:.2} [{:.2}, {:.2}]",
+                    sprt.games_played(),
+                    sprt.estimated_elo(),
+                    lo, hi,
+                    sprt.llr,
+                    sprt.lower_bound,
+                    sprt.upper_bound
+                );
+            }
+        }
+
+        let status = match sprt.status() {
+            SPRTStatus::H1Accepted => BenchmarkStatus::Passed,
+            SPRTStatus::H0Accepted => BenchmarkStatus::Failed,
+            SPRTStatus::Continue => BenchmarkStatus::Inconclusive,
+        };
+
+        let result_str = match status {
+            BenchmarkStatus::Passed => "✅ PASSED - Improvement confirmed!",
+            BenchmarkStatus::Failed => "❌ FAILED - No significant improvement",
+            BenchmarkStatus::Inconclusive => "⚠️ INCONCLUSIVE - Need more games",
+        };
+
+        println!();
+        println!("RESULT: {}", result_str);
+        println!("  Final Elo: {:.1} +/- {:.1}", sprt.estimated_elo(),
+                 (sprt.confidence_interval().1 - sprt.confidence_interval().0) / 2.0);
+        println!();
+
+        self.results.insert(test.name.clone(), BenchmarkResult {
+            test_name: test.name.clone(),
+            sprt_state: sprt,
+            baseline_metrics: PerformanceMetrics::default(),
+            variant_metrics: PerformanceMetrics::default(),
+            games: games,
+            status: status,
+        });
+    }
+
+    fn play_game(&self, white: &EngineConfig, black: &EngineConfig, _is_first: bool) -> GameRecord {
+        // TODO: Implement actual game playing
+        // This would integrate with the UCI/CECP protocols
+        return GameRecord {
+            opening: "e4 e5".to_string(),
+            result: GameResult::Draw,
+            baseline_time_ms: 0,
+            variant_time_ms: 0,
+            moves: 40,
+        };
+    }
+
+    fn invert_result(result: GameResult) -> GameResult {
+        match result {
+            GameResult::Win => GameResult::Loss,
+            GameResult::Loss => GameResult::Win,
+            GameResult::Draw => GameResult::Draw,
+        }
+    }
+
+    fn print_summary(&self) {
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║                    BENCHMARK SUMMARY                         ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!();
+        println!("┌────────────────────────┬────────┬─────────┬──────────────────┐");
+        println!("│ Test                   │ Status │ Games   │ Elo Gain         │");
+        println!("├────────────────────────┼────────┼─────────┼──────────────────┤");
+
+        for (name, result) in &self.results {
+            let status_icon = match result.status {
+                BenchmarkStatus::Passed => "✅",
+                BenchmarkStatus::Failed => "❌",
+                BenchmarkStatus::Inconclusive => "⚠️",
+                BenchmarkStatus::Running => "🔄",
+            };
+            let (lo, hi) = result.sprt_state.confidence_interval();
+            println!(
+                "│ {:22} │   {}   │ {:7} │ {:+5.1} [{:+.0},{:+.0}] │",
+                name,
+                status_icon,
+                result.sprt_state.games_played(),
+                result.sprt_state.estimated_elo(),
+                lo, hi
+            );
+        }
+
+        println!("└────────────────────────┴────────┴─────────┴──────────────────┘");
+    }
+
+    fn save_results(&self) {
+        // Save to JSON for later analysis
+        let path = format!("{}/benchmark_results.json", self.output_dir);
+        println!("\nResults saved to: {}", path);
+    }
+}
+
+// ============================================================================
+// MAIN BENCHMARK ENTRY POINT
+// ============================================================================
+
+fn run_llm_consensus_benchmarks() {
+    let suite = BenchmarkSuite::llm_consensus_tests();
+    let mut runner = BenchmarkRunner::new(suite, "/home/n/.nikolachess/NikolaChess/bench_results");
+    runner.run_all();
+}

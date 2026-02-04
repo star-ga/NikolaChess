@@ -1,0 +1,535 @@
+// NikolaChess - Arena GUI Extensions
+// Copyright (c) 2026 STARGA, Inc. All rights reserved.
+// PROPRIETARY AND CONFIDENTIAL
+//
+// Arena Chess GUI specific extensions:
+// - Custom commands
+// - AutoPlayer mode
+// - Tournament support
+// - Analysis mode extensions
+
+import std.io;
+import std.time;
+
+// ============================================================================
+// ARENA MODE
+// ============================================================================
+
+struct ArenaMode {
+    // Arena-specific state
+    autoplayer: bool,
+    tournament_mode: bool,
+    show_eval_bar: bool,
+    show_book_hints: bool,
+
+    // Analysis extensions
+    analysis_output: AnalysisOutput,
+    multipv_analysis: bool,
+
+    // Engine info
+    engine_name: str,
+    engine_author: str,
+    engine_elo: Option<i32>,
+}
+
+enum AnalysisOutput {
+    Standard,
+    Verbose,
+    Extended,
+}
+
+impl ArenaMode {
+    fn new() -> ArenaMode {
+        return ArenaMode {
+            autoplayer: false,
+            tournament_mode: false,
+            show_eval_bar: true,
+            show_book_hints: true,
+            analysis_output: AnalysisOutput::Standard,
+            multipv_analysis: false,
+            engine_name: "NikolaChess".to_string(),
+            engine_author: "STARGA, Inc.".to_string(),
+            engine_elo: None,
+        };
+    }
+}
+
+// ============================================================================
+// ARENA COMMANDS
+// ============================================================================
+
+// Arena sends some non-standard commands that we handle here
+
+fn handle_arena_command(cmd: &str, arena: &mut ArenaMode) -> Option<String> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    match parts[0] {
+        // Arena-specific UCI extensions
+        "ucistrings" => {
+            return Some(format_uci_strings(arena));
+        }
+
+        // Engine strength adjustment
+        "elomode" => {
+            if parts.len() >= 2 {
+                arena.engine_elo = parts[1].parse().ok();
+            }
+            return Some("".to_string());
+        }
+
+        // Tournament mode
+        "tournament" => {
+            if parts.len() >= 2 {
+                arena.tournament_mode = parts[1] == "on" || parts[1] == "1";
+            }
+            return Some("".to_string());
+        }
+
+        // AutoPlayer (unattended play)
+        "autoplayer" => {
+            if parts.len() >= 2 {
+                arena.autoplayer = parts[1] == "on" || parts[1] == "1";
+            }
+            return Some("".to_string());
+        }
+
+        // Book hints display
+        "bookhints" => {
+            if parts.len() >= 2 {
+                arena.show_book_hints = parts[1] == "on" || parts[1] == "1";
+            }
+            return Some("".to_string());
+        }
+
+        // Evaluation bar
+        "evalbar" => {
+            if parts.len() >= 2 {
+                arena.show_eval_bar = parts[1] == "on" || parts[1] == "1";
+            }
+            return Some("".to_string());
+        }
+
+        // Analysis verbosity
+        "analysisverbose" => {
+            if parts.len() >= 2 {
+                arena.analysis_output = match parts[1] {
+                    "0" | "standard" => AnalysisOutput::Standard,
+                    "1" | "verbose" => AnalysisOutput::Verbose,
+                    "2" | "extended" => AnalysisOutput::Extended,
+                    _ => AnalysisOutput::Standard,
+                };
+            }
+            return Some("".to_string());
+        }
+
+        // Not an Arena command
+        _ => return None,
+    }
+}
+
+fn format_uci_strings(arena: &ArenaMode) -> String {
+    let mut lines = Vec::new();
+
+    // Engine identification
+    lines.push(format!("ucistring engine name {}", arena.engine_name));
+    lines.push(format!("ucistring engine author {}", arena.engine_author));
+
+    // Features
+    lines.push("ucistring feature analysis=1".to_string());
+    lines.push("ucistring feature tablebases=1".to_string());
+    lines.push("ucistring feature openingbook=1".to_string());
+    lines.push("ucistring feature multipv=1".to_string());
+
+    if let Some(elo) = arena.engine_elo {
+        lines.push(format!("ucistring engine elo {}", elo));
+    }
+
+    return lines.join("\n");
+}
+
+// ============================================================================
+// ARENA ANALYSIS INFO
+// ============================================================================
+
+// Arena expects extended info strings in certain formats
+
+fn format_arena_info(info: &SearchInfo, arena: &ArenaMode) -> String {
+    let mut output = format_standard_info(info);
+
+    // Add Arena-specific extensions based on verbosity
+    match arena.analysis_output {
+        AnalysisOutput::Standard => {
+            // Standard UCI info
+        }
+        AnalysisOutput::Verbose => {
+            // Add string info
+            if let Some(ref eval_type) = info.eval_type {
+                output.push_str(&format!(" string eval={}", eval_type));
+            }
+        }
+        AnalysisOutput::Extended => {
+            // Full analysis details
+            if let Some(ref eval_type) = info.eval_type {
+                output.push_str(&format!(" string eval={}", eval_type));
+            }
+            if let Some(tb_hits) = info.tbhits {
+                output.push_str(&format!(" string tbhits={}", tb_hits));
+            }
+            if let Some(hashfull) = info.hashfull {
+                output.push_str(&format!(" string hashfull={}", hashfull));
+            }
+        }
+    }
+
+    // Book hints
+    if arena.show_book_hints {
+        if let Some(ref book_move) = info.book_move {
+            output.push_str(&format!(" string book={}", book_move));
+        }
+    }
+
+    return output;
+}
+
+fn format_standard_info(info: &SearchInfo) -> String {
+    let mut parts = Vec::new();
+
+    parts.push(format!("info depth {}", info.depth));
+
+    if let Some(seldepth) = info.seldepth {
+        parts.push(format!("seldepth {}", seldepth));
+    }
+
+    if let Some(multipv) = info.multipv {
+        parts.push(format!("multipv {}", multipv));
+    }
+
+    // Score
+    if let Some(mate) = info.score_mate {
+        parts.push(format!("score mate {}", mate));
+    } else {
+        parts.push(format!("score cp {}", info.score_cp));
+    }
+
+    // Time and nodes
+    parts.push(format!("time {}", info.time_ms));
+    parts.push(format!("nodes {}", info.nodes));
+
+    if info.time_ms > 0 {
+        let nps = (info.nodes as i64 * 1000) / info.time_ms;
+        parts.push(format!("nps {}", nps));
+    }
+
+    // PV
+    if !info.pv.is_empty() {
+        let pv_str: String = info.pv.iter()
+            .map(|m| format_uci_move(m))
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!("pv {}", pv_str));
+    }
+
+    return parts.join(" ");
+}
+
+// ============================================================================
+// ARENA TOURNAMENT SUPPORT
+// ============================================================================
+
+struct TournamentState {
+    round: i32,
+    total_rounds: i32,
+    wins: i32,
+    losses: i32,
+    draws: i32,
+    current_opponent: Option<str>,
+    time_control: Option<str>,
+}
+
+impl TournamentState {
+    fn new() -> TournamentState {
+        return TournamentState {
+            round: 0,
+            total_rounds: 0,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            current_opponent: None,
+            time_control: None,
+        };
+    }
+
+    fn record_result(&mut self, result: GameResult) {
+        match result {
+            GameResult::WhiteWins | GameResult::BlackWins => {
+                // Need to know our color to record correctly
+            }
+            GameResult::Draw => self.draws += 1,
+            _ => {}
+        }
+        self.round += 1;
+    }
+
+    fn score(&self) -> f32 {
+        return self.wins as f32 + (self.draws as f32 * 0.5);
+    }
+
+    fn performance(&self) -> Option<i32> {
+        // Calculate performance rating if we have enough games
+        let total = self.wins + self.losses + self.draws;
+        if total < 3 {
+            return None;
+        }
+
+        let score_pct = self.score() / total as f32;
+        // Simplified performance calculation
+        let base_rating = 2000; // Assume average opponent
+        let rating_diff = ((score_pct - 0.5) * 800.0) as i32;
+
+        return Some(base_rating + rating_diff);
+    }
+}
+
+// ============================================================================
+// ARENA AUTOPLAYER
+// ============================================================================
+
+// AutoPlayer mode allows unattended operation
+
+struct AutoPlayer {
+    enabled: bool,
+    auto_accept_challenges: bool,
+    auto_rematch: bool,
+    max_games: Option<i32>,
+    games_played: i32,
+    rest_between_games_ms: i64,
+}
+
+impl AutoPlayer {
+    fn new() -> AutoPlayer {
+        return AutoPlayer {
+            enabled: false,
+            auto_accept_challenges: true,
+            auto_rematch: false,
+            max_games: None,
+            games_played: 0,
+            rest_between_games_ms: 1000,
+        };
+    }
+
+    fn should_continue(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        if let Some(max) = self.max_games {
+            return self.games_played < max;
+        }
+
+        return true;
+    }
+
+    fn on_game_end(&mut self) {
+        self.games_played += 1;
+
+        // Rest between games
+        if self.rest_between_games_ms > 0 {
+            std::thread::sleep(Duration::from_millis(self.rest_between_games_ms as u64));
+        }
+    }
+}
+
+// ============================================================================
+// ARENA ENGINE LOGO
+// ============================================================================
+
+// Arena supports engine logos - we provide a base64-encoded PNG
+
+const ENGINE_LOGO_BASE64: &str = "
+iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAF
+... (logo data) ...
+";
+
+fn get_engine_logo() -> Option<Vec<u8>> {
+    // Decode base64 logo
+    base64_decode(ENGINE_LOGO_BASE64)
+}
+
+// ============================================================================
+// ARENA PROTOCOL EXTENSIONS
+// ============================================================================
+
+// Additional Arena-compatible options
+
+fn get_arena_options() -> Vec<UCIOption> {
+    return vec![
+        UCIOption::Check {
+            name: "Arena LogFile".to_string(),
+            default: false,
+        },
+        UCIOption::Spin {
+            name: "Arena Adjudication Score".to_string(),
+            default: 700,
+            min: 100,
+            max: 2000,
+        },
+        UCIOption::Spin {
+            name: "Arena Adjudication Moves".to_string(),
+            default: 5,
+            min: 1,
+            max: 20,
+        },
+        UCIOption::Check {
+            name: "Arena TB Adjudication".to_string(),
+            default: true,
+        },
+    ];
+}
+
+// Adjudication support (Arena can end games early based on evaluation)
+
+struct Adjudication {
+    enabled: bool,
+    score_threshold: i32,  // Centipawns
+    moves_required: i32,   // Consecutive moves above threshold
+    consecutive_count: i32,
+    tb_adjudication: bool, // End game on tablebase hit
+}
+
+impl Adjudication {
+    fn new() -> Adjudication {
+        return Adjudication {
+            enabled: false,
+            score_threshold: 700,
+            moves_required: 5,
+            consecutive_count: 0,
+            tb_adjudication: true,
+        };
+    }
+
+    fn check(&mut self, score: i32, tb_hit: bool) -> Option<AdjudicationResult> {
+        // TB adjudication
+        if self.tb_adjudication && tb_hit {
+            return Some(AdjudicationResult::Tablebase);
+        }
+
+        // Score adjudication
+        if score.abs() >= self.score_threshold {
+            self.consecutive_count += 1;
+            if self.consecutive_count >= self.moves_required {
+                if score > 0 {
+                    return Some(AdjudicationResult::WhiteWins);
+                } else {
+                    return Some(AdjudicationResult::BlackWins);
+                }
+            }
+        } else {
+            self.consecutive_count = 0;
+        }
+
+        return None;
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_count = 0;
+    }
+}
+
+enum AdjudicationResult {
+    WhiteWins,
+    BlackWins,
+    Draw,
+    Tablebase,
+}
+
+// ============================================================================
+// DATA TYPES (Placeholders)
+// ============================================================================
+
+struct SearchInfo {
+    depth: i32,
+    seldepth: Option<i32>,
+    multipv: Option<i32>,
+    score_cp: i32,
+    score_mate: Option<i32>,
+    time_ms: i64,
+    nodes: i64,
+    pv: Vec<Move>,
+    eval_type: Option<str>,
+    tbhits: Option<i64>,
+    hashfull: Option<i32>,
+    book_move: Option<str>,
+}
+
+struct UCIOption {
+    // Placeholder - actual implementation in uci.mind
+}
+
+enum UCIOption {
+    Check { name: str, default: bool },
+    Spin { name: str, default: i32, min: i32, max: i32 },
+    Combo { name: str, default: str, options: Vec<str> },
+    Button { name: str },
+    String { name: str, default: str },
+}
+
+fn format_uci_move(mv: &Move) -> String {
+    let from_file = (b'a' + mv.from.file() as u8) as char;
+    let from_rank = (b'1' + mv.from.rank() as u8) as char;
+    let to_file = (b'a' + mv.to.file() as u8) as char;
+    let to_rank = (b'1' + mv.to.rank() as u8) as char;
+
+    let mut s = format!("{}{}{}{}", from_file, from_rank, to_file, to_rank);
+
+    if let Some(promo) = mv.promotion {
+        s.push(match promo {
+            PieceType::Queen => 'q',
+            PieceType::Rook => 'r',
+            PieceType::Bishop => 'b',
+            PieceType::Knight => 'n',
+            _ => 'q',
+        });
+    }
+
+    return s;
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    // Simplified base64 decode
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let s = s.trim().replace("\n", "").replace(" ", "");
+    let mut result = Vec::new();
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c1 = chars.get(i).and_then(|&c| ALPHABET.iter().position(|&b| b == c as u8))?;
+        let c2 = chars.get(i + 1).and_then(|&c| ALPHABET.iter().position(|&b| b == c as u8))?;
+
+        result.push(((c1 << 2) | (c2 >> 4)) as u8);
+
+        if let Some(&c) = chars.get(i + 2) {
+            if c != '=' {
+                let c3 = ALPHABET.iter().position(|&b| b == c as u8)?;
+                result.push((((c2 & 0xF) << 4) | (c3 >> 2)) as u8);
+
+                if let Some(&c) = chars.get(i + 3) {
+                    if c != '=' {
+                        let c4 = ALPHABET.iter().position(|&b| b == c as u8)?;
+                        result.push((((c3 & 0x3) << 6) | c4) as u8);
+                    }
+                }
+            }
+        }
+
+        i += 4;
+    }
+
+    return Some(result);
+}
+
