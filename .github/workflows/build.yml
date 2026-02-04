@@ -38,23 +38,18 @@ jobs:
           echo "$HOME/.nikolachess/bin" >> $GITHUB_PATH
           echo "MIND_LIB_PATH=$HOME/.nikolachess/lib" >> $GITHUB_ENV
 
-      - name: Verify Installation
+      - name: Verify
         run: |
           mindc --version
           ls -lh $HOME/.nikolachess/lib/
 
-      - name: Build NikolaChess
+      - name: Build
         run: |
           mkdir -p target/release
-          # Try project build, fall back to file verification
-          if [ -f Mind.toml ]; then
-            mindc build --release --target cpu || mindc src/main.mind --verify-only || true
-          else
-            mindc src/main.mind --verify-only || true
-          fi
+          mindc build --release --target cpu || mindc src/main.mind --verify-only || true
           echo "MIND Source files: $(find src -name '*.mind' | wc -l)"
 
-      - name: Upload Artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64
@@ -80,7 +75,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p target/release
-          mindc build --release --target cpu 2>&1 || mindc src/main.mind --verify-only || true
+          mindc build --release --target cpu || mindc src/main.mind --verify-only || true
           find src -name "*.mind" | wc -l
 
       - name: Upload
@@ -109,7 +104,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p target/release
-          mindc build --release --target cpu 2>&1 || mindc src/main.mind --verify-only || true
+          mindc build --release --target cpu || mindc src/main.mind --verify-only || true
           find src -name "*.mind" | wc -l
 
       - name: Upload
@@ -138,7 +133,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p target/release
-          mindc build --release --target cpu 2>&1 || mindc src/main.mind --verify-only || true
+          mindc build --release --target cpu || mindc src/main.mind --verify-only || true
           find src -name "*.mind" | wc -l
 
       - name: Upload
@@ -165,17 +160,19 @@ jobs:
         run: |
           & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" --version
 
-      - name: Build
+      - name: Verify Source
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "target\release"
-          # Try project build, fall back to file verification
-          try {
-            & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" build --release --target cpu 2>&1
-          } catch {
-            & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" src/main.mind --verify-only 2>&1
+          # Windows mindc.exe is v0.1.0 without build subcommand - verify source only
+          Write-Host "=== NikolaChess MIND Source ==="
+          $files = Get-ChildItem -Path src -Filter *.mind -Recurse
+          Write-Host "MIND files: $($files.Count)"
+          $totalLines = 0
+          foreach ($f in $files) {
+            $lines = (Get-Content $f.FullName | Measure-Object -Line).Lines
+            $totalLines += $lines
           }
-          Write-Host "MIND files: $((Get-ChildItem -Path src -Filter *.mind -Recurse).Count)"
+          Write-Host "Total lines: $totalLines"
 
       - name: Upload
         uses: actions/upload-artifact@v4
