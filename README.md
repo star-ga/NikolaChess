@@ -12,10 +12,6 @@ NikolaChess is a state-of-the-art chess engine built entirely in the **MIND prog
 
 ### What Makes NikolaChess Special
 
-**🏆 Fortress: The Unbeatable Engine**
-
-NikolaChess is designed with a singular philosophy: **NEVER LOSE**. Every algorithm, every optimization, every line of code is engineered toward fortress-like defensive strength combined with ruthless attacking precision.
-
 | Capability | NikolaChess | Traditional Engines |
 |------------|-------------|---------------------|
 | GPU NNUE Evaluation | 1M+ positions/sec | 500K positions/sec (CPU) |
@@ -24,23 +20,21 @@ NikolaChess is designed with a singular philosophy: **NEVER LOSE**. Every algori
 | Parallel Scaling | 1024 GPUs / 8192 threads | 128 threads typical |
 | Position Understanding | Deep residual network | Basic NNUE |
 
-**🚀 Revolutionary Technology Stack**
+**Revolutionary Technology Stack**
 
 - **First chess engine with native GPU MCTS**: Combines AlphaZero-style tree search with classical alpha-beta for best of both worlds
 - **SPTT (Superparallel Tree Traversal)**: Novel hybrid algorithm that dynamically switches between MCTS and alpha-beta based on position characteristics
 - **GPU-batched Lazy SMP**: All search threads submit positions to GPU for batch NNUE evaluation, achieving 10x throughput vs CPU
-- **ProbCut pruning**: Statistical pruning with 99.9% accuracy prevents wasted search effort
+- **ProbCut pruning**: Statistical pruning for efficient search tree exploration
 - **History-modulated LMR**: Adaptive late move reductions that learn from search history
 
-**🛡️ Defensive Mastery**
+**Advanced Endgame Intelligence**
 
-NikolaChess employs advanced fortress detection using convolutional neural networks to identify unbreakable defensive positions:
+NikolaChess employs advanced fortress detection using convolutional neural networks to identify defensive positions:
 - Rook + wrong-color bishop fortresses
-- Blocked pawn chain fortresses
-- Perpetual check possibilities
-- Stalemate trap recognition
-
-This ensures the engine never loses from a drawable position - the hallmark of true strength.
+- Blocked pawn chain detection
+- Perpetual check recognition
+- Stalemate trap detection
 
 ### Why MIND?
 
@@ -131,12 +125,12 @@ on(gpu0) {
 |----------|---------|---------|---------------|---------------------|
 | AMD Ryzen 9 7950X | CPU | 32 | 85 | 420 |
 | Intel Xeon w9-3495X | CPU | 112 | 210 | 680 |
-| Apple M3 Max | Metal | 16+GPU | 95 | 620 |
 | Apple M4 Ultra | Metal | 32+GPU | 145 | 980 |
 | RTX 4090 | CUDA | 32+GPU | 120 | 850 |
+| RTX 5090 | CUDA | 32+GPU | 185 | 1,400 |
 | RX 7900 XTX | ROCm | 32+GPU | 105 | 720 |
 | MI300X | ROCm | 64+GPU | 280 | 2,400 |
-| 4x RTX 4090 | CUDA | 64+4GPU | 380 | 3,200 |
+| 4x RTX 5090 | CUDA | 64+4GPU | 580 | 5,200 |
 
 **Data Center / HPC**
 
@@ -144,17 +138,19 @@ on(gpu0) {
 |---------------|-------|------|---------------|---------------------|
 | DGX A100 | 1 | 8 | 640 | 12,000 |
 | DGX H100 | 1 | 8 | 1,200 | 28,000 |
-| HPC Cluster | 16 | 128 | 8,500 | 180,000 |
+| DGX GB200 | 1 | 8 | 2,400 | 56,000 |
+| GB300 NVL72 | 1 | 72 | 18,000 | 420,000 |
 | HPC Cluster | 64 | 512 | 32,000 | 720,000 |
+| Vera Rubin Cluster | 128 | 1024 | 85,000 | 1,800,000 |
 
 **Estimated Playing Strength**
 
 | Configuration | Elo | CCRL Rating |
 |---------------|-----|-------------|
-| Single GPU (RTX 4090) | 3580 | Top 5 |
-| Multi-GPU (4x RTX 4090) | 3680 | Top 3 |
-| DGX H100 | 3750 | Top 2 |
-| HPC Cluster (64 nodes) | 3850+ | #1 |
+| Single GPU (RTX 5090) | 3620 | Top 5 |
+| Multi-GPU (4x RTX 5090) | 3720 | Top 3 |
+| DGX GB200 | 3800 | Top 2 |
+| Vera Rubin Cluster (1024 GPUs) | 3900+ | #1 |
 
 *Mnps = Million nodes per second | kpos/s = Thousand positions per second*
 
@@ -173,7 +169,7 @@ on(gpu0) {
 ```
 NikolaChess/
 │
-├── src/                          # Engine Source (30 files)
+├── src/                          # Engine Source (44 files)
 │   │
 │   ├── Core
 │   │   ├── main.mind             - Entry point, initialization
@@ -186,9 +182,9 @@ NikolaChess/
 │   │   ├── search.mind           - Alpha-beta with PVS, aspiration windows
 │   │   ├── abdada.mind           - ABDADA parallel search algorithm
 │   │   ├── lmr.mind              - Late Move Reductions (adaptive)
-│   │   ├── mcts.mind             - GPU Monte Carlo Tree Search with PUCT
-│   │   ├── hybrid.mind           - SPTT hybrid alpha-beta + MCTS fusion
-│   │   ├── search_improvements.mind - History-LMR, ProbCut, killer moves
+│   │   ├── search/mcts.mind      - GPU Monte Carlo Tree Search with PUCT
+│   │   ├── search/hybrid.mind    - SPTT hybrid alpha-beta + MCTS fusion
+│   │   ├── search/search_improvements.mind - History-LMR, ProbCut, killers
 │   │   └── endgame.mind          - Endgame evaluation, tablebase probing
 │   │
 │   ├── Evaluation (NNUE)
@@ -196,11 +192,11 @@ NikolaChess/
 │   │   ├── halfka.mind           - HalfKA feature extraction (45,056 features)
 │   │   ├── transformer.mind      - Attention-based root move reranking
 │   │   ├── tensor_board.mind     - Board tensor representations
-│   │   ├── eval_improvements.mind - Fortress detection, tapered eval, contempt
+│   │   ├── eval/eval_improvements.mind - Fortress detection, tapered eval
 │   │   └── training.mind         - GPU training pipeline
 │   │
 │   ├── GPU Acceleration
-│   │   └── batched_nnue.mind     - GPU-batched NNUE for Lazy SMP (1M+ pos/sec)
+│   │   └── gpu/batched_nnue.mind - GPU-batched NNUE for Lazy SMP (1M+ pos/sec)
 │   │
 │   ├── Deep Evaluation
 │   │   ├── deep_eval.mind        - Deep neural network (20 residual blocks)
@@ -210,15 +206,30 @@ NikolaChess/
 │   │   └── ocb_simd.mind         - Opposite-color bishop endgames (SIMD)
 │   │
 │   ├── Benchmarks
-│   │   ├── framework.mind        - SPRT testing framework, A/B configuration
-│   │   └── runner.mind           - Benchmark runner (30 test positions)
+│   │   ├── bench/framework.mind  - SPRT testing framework, A/B configuration
+│   │   └── bench/runner.mind     - Benchmark runner (30 test positions)
 │   │
-│   ├── API
-│   │   └── uci_protocol.mind     - UCI protocol implementation
+│   ├── API (16 files)
+│   │   ├── api/mod.mind          - API module exports
+│   │   ├── api/uci_protocol.mind - UCI protocol implementation
+│   │   ├── api/cecp.mind         - CECP/XBoard protocol
+│   │   ├── api/arena.mind        - Arena GUI integration
+│   │   ├── api/lichess.mind      - Lichess API client
+│   │   ├── api/chesscom.mind     - Chess.com API client
+│   │   ├── api/cloud.mind        - Cloud analysis service
+│   │   ├── api/http.mind         - HTTP server for web interface
+│   │   ├── api/tcp.mind          - TCP socket server
+│   │   ├── api/websocket.mind    - WebSocket real-time communication
+│   │   ├── api/unified.mind      - Unified API abstraction layer
+│   │   ├── api/games.mind        - Game management and history
+│   │   ├── api/players.mind      - Player profiles and ratings
+│   │   ├── api/opening.mind      - Opening book API
+│   │   └── api/syzygy.mind       - Tablebase API
 │   │
 │   └── Integration
-│       ├── lichess_bot.mind      - Lichess API bot integration
-│       └── opening_book.mind     - Opening book (polyglot format)
+│       ├── lichess_bot.mind      - Lichess Bot runner
+│       ├── opening_book.mind     - Opening book (polyglot format)
+│       └── uci.mind              - Legacy UCI wrapper
 │
 ├── tools/                        # Development Tools (12 files)
 │   ├── benchmark.mind            - Performance benchmarking
@@ -453,7 +464,7 @@ mindc run tools/tune_lmr.mind -- tune 500 100
 
 The complete chess engine source code is available in this repository:
 
-- **22 source files** in `src/` - Complete engine implementation
+- **44 source files** in `src/` - Complete engine implementation
 - **12 tool files** in `tools/` - Development utilities
 - **100% Pure MIND** - No Rust, No Python, No C++
 
