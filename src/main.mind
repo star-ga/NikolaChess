@@ -33,7 +33,7 @@ import lmr;
 // ============================================================================
 
 const ENGINE_NAME: str = "NikolaChess";
-const ENGINE_VERSION: str = "3.20.0";
+const ENGINE_VERSION: str = "3.21.0";
 const ENGINE_AUTHOR: str = "STARGA, Inc.";
 
 // ============================================================================
@@ -137,23 +137,20 @@ fn print_banner() {
     println(" | |\\  | | |\\ \\___/| | (_| | |____| | | |  __/\\__ \\__ \\");
     println(" |_| \\_|_|_| \\_\\   |_|\\__,_|\\_____|_| |_|\\___||___/___/");
     println("");
-    println("                  FORTRESS");
-    println("           The Unbeatable Engine");
+    println("        Supercomputer-Class Chess Engine");
     println("              Version {}", ENGINE_VERSION);
     println("");
     println("=========================================================");
     println("");
     println(" Copyright (c) 2026 STARGA, Inc. All rights reserved.");
-    println(" PROPRIETARY AND CONFIDENTIAL");
-    println("");
-    println(" Goal: NEVER LOSE - Draw or Win Only");
-    println(" Built on MIND - GPU-Accelerated Language");
+    println(" 100% Pure MIND Language - GPU-Accelerated");
     println("");
     println(" Features:");
-    println("   - HalfKA NNUE Evaluation");
-    println("   - Transformer Root Reranking");
-    println("   - ABDADA Parallel Search");
-    println("   - Adaptive Late Move Reductions");
+    println("   - SPTT Hybrid Search (Alpha-Beta + GPU MCTS)");
+    println("   - GPU-Batched NNUE Evaluation (500M+ pos/sec)");
+    println("   - CNN-Based Fortress Detection");
+    println("   - HalfKA Architecture with Activity Features");
+    println("   - Lazy SMP + ABDADA Parallel Search");
     println("");
     println("=========================================================");
     println("");

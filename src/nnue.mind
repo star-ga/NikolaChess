@@ -207,23 +207,29 @@ fn wdl_to_cp(win: i32, draw: i32, loss: i32) -> i32 {
     (expected * 400) / 1000
 }
 
-// Load weights from .nknn file with v1/v2 version selector
+// Load weights from .nknn/.nnkn file with auto-detection
 pub fn load_weights(path: &str) -> Result<NNUEWeights, Error> {
     let file = std::fs::read(path)?;
     let mut cursor = 0;
 
-    // Parse header
+    // Parse header - support both NKNN and NNKN magic bytes
     let magic = read_u32(&file, &mut cursor);
-    if magic != 0x4E4B4E4E {  // "NKNN"
-        return Err(Error::InvalidFormat);
-    }
+    let format_type = match magic {
+        0x4E4B4E4E => "NKNN",  // Legacy weights format
+        0x4E4E4B4E => "NNKN",  // New trained model format
+        _ => return Err(Error::InvalidFormat),
+    };
+
+    println!("Detected {} format", format_type);
 
     let version = read_u32(&file, &mut cursor);
 
     // Version selector - automatically detect and load appropriate format
-    match version {
-        1 => load_weights_v1(&file, &mut cursor),
-        2 => load_weights_v2(&file, &mut cursor),
+    match (format_type, version) {
+        ("NKNN", 1) => load_weights_v1(&file, &mut cursor),
+        ("NKNN", 2) => load_weights_v2(&file, &mut cursor),
+        ("NNKN", 1) => load_weights_nnkn_v1(&file, &mut cursor),
+        ("NNKN", 2) => load_weights_nnkn_v2(&file, &mut cursor),
         _ => Err(Error::UnsupportedVersion(version)),
     }
 }
@@ -339,6 +345,229 @@ fn expand_output(v1: tensor<i8, (32, 1)>) -> tensor<i8, (L3_SIZE, 3)> {
     for i in 0..32 {
         out[i][0] = v1[i][0];  // Win channel
         out[i][2] = -v1[i][0]; // Loss channel (negated)
+    }
+    out
+}
+
+// ============================================================================
+// NNKN FORMAT LOADERS (Trained model format from consensus)
+// ============================================================================
+
+// NNKN v1: Basic trained weights format
+fn load_weights_nnkn_v1(file: &[u8], cursor: &mut usize) -> Result<NNUEWeights, Error> {
+    println!("Loading NNKN v1 format (basic trained model)");
+
+    // NNKN v1 header: record_count (8 bytes), input_size, hidden_size
+    let _record_count = read_u64(file, cursor);
+    let input_size = read_u32(file, cursor) as usize;
+    let hidden_size = read_u32(file, cursor) as usize;
+
+    println!("  Input size: {}, Hidden size: {}", input_size, hidden_size);
+
+    // Read weights in NNKN format (f32 -> convert to quantized)
+    let ft_weights_f32: Vec<f32> = read_floats(file, cursor, input_size * hidden_size);
+    let ft_biases_f32: Vec<f32> = read_floats(file, cursor, hidden_size);
+
+    // Quantize to internal format
+    let weights = quantize_nnkn_to_internal(
+        ft_weights_f32, ft_biases_f32,
+        input_size, hidden_size
+    );
+
+    Ok(weights)
+}
+
+// NNKN v2: Extended format with WDL and multiple layers
+fn load_weights_nnkn_v2(file: &[u8], cursor: &mut usize) -> Result<NNUEWeights, Error> {
+    println!("Loading NNKN v2 format (extended trained model with WDL)");
+
+    // NNKN v2 extended header
+    let record_count = read_u64(file, cursor);
+    let input_size = read_u32(file, cursor) as usize;   // 40960
+    let l1_size = read_u32(file, cursor) as usize;      // 256 or 1024
+    let l2_size = read_u32(file, cursor) as usize;      // 32
+    let l3_size = read_u32(file, cursor) as usize;      // 32
+    let has_wdl = read_u32(file, cursor) != 0;
+
+    println!("  Records: {}, Input: {}, L1: {}, L2: {}, L3: {}, WDL: {}",
+             record_count, input_size, l1_size, l2_size, l3_size, has_wdl);
+
+    // Skip reserved header bytes
+    let _reserved = read_bytes(file, cursor, 16);
+
+    // Check if this is weights or training data
+    if record_count > 1000 {
+        // This is training data, not weights - cannot load directly
+        return Err(Error::InvalidFormat("NNKN v2 contains training data, not weights"));
+    }
+
+    // Read quantization parameters
+    let quant_scale_ft = read_f32(file, cursor);
+    let quant_scale_dense = read_f32(file, cursor);
+
+    // Read feature transformer
+    let ft_weights = read_tensor_i16(file, cursor, input_size, l1_size);
+    let ft_biases = read_tensor_i16_1d(file, cursor, l1_size);
+
+    // Read hidden layers
+    let l1_weights = read_tensor_i8(file, cursor, l1_size * 2, l2_size);
+    let l1_biases = read_tensor_i32_1d(file, cursor, l2_size);
+
+    let l2_weights = read_tensor_i8(file, cursor, l2_size, l3_size);
+    let l2_biases = read_tensor_i32_1d(file, cursor, l3_size);
+
+    // Read output layer (WDL: 3 outputs, or scalar: 1 output)
+    let out_size = if has_wdl { 3 } else { 1 };
+    let output_weights = read_tensor_i8(file, cursor, l3_size, out_size);
+    let output_biases = read_tensor_i32_1d(file, cursor, out_size);
+
+    // Expand to internal format if needed
+    let weights = NNUEWeights {
+        ft_weights: expand_to_internal_ft(ft_weights, input_size, l1_size),
+        ft_biases: expand_to_internal_bias(ft_biases, l1_size),
+        l1_weights: expand_to_internal_l1(l1_weights, l1_size * 2, l2_size),
+        l1_biases: expand_to_internal_l1_bias(l1_biases, l2_size),
+        l2_weights: expand_to_internal_l2(l2_weights, l2_size, l3_size),
+        l2_biases: expand_to_internal_l2_bias(l2_biases, l3_size),
+        output_weights: expand_to_internal_out(output_weights, l3_size, out_size, has_wdl),
+        output_biases: expand_to_internal_out_bias(output_biases, out_size, has_wdl),
+    };
+
+    Ok(weights)
+}
+
+// Helper: Read f32 array
+fn read_floats(file: &[u8], cursor: &mut usize, count: usize) -> Vec<f32> {
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        result.push(read_f32(file, cursor));
+    }
+    result
+}
+
+// Helper: Quantize f32 weights to internal format
+fn quantize_nnkn_to_internal(
+    ft_weights: Vec<f32>, ft_biases: Vec<f32>,
+    input_size: usize, hidden_size: usize
+) -> NNUEWeights {
+    const QUANT_SCALE: f32 = 64.0;
+
+    // Convert and expand to internal dimensions
+    let mut weights = NNUEWeights {
+        ft_weights: tensor::zeros(),
+        ft_biases: tensor::zeros(),
+        l1_weights: tensor::zeros(),
+        l1_biases: tensor::zeros(),
+        l2_weights: identity_l2(),
+        l2_biases: tensor::zeros(),
+        output_weights: tensor::zeros(),
+        output_biases: tensor::zeros(),
+    };
+
+    // Quantize feature transformer
+    let in_dim = input_size.min(HALF_DIMS);
+    let hid_dim = hidden_size.min(L1_SIZE);
+
+    for i in 0..in_dim {
+        for j in 0..hid_dim {
+            let idx = i * hidden_size + j;
+            if idx < ft_weights.len() {
+                weights.ft_weights[i][j] = (ft_weights[idx] * QUANT_SCALE).clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+    }
+
+    for j in 0..hid_dim {
+        if j < ft_biases.len() {
+            weights.ft_biases[j] = (ft_biases[j] * QUANT_SCALE).clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+
+    weights
+}
+
+// Expansion helpers for NNKN -> internal format
+fn expand_to_internal_ft(src: tensor<i16, dyn>, in_size: usize, hid_size: usize) -> tensor<i16, (HALF_DIMS, L1_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..in_size.min(HALF_DIMS) {
+        for j in 0..hid_size.min(L1_SIZE) {
+            out[i][j] = src[i][j];
+        }
+    }
+    out
+}
+
+fn expand_to_internal_bias(src: tensor<i16, dyn>, size: usize) -> tensor<i16, (L1_SIZE,)> {
+    let mut out = tensor::zeros();
+    for i in 0..size.min(L1_SIZE) {
+        out[i] = src[i];
+    }
+    out
+}
+
+fn expand_to_internal_l1(src: tensor<i8, dyn>, in_size: usize, out_size: usize) -> tensor<i8, (L1_SIZE * 2, L2_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..in_size.min(L1_SIZE * 2) {
+        for j in 0..out_size.min(L2_SIZE) {
+            out[i][j] = src[i][j];
+        }
+    }
+    out
+}
+
+fn expand_to_internal_l1_bias(src: tensor<i32, dyn>, size: usize) -> tensor<i32, (L2_SIZE,)> {
+    let mut out = tensor::zeros();
+    for i in 0..size.min(L2_SIZE) {
+        out[i] = src[i];
+    }
+    out
+}
+
+fn expand_to_internal_l2(src: tensor<i8, dyn>, in_size: usize, out_size: usize) -> tensor<i8, (L2_SIZE, L3_SIZE)> {
+    let mut out = tensor::zeros();
+    for i in 0..in_size.min(L2_SIZE) {
+        for j in 0..out_size.min(L3_SIZE) {
+            out[i][j] = src[i][j];
+        }
+    }
+    out
+}
+
+fn expand_to_internal_l2_bias(src: tensor<i32, dyn>, size: usize) -> tensor<i32, (L3_SIZE,)> {
+    let mut out = tensor::zeros();
+    for i in 0..size.min(L3_SIZE) {
+        out[i] = src[i];
+    }
+    out
+}
+
+fn expand_to_internal_out(src: tensor<i8, dyn>, in_size: usize, out_size: usize, has_wdl: bool) -> tensor<i8, (L3_SIZE, 3)> {
+    let mut out = tensor::zeros();
+    for i in 0..in_size.min(L3_SIZE) {
+        if has_wdl {
+            for j in 0..out_size.min(3) {
+                out[i][j] = src[i][j];
+            }
+        } else {
+            // Single output -> expand to WDL
+            out[i][0] = src[i][0];   // Win
+            out[i][1] = 0;           // Draw
+            out[i][2] = -src[i][0];  // Loss (negated)
+        }
+    }
+    out
+}
+
+fn expand_to_internal_out_bias(src: tensor<i32, dyn>, size: usize, has_wdl: bool) -> tensor<i32, (3,)> {
+    let mut out = tensor::zeros();
+    if has_wdl && size >= 3 {
+        out[0] = src[0];
+        out[1] = src[1];
+        out[2] = src[2];
+    } else if size >= 1 {
+        out[0] = src[0];
+        out[1] = 0;
+        out[2] = -src[0];
     }
     out
 }
