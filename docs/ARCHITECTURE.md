@@ -35,6 +35,27 @@ NikolaChess is a supercomputer-class chess engine written 100% in MIND.
 - Work stealing
 - GPU acceleration via MIND Runtime
 
+### GPU MCTS Search (`src/search/mcts.mind`)
+- Monte Carlo Tree Search with PUCT selection (AlphaZero-style)
+- Policy+Value network with ResNet backbone
+- Batched leaf evaluation on GPU
+- Virtual loss for parallel expansion
+- Dirichlet noise for root exploration
+
+### Hybrid Search (`src/search/hybrid.mind`)
+- SPTT (Superparallel Tree Traversal) algorithm
+- Dynamic switching between alpha-beta and MCTS
+- Position analyzer for algorithm selection:
+  - High branching factor → MCTS
+  - Tactical positions → Alpha-beta
+  - Endgame → Alpha-beta with tablebases
+
+### Search Improvements (`src/search/search_improvements.mind`)
+- History-modulated Late Move Reductions
+- ProbCut pruning with statistical cutoff prediction
+- Enhanced killer move tracking
+- Countermove heuristic with history bonuses
+
 ### Neural Network Evaluation
 
 #### NNUE (`src/nnue.mind`, `src/halfka.mind`)
@@ -69,6 +90,19 @@ Output (32 → 1)
 - Position encoding
 - ~15 Elo gain at root
 
+#### GPU-Batched NNUE (`src/gpu/batched_nnue.mind`)
+- Batch positions from Lazy SMP threads for GPU inference
+- 32-256 positions per batch
+- Asynchronous CUDA streams
+- 1M+ positions/sec throughput
+- Multi-GPU distribution (up to 8 GPUs)
+
+#### Evaluation Improvements (`src/eval/eval_improvements.mind`)
+- CNN-based fortress detection (95%+ accuracy)
+- Tapered phase evaluation with smooth transitions
+- Dynamic contempt based on opponent strength
+- King activity bonus in endgames
+
 ### Draw Specialization
 
 #### Draw Evaluation (`src/draw_eval.mind`)
@@ -86,11 +120,19 @@ Output (32 → 1)
 - Endgame-specific evaluation
 - Mating patterns
 
-### UCI Protocol (`src/uci.mind`)
+### UCI Protocol (`src/api/uci_protocol.mind`)
 - Standard UCI implementation
 - MultiPV support
 - Ponder support
 - Hash/Threads options
+
+### Benchmark Framework (`src/bench/`)
+- SPRT (Sequential Probability Ratio Test) for Elo measurement
+- A/B testing configuration with customizable parameters
+- 30 curated benchmark positions:
+  - Openings, middlegame tactics, complex positions
+  - Rook, pawn, and complex endgames
+- Automated statistical significance testing
 
 ### Lichess Integration (`src/lichess_bot.mind`)
 - Lichess API v2

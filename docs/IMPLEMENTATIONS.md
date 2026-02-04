@@ -6,13 +6,13 @@ All advanced search and evaluation improvements for NikolaChess.
 
 | Feature | File | Status |
 |---------|------|--------|
-| History-modulated LMR | `src/search/improvements.mind` | ✅ Implemented |
-| ProbCut Pruning | `src/search/improvements.mind` | ✅ Implemented |
-| Killer Moves | `src/search/improvements.mind` | ✅ Implemented |
-| Countermove Heuristic | `src/search/improvements.mind` | ✅ Implemented |
-| Fortress Detection | `src/eval/improvements.mind` | ✅ Implemented |
-| Tapered Phase Eval | `src/eval/improvements.mind` | ✅ Implemented |
-| Dynamic Contempt | `src/eval/improvements.mind` | ✅ Implemented |
+| History-modulated LMR | `src/search/search_improvements.mind` | ✅ Implemented |
+| ProbCut Pruning | `src/search/search_improvements.mind` | ✅ Implemented |
+| Killer Moves | `src/search/search_improvements.mind` | ✅ Implemented |
+| Countermove Heuristic | `src/search/search_improvements.mind` | ✅ Implemented |
+| Fortress Detection | `src/eval/eval_improvements.mind` | ✅ Implemented |
+| Tapered Phase Eval | `src/eval/eval_improvements.mind` | ✅ Implemented |
+| Dynamic Contempt | `src/eval/eval_improvements.mind` | ✅ Implemented |
 | GPU-Batched NNUE | `src/gpu/batched_nnue.mind` | ✅ Implemented |
 | GPU MCTS | `src/search/mcts.mind` | ✅ Implemented |
 | Hybrid Search (SPTT) | `src/search/hybrid.mind` | ✅ Implemented |
@@ -23,7 +23,7 @@ All advanced search and evaluation improvements for NikolaChess.
 
 ## Implementation Details
 
-### 1. Search Improvements (`src/search/improvements.mind`)
+### 1. Search Improvements (`src/search/search_improvements.mind`)
 
 **History-Modulated LMR**
 - Modulates Late Move Reductions by historical move success
@@ -45,7 +45,7 @@ All advanced search and evaluation improvements for NikolaChess.
 
 ---
 
-### 2. Evaluation Improvements (`src/eval/improvements.mind`)
+### 2. Evaluation Improvements (`src/eval/eval_improvements.mind`)
 
 **Fortress Detection**
 - Detects KBN vs K, blocked pawn chains
@@ -159,16 +159,18 @@ With multi-GPU scaling (8+ GPUs): **+300-600 Elo**
 ```
 src/
 ├── search/
-│   ├── improvements.mind    # History-LMR, ProbCut, move ordering
-│   ├── mcts.mind           # GPU MCTS implementation
-│   └── hybrid.mind         # Hybrid search (SPTT)
+│   ├── search_improvements.mind  # History-LMR, ProbCut, move ordering
+│   ├── mcts.mind                 # GPU MCTS implementation
+│   └── hybrid.mind               # Hybrid search (SPTT)
 ├── eval/
-│   └── improvements.mind    # Fortress, tapered, contempt
+│   └── eval_improvements.mind    # Fortress, tapered, contempt
 ├── gpu/
-│   └── batched_nnue.mind   # GPU-batched NNUE evaluation
-└── bench/
-    ├── framework.mind      # SPRT, A/B testing framework
-    └── runner.mind         # Benchmark test runner
+│   └── batched_nnue.mind         # GPU-batched NNUE evaluation
+├── bench/
+│   ├── framework.mind            # SPRT, A/B testing framework
+│   └── runner.mind               # Benchmark test runner
+└── api/
+    └── uci_protocol.mind         # UCI protocol implementation
 ```
 
 ---
