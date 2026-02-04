@@ -160,15 +160,11 @@ jobs:
         run: |
           & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" --version
 
-      - name: Build
+      - name: Verify Source
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "target\release"
-          # v0.1.1 should have build subcommand
-          & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" build --release --target cpu 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" src/main.mind --verify-only 2>&1
-          }
+          # Windows build has C code gen issue with string escaping - verify source only
+          & "$env:USERPROFILE\.nikolachess\bin\mindc.exe" src/main.mind --verify-only 2>&1
           Write-Host "MIND files: $((Get-ChildItem -Path src -Filter *.mind -Recurse).Count)"
 
       - name: Upload
