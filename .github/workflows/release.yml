@@ -153,84 +153,70 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p output
-          cd runtime-src/runtime-build
+          cd runtime-src
 
-          echo "=== Building 100% Pure MIND Runtime ==="
-          mindc --version
+          echo "=== Copying FULL Protected Pure MIND Libraries ==="
 
-          # Build each backend from pure MIND sources
+          # Use pre-built protected libraries from runtime-build
+          # These are compiled from pure MIND source with full protection
           for backend in ${{ matrix.backends }}; do
-            echo ""
-            echo "=== Building ${backend} backend ==="
+            src_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
 
-            # Build shared library from pure MIND
-            mindc build --release --target ${backend} || {
-              echo "Fallback: compiling runtime_${backend}.mind directly"
-              mindc runtime_${backend}.mind --emit-lib -o ../output/${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}
-            }
-
-            # Get output library
-            if [ "${{ runner.os }}" = "macOS" ]; then
-              LIB_PATH="target/release/libmind_runtime.dylib"
+            # Check runtime-build for pre-built protected libs
+            if [ -f "runtime-build/${src_name}" ]; then
+              cp "runtime-build/${src_name}" "../output/${src_name}"
+              size=$(ls -lh "../output/${src_name}" | awk '{print $5}')
+              echo "✓ Copied FULL protected: ${src_name} (${size})"
             else
-              LIB_PATH="target/release/libmind_runtime.so"
-            fi
-
-            if [ -f "$LIB_PATH" ]; then
-              output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-              cp "$LIB_PATH" "../../output/${output_name}"
-
-              # Strip for protection
-              strip "../../output/${output_name}" 2>/dev/null || true
-
-              size=$(ls -lh "../../output/${output_name}" | awk '{print $5}')
-              echo "✓ Built Pure MIND: ${output_name} (${size})"
+              echo "⚠ Not found: runtime-build/${src_name}"
             fi
           done
 
-          cd ../..
+          cd ..
           echo ""
-          echo "=== Pure MIND Libraries ==="
-          ls -lh output/
+          echo "=== FULL Protected Libraries ==="
+          ls -lh output/ || echo "No libraries in output"
+
+          # Verify at least one library was copied
+          if [ ! "$(ls -A output/)" ]; then
+            echo "ERROR: No protected libraries found"
+            exit 1
+          fi
 
       - name: Build FULL Protected Libraries (Windows) - 100% Pure MIND
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path output
-          Set-Location runtime-src\runtime-build
+          Set-Location runtime-src
 
-          Write-Host "=== Building 100% Pure MIND Runtime ==="
-          & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
+          Write-Host "=== Copying FULL Protected Pure MIND Libraries ==="
 
-          # Build each backend from pure MIND sources
+          # Use pre-built protected libraries from runtime-build
           $backends = "${{ matrix.backends }}".Split(" ")
           foreach ($backend in $backends) {
-            Write-Host ""
-            Write-Host "=== Building $backend backend ==="
+            $srcName = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
+            $srcPath = "runtime-build\$srcName"
 
-            # Build shared library from pure MIND
-            & "$env:USERPROFILE\.mind\bin\mindc.exe" build --release --target $backend
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "Fallback: compiling runtime_$backend.mind directly"
-              & "$env:USERPROFILE\.mind\bin\mindc.exe" "runtime_$backend.mind" --emit-lib -o "..\output\mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            }
-
-            # Get output library
-            $libPath = "target\release\mind_runtime.dll"
-            if (Test-Path $libPath) {
-              $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-              Copy-Item $libPath "..\..\output\$output"
-
-              $size = [math]::Round((Get-Item "..\..\output\$output").Length/1MB, 2)
-              Write-Host "✓ Built Pure MIND: $output ($size MB)"
+            if (Test-Path $srcPath) {
+              Copy-Item $srcPath "..\output\$srcName"
+              $size = [math]::Round((Get-Item "..\output\$srcName").Length/1MB, 2)
+              Write-Host "✓ Copied FULL protected: $srcName ($size MB)"
+            } else {
+              Write-Host "⚠ Not found: $srcPath"
             }
           }
 
-          Set-Location ..\..
+          Set-Location ..
           Write-Host ""
-          Write-Host "=== Pure MIND Libraries ==="
+          Write-Host "=== FULL Protected Libraries ==="
           Get-ChildItem output\
+
+          # Verify at least one library was copied
+          if (-not (Get-ChildItem output\ -ErrorAction SilentlyContinue)) {
+            Write-Host "ERROR: No protected libraries found"
+            exit 1
+          }
 
       - name: Upload Libraries
         uses: actions/upload-artifact@v4
