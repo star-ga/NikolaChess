@@ -64,3 +64,9 @@ runtime-build/*.so
 runtime-build/*.dylib
 runtime-build/*.dll
 runtime-build/test_*
+
+# Python virtual environment
+tools/venv/
+
+# LLM consensus results (contains model names)
+docs/llm_consensus_results.json
