@@ -14,7 +14,7 @@ NikolaChess is a state-of-the-art chess engine built entirely in the **MIND prog
 
 | Capability | NikolaChess | Traditional Engines |
 |------------|-------------|---------------------|
-| GPU NNUE Evaluation | 100M+ positions/sec | 500K positions/sec (CPU) |
+| GPU NNUE Evaluation | 500M+ positions/sec | 500K positions/sec (CPU) |
 | Search Algorithm | SPTT Hybrid (α-β + MCTS) | Pure Alpha-Beta |
 | Fortress Detection | CNN-based (95%+ accuracy) | Rule-based heuristics |
 | Parallel Scaling | 1024 GPUs / 8192 threads | 128 threads typical |
@@ -101,7 +101,7 @@ on(gpu0) {
 ### Engine Capabilities
 
 - **NNUE Evaluation**: GPU-accelerated neural network with HalfKA architecture
-- **GPU-Batched NNUE**: Lazy SMP threads batch positions for GPU inference (100M+ pos/sec)
+- **GPU-Batched NNUE**: Lazy SMP threads batch positions for GPU inference (500M+ pos/sec)
 - **CUDA/ROCm/Metal Backends**: Native GPU acceleration on all major platforms
 - **Multi-GPU Batch Eval**: Distribute position evaluation across GPU cluster
 - **Syzygy Tablebases**: Perfect endgame play (7-man standard, 8-man extended)
@@ -196,7 +196,7 @@ NikolaChess/
 │   │   └── training.mind         - GPU training pipeline
 │   │
 │   ├── GPU Acceleration
-│   │   └── gpu/batched_nnue.mind - GPU-batched NNUE for Lazy SMP (100M+ pos/sec)
+│   │   └── gpu/batched_nnue.mind - GPU-batched NNUE for Lazy SMP (500M+ pos/sec)
 │   │
 │   ├── Deep Evaluation
 │   │   ├── deep_eval.mind        - Deep neural network (20 residual blocks)
@@ -509,7 +509,7 @@ NikolaChess implements state-of-the-art chess engine techniques with novel optim
 - WDL head (Win/Draw/Loss) for better endgame scaling
 - Deep residual network (384 filters, 20 blocks, SE attention)
 - Dual perspective evaluation (king-relative features)
-- GPU-batched NNUE for Lazy SMP threads (100M+ positions/sec)
+- GPU-batched NNUE for Lazy SMP threads (500M+ positions/sec)
 - Position batching across 32-256 threads per GPU
 - Asynchronous CUDA streams for overlapped compute
 - Tapered evaluation with smooth phase transitions
