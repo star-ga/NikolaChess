@@ -104,24 +104,41 @@ jobs:
         env:
           RUNTIME_TOKEN: ${{ secrets.RUNTIME_TOKEN }}
 
-      - name: Download MIND Compiler (Unix)
+      - name: Build MIND Compiler with mlir-build (Unix)
         if: runner.os != 'Windows'
         run: |
+          echo "=== Building mindc with mlir-build feature ==="
+          git clone --depth 1 https://github.com/star-ga/mind.git /tmp/mind-compiler
+          cd /tmp/mind-compiler
+
+          # Build with mlir-build feature for --emit-obj support
+          cargo build --release --features mlir-build
+
           mkdir -p $HOME/.mind/bin
-          curl -fsSL -o /tmp/mindc.${{ matrix.mindc_archive }} \
-            "https://github.com/star-ga/mind/releases/download/v${{ env.MIND_VERSION }}/mindc-${{ matrix.platform }}.${{ matrix.mindc_archive }}"
-          tar -xzf /tmp/mindc.${{ matrix.mindc_archive }} -C $HOME/.mind/bin/
-          chmod +x $HOME/.mind/bin/mindc*
+          cp target/release/mindc $HOME/.mind/bin/
+          chmod +x $HOME/.mind/bin/mindc
           echo "$HOME/.mind/bin" >> $GITHUB_PATH
 
-      - name: Download MIND Compiler (Windows)
+          echo "=== mindc built with mlir-build ==="
+          $HOME/.mind/bin/mindc --version
+
+      - name: Build MIND Compiler with mlir-build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          Write-Host "=== Building mindc with mlir-build feature ==="
+          git clone --depth 1 https://github.com/star-ga/mind.git $env:TEMP\mind-compiler
+          Set-Location $env:TEMP\mind-compiler
+
+          # Build with mlir-build feature for --emit-obj support
+          cargo build --release --features mlir-build
+
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.mind\bin"
-          Invoke-WebRequest -Uri "https://github.com/star-ga/mind/releases/download/v$env:MIND_VERSION/mindc-${{ matrix.platform }}.zip" -OutFile "$env:TEMP\mindc.zip"
-          Expand-Archive -Path "$env:TEMP\mindc.zip" -DestinationPath "$env:USERPROFILE\.mind\bin" -Force
+          Copy-Item target\release\mindc.exe "$env:USERPROFILE\.mind\bin\"
           echo "$env:USERPROFILE\.mind\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "=== mindc built with mlir-build ==="
+          & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
 
       - name: Build FULL Protected Libraries (Unix)
         if: runner.os != 'Windows'
@@ -129,31 +146,19 @@ jobs:
           mkdir -p output
           cd runtime-src
 
-          echo "=== Compiling protection.mind ==="
+          echo "=== Compiling protection.mind with mlir-build ==="
           mindc --version
 
-          # Compile protection.mind to object file
-          mindc src/protection.mind --emit-obj protection.o || {
-            echo "mindc --emit-obj not ready yet, using pre-built protection"
-            # Fallback: copy from runtime-build if available
-            if [ -d "runtime-build" ]; then
-              for backend in ${{ matrix.backends }}; do
-                src="runtime-build/${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-                if [ -f "$src" ]; then
-                  cp "$src" "../output/"
-                  echo "Copied pre-built: ${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-                fi
-              done
-            fi
-            exit 0
-          }
+          # Compile protection.mind to object file (MUST succeed with mlir-build)
+          mindc src/protection.mind --emit-obj -o protection.o
+          echo "✓ protection.mind compiled to protection.o"
 
-          echo "=== Building Rust runtime with protection ==="
+          echo "=== Building Rust runtime with FULL protection ==="
           cd runtime-rust
 
-          # Link protection.o into the build
+          # Link protection.o into the build for FULL protection
           export RUSTFLAGS="-C link-arg=../protection.o"
-          cargo build --release
+          cargo build --release --all-features
 
           # Get library name
           if [ "${{ runner.os }}" = "macOS" ]; then
@@ -162,19 +167,25 @@ jobs:
             LIB_NAME="libmind_runtime.so"
           fi
 
+          # Verify library size (FULL protection should be ~5-6MB)
+          LIB_SIZE=$(stat -f%z "target/release/$LIB_NAME" 2>/dev/null || stat -c%s "target/release/$LIB_NAME")
+          echo "Library size: $LIB_SIZE bytes"
+          if [ "$LIB_SIZE" -lt 3000000 ]; then
+            echo "ERROR: Library too small ($LIB_SIZE bytes). FULL protection should be ~5-6MB"
+            exit 1
+          fi
+
           # Copy for each backend
           for backend in ${{ matrix.backends }}; do
             output_name="${{ matrix.prefix }}mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            if [ -f "target/release/$LIB_NAME" ]; then
-              cp "target/release/$LIB_NAME" "../../output/${output_name}"
-              size=$(ls -lh "../../output/${output_name}" | awk '{print $5}')
-              echo "Built FULL: ${output_name} (${size})"
-            fi
+            cp "target/release/$LIB_NAME" "../../output/${output_name}"
+            size=$(ls -lh "../../output/${output_name}" | awk '{print $5}')
+            echo "✓ Built FULL: ${output_name} (${size})"
           done
 
           cd ../..
           echo ""
-          echo "=== Output ==="
+          echo "=== FULL Protected Libraries ==="
           ls -lh output/
 
       - name: Build FULL Protected Libraries (Windows)
@@ -184,47 +195,45 @@ jobs:
           New-Item -ItemType Directory -Force -Path output
           Set-Location runtime-src
 
-          Write-Host "=== Compiling protection.mind ==="
+          Write-Host "=== Compiling protection.mind with mlir-build ==="
           & "$env:USERPROFILE\.mind\bin\mindc.exe" --version
 
-          # Try to compile protection.mind
-          $emitResult = & "$env:USERPROFILE\.mind\bin\mindc.exe" src\protection.mind --emit-obj protection.obj 2>&1
+          # Compile protection.mind to object file (MUST succeed with mlir-build)
+          & "$env:USERPROFILE\.mind\bin\mindc.exe" src\protection.mind --emit-obj -o protection.obj
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "mindc --emit-obj not ready yet, using pre-built protection"
-            # Fallback: copy from runtime-build
-            $backends = "${{ matrix.backends }}".Split(" ")
-            foreach ($backend in $backends) {
-              $src = "runtime-build\mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-              if (Test-Path $src) {
-                Copy-Item $src "..\output\"
-                Write-Host "Copied pre-built: mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-              }
-            }
-            exit 0
+            Write-Host "ERROR: Failed to compile protection.mind"
+            exit 1
           }
+          Write-Host "✓ protection.mind compiled to protection.obj"
 
-          Write-Host "=== Building Rust runtime with protection ==="
+          Write-Host "=== Building Rust runtime with FULL protection ==="
           Set-Location runtime-rust
 
-          # Link protection.obj into the build
+          # Link protection.obj into the build for FULL protection
           $env:RUSTFLAGS = "-C link-arg=..\protection.obj"
-          cargo build --release
+          cargo build --release --all-features
+
+          # Verify library size (FULL protection should be ~5-6MB)
+          $libPath = "target\release\mind_runtime.dll"
+          $libSize = (Get-Item $libPath).Length
+          Write-Host "Library size: $libSize bytes"
+          if ($libSize -lt 3000000) {
+            Write-Host "ERROR: Library too small ($libSize bytes). FULL protection should be ~5-6MB"
+            exit 1
+          }
 
           # Copy for each backend
           $backends = "${{ matrix.backends }}".Split(" ")
           foreach ($backend in $backends) {
             $output = "mind_${backend}_${{ matrix.platform }}.${{ matrix.ext }}"
-            $source = "target\release\mind_runtime.dll"
-            if (Test-Path $source) {
-              Copy-Item $source "..\..\output\$output"
-              $size = (Get-Item "..\..\output\$output").Length
-              Write-Host "Built FULL: $output ($([math]::Round($size/1MB, 2)) MB)"
-            }
+            Copy-Item $libPath "..\..\output\$output"
+            $size = [math]::Round((Get-Item "..\..\output\$output").Length/1MB, 2)
+            Write-Host "✓ Built FULL: $output ($size MB)"
           }
 
           Set-Location ..\..
           Write-Host ""
-          Write-Host "=== Output ==="
+          Write-Host "=== FULL Protected Libraries ==="
           Get-ChildItem output\
 
       - name: Upload Libraries
