@@ -6,7 +6,7 @@
 
 set -e
 
-MINDC_VERSION="0.1.7"
+MINDC_VERSION="0.1.9"
 RUNTIME_VERSION="3.21.0"
 MINDC_URL="https://github.com/star-ga/mind/releases/download/v${MINDC_VERSION}"
 RUNTIME_URL="https://github.com/star-ga/NikolaChess/releases/download/v${RUNTIME_VERSION}"
