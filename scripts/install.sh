@@ -16,6 +16,11 @@ LOCAL_MODE=false
 CUDA_SUPPORT=false
 METAL_SUPPORT=false
 ROCM_SUPPORT=false
+SOURCE_BUILD=false
+
+# Minimum GLIBC version for prebuilt binaries
+MIN_GLIBC_MAJOR=2
+MIN_GLIBC_MINOR=31
 
 # Colors
 RED='\033[0;31m'
@@ -90,6 +95,34 @@ detect_platform() {
     log "Detected platform: ${PLATFORM}"
 }
 
+detect_glibc() {
+    # Only check GLIBC on Linux
+    if [ "$OS" != "linux" ]; then
+        return 0
+    fi
+
+    # Get GLIBC version
+    if command -v ldd &>/dev/null; then
+        GLIBC_VERSION=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        if [ -n "$GLIBC_VERSION" ]; then
+            GLIBC_MAJOR=$(echo "$GLIBC_VERSION" | cut -d. -f1)
+            GLIBC_MINOR=$(echo "$GLIBC_VERSION" | cut -d. -f2)
+
+            log "Detected GLIBC: ${GLIBC_VERSION}"
+
+            # Check if GLIBC is too old
+            if [ "$GLIBC_MAJOR" -lt "$MIN_GLIBC_MAJOR" ] || \
+               ([ "$GLIBC_MAJOR" -eq "$MIN_GLIBC_MAJOR" ] && [ "$GLIBC_MINOR" -lt "$MIN_GLIBC_MINOR" ]); then
+                warn "GLIBC ${GLIBC_VERSION} is older than required ${MIN_GLIBC_MAJOR}.${MIN_GLIBC_MINOR}"
+                warn "Falling back to source build..."
+                SOURCE_BUILD=true
+            fi
+        fi
+    else
+        warn "Cannot detect GLIBC version, assuming compatible"
+    fi
+}
+
 detect_gpu() {
     # NVIDIA CUDA
     if command -v nvidia-smi &>/dev/null; then
@@ -133,6 +166,10 @@ parse_args() {
                 ROCM_SUPPORT=true
                 shift
                 ;;
+            --source)
+                SOURCE_BUILD=true
+                shift
+                ;;
             --version)
                 VERSION="$2"
                 shift 2
@@ -144,6 +181,7 @@ parse_args() {
                 echo ""
                 echo "Options:"
                 echo "  --local        Install from local build (development)"
+                echo "  --source       Build from source (for old GLIBC systems)"
                 echo "  --cuda         Enable NVIDIA CUDA support"
                 echo "  --metal        Enable Apple Metal support"
                 echo "  --rocm         Enable AMD ROCm support"
@@ -166,6 +204,67 @@ create_directories() {
     mkdir -p "${INSTALL_DIR}/models"
     mkdir -p "${INSTALL_DIR}/book"
     mkdir -p "${INSTALL_DIR}/syzygy"
+}
+
+install_from_source() {
+    log "Building from source (GLIBC compatibility mode)..."
+
+    # Check for build dependencies
+    if ! command -v git &>/dev/null; then
+        error "git is required for source build. Install with: sudo apt install git"
+    fi
+
+    # Clone NikolaChess source
+    NIKOLACHESS_SRC="${INSTALL_DIR}/src/NikolaChess"
+    if [ ! -d "$NIKOLACHESS_SRC" ]; then
+        log "Cloning NikolaChess source..."
+        mkdir -p "${INSTALL_DIR}/src"
+        git clone --depth 1 https://github.com/star-ga/NikolaChess.git "$NIKOLACHESS_SRC" || \
+            error "Failed to clone NikolaChess"
+    fi
+
+    # Download mindc compiler (still needs compatible GLIBC, try anyway)
+    log "Downloading mindc compiler..."
+    MINDC_TAR="https://github.com/star-ga/mind/releases/download/v0.1.9/mindc-${PLATFORM}.tar.gz"
+    if curl -fsSL "$MINDC_TAR" -o "/tmp/mindc-${PLATFORM}.tar.gz" 2>/dev/null; then
+        tar -xzf "/tmp/mindc-${PLATFORM}.tar.gz" -C "${INSTALL_DIR}/bin/"
+        chmod +x "${INSTALL_DIR}/bin/mindc"
+        rm -f "/tmp/mindc-${PLATFORM}.tar.gz"
+        log "Downloaded mindc"
+    else
+        warn "Could not download mindc - may need to build from source"
+        warn "Visit https://github.com/star-ga/mind for build instructions"
+        return 1
+    fi
+
+    # Download runtime libraries
+    log "Downloading runtime libraries..."
+    RUNTIME_URL="https://github.com/star-ga/NikolaChess/releases/download/v${VERSION}/libmind_cpu_${PLATFORM}.${LIB_EXT}"
+    if curl -fsSL "$RUNTIME_URL" -o "${INSTALL_DIR}/lib/libmind_cpu_${PLATFORM}.${LIB_EXT}" 2>/dev/null; then
+        log "Downloaded CPU runtime"
+    else
+        warn "Could not download runtime library"
+    fi
+
+    # Build NikolaChess from source
+    log "Building NikolaChess..."
+    cd "$NIKOLACHESS_SRC"
+    export MIND_LIB_PATH="${INSTALL_DIR}/lib"
+    export PATH="${INSTALL_DIR}/bin:$PATH"
+
+    if "${INSTALL_DIR}/bin/mindc" build --release --target cpu 2>/dev/null; then
+        if [ -f "target/release/nikola-cpu" ]; then
+            cp "target/release/nikola-cpu" "${INSTALL_DIR}/bin/nikola"
+            chmod +x "${INSTALL_DIR}/bin/nikola"
+            log "Built and installed nikola"
+        elif [ -f "target/release/nikola" ]; then
+            cp "target/release/nikola" "${INSTALL_DIR}/bin/nikola"
+            chmod +x "${INSTALL_DIR}/bin/nikola"
+            log "Built and installed nikola"
+        fi
+    else
+        error "Failed to build NikolaChess from source"
+    fi
 }
 
 install_local() {
@@ -337,11 +436,14 @@ main() {
     print_banner
     parse_args "$@"
     detect_platform
+    detect_glibc
     detect_gpu
     create_directories
 
     if [ "$LOCAL_MODE" = true ]; then
         install_local
+    elif [ "$SOURCE_BUILD" = true ]; then
+        install_from_source
     else
         install_remote
     fi
