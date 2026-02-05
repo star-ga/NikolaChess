@@ -90,12 +90,12 @@ Ensure consistent tensor operations across all targets:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    MindLang Tensor API                   │
+│                    MindLang Tensor API                  │
 ├─────────────┬─────────────┬─────────────┬───────────────┤
 │    CUDA     │    ROCm     │    Metal    │    WebGPU     │
 │  (NVIDIA)   │    (AMD)    │   (Apple)   │   (Browser)   │
 ├─────────────┴─────────────┴─────────────┴───────────────┤
-│                      CPU Fallback                        │
+│                      CPU Fallback                       │
 │              (AVX-512 / NEON / WASM SIMD)               │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -278,27 +278,27 @@ Where:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   MCTS Controller                        │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│  │ Worker 1 │  │ Worker 2 │  │ Worker N │  ...×1024    │
-│  │  Tree 1  │  │  Tree 2  │  │  Tree N  │              │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘              │
+│                   MCTS Controller                       │
+│                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐               │
+│  │ Worker 1 │  │ Worker 2 │  │ Worker N │  ...×1024     │
+│  │  Tree 1  │  │  Tree 2  │  │  Tree N  │               │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘               │
 │       │             │             │                     │
 │       └─────────────┼─────────────┘                     │
-│                     ▼                                    │
+│                     ▼                                   │
 │            ┌─────────────────┐                          │
-│            │  Batch Collector │                          │
+│            │  Batch Collector │                         │
 │            │  (512–4096 pos) │                          │
 │            └────────┬────────┘                          │
-│                     ▼                                    │
+│                     ▼                                   │
 │            ┌─────────────────┐                          │
 │            │   GPU Inference  │  ← Single forward pass  │
-│            │   (Transformer)  │                          │
+│            │   (Transformer)  │                         │
 │            └────────┬────────┘                          │
-│                     ▼                                    │
+│                     ▼                                   │
 │            ┌─────────────────┐                          │
-│            │ Result Scatter   │                          │
+│            │ Result Scatter   │                         │
 │            └─────────────────┘                          │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -346,19 +346,19 @@ struct Edge {
 Self-Play Pipeline:
 
 ┌─────────────────────────────────────────────────────────┐
-│                    Game Generator                        │
-│                                                          │
-│  For each game:                                          │
+│                    Game Generator                       │
+│                                                         │
+│  For each game:                                         │
 │    1. Initialize from random opening (8-ply book)       │
 │    2. Play with MCTS (800 simulations/move)             │
-│    3. Temperature schedule:                              │
+│    3. Temperature schedule:                             │
 │       - Moves 1-30: τ=1.0 (exploration)                 │
 │       - Moves 31+: τ=0.1 (exploitation)                 │
 │    4. Add Dirichlet noise at root: Dir(0.3)             │
 │    5. Record (position, policy, outcome) tuples         │
 │    6. Terminate on checkmate, stalemate, or 512 moves   │
-│                                                          │
-│  Output: ~500 positions per game                         │
+│                                                         │
+│  Output: ~500 positions per game                        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -368,20 +368,20 @@ Self-Play Pipeline:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Replay Buffer                         │
-│                                                          │
+│                    Replay Buffer                        │
+│                                                         │
 │  Capacity: 2M positions (FIFO eviction)                 │
-│                                                          │
-│  Each sample:                                            │
+│                                                         │
+│  Each sample:                                           │
 │    - Position tensor: 119 × 8 × 8 (f16)                 │
 │    - Policy target: 1858 (f16, visit proportions)       │
 │    - Value target: scalar (f32, game outcome)           │
 │    - Metadata: game_id, move_number, timestamp          │
-│                                                          │
-│  Augmentation:                                           │
+│                                                         │
+│  Augmentation:                                          │
 │    - 8× symmetry (rotations + reflections)              │
-│    - Color flip (swap perspectives)                      │
-│                                                          │
+│    - Color flip (swap perspectives)                     │
+│                                                         │
 │  Storage: ~150GB uncompressed, ~40GB with fp16          │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -441,19 +441,19 @@ Arena Schedule (every 10K training steps):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              Syzygy Tablebase Probing                    │
-│                                                          │
+│              Syzygy Tablebase Probing                   │
+│                                                         │
 │  Trigger: ≤7 pieces on board                            │
-│                                                          │
-│  Probe returns:                                          │
+│                                                         │
+│  Probe returns:                                         │
 │    - WDL: Win/Draw/Loss with optimal play               │
 │    - DTZ: Distance to zeroing (capture/pawn move)       │
-│                                                          │
-│  Integration modes:                                      │
+│                                                         │
+│  Integration modes:                                     │
 │    1. Hard cutoff: Replace search at probe depth        │
 │    2. Soft bias: Adjust value head output               │
 │    3. Training signal: Include TB positions in buffer   │
-│                                                          │
+│                                                         │
 │  Coverage: 6-man (1.5GB), 7-man (140GB)                 │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -515,27 +515,27 @@ Opening Book Modes:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Deployment Modes                      │
+│                    Deployment Modes                     │
 ├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  [Standalone]                                            │
+│                                                         │
+│  [Standalone]                                           │
 │    Single binary, UCI protocol                          │
 │    Works with: Arena, SCID, Lichess, Chess.com          │
-│                                                          │
-│  [Server]                                                │
+│                                                         │
+│  [Server]                                               │
 │    REST API + WebSocket for real-time analysis          │
 │    Docker image, Kubernetes ready                       │
-│                                                          │
-│  [Cluster]                                               │
+│                                                         │
+│  [Cluster]                                              │
 │    Distributed hash table across nodes                  │
 │    MPI or gRPC for inter-node communication             │
 │    Target: TCEC Superfinal hardware                     │
-│                                                          │
-│  [Embedded]                                              │
+│                                                         │
+│  [Embedded]                                             │
 │    Reduced network (10M params)                         │
 │    CPU-only, deterministic mode                         │
 │    Target: DGT boards, dedicated chess computers        │
-│                                                          │
+│                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
