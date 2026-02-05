@@ -22,6 +22,9 @@ SOURCE_BUILD=false
 MIN_GLIBC_MAJOR=2
 MIN_GLIBC_MINOR=31
 
+# Static build includes bundled GLIBC 2.39
+STATIC_BUILD=false
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -114,8 +117,8 @@ detect_glibc() {
             if [ "$GLIBC_MAJOR" -lt "$MIN_GLIBC_MAJOR" ] || \
                ([ "$GLIBC_MAJOR" -eq "$MIN_GLIBC_MAJOR" ] && [ "$GLIBC_MINOR" -lt "$MIN_GLIBC_MINOR" ]); then
                 warn "GLIBC ${GLIBC_VERSION} is older than required ${MIN_GLIBC_MAJOR}.${MIN_GLIBC_MINOR}"
-                warn "Falling back to source build..."
-                SOURCE_BUILD=true
+                warn "Will use static build with bundled GLIBC 2.39..."
+                STATIC_BUILD=true
             fi
         fi
     else
@@ -170,6 +173,10 @@ parse_args() {
                 SOURCE_BUILD=true
                 shift
                 ;;
+            --static)
+                STATIC_BUILD=true
+                shift
+                ;;
             --version)
                 VERSION="$2"
                 shift 2
@@ -182,6 +189,7 @@ parse_args() {
                 echo "Options:"
                 echo "  --local        Install from local build (development)"
                 echo "  --source       Build from source (for old GLIBC systems)"
+                echo "  --static       Use static build with bundled GLIBC 2.39"
                 echo "  --cuda         Enable NVIDIA CUDA support"
                 echo "  --metal        Enable Apple Metal support"
                 echo "  --rocm         Enable AMD ROCm support"
@@ -204,6 +212,58 @@ create_directories() {
     mkdir -p "${INSTALL_DIR}/models"
     mkdir -p "${INSTALL_DIR}/book"
     mkdir -p "${INSTALL_DIR}/syzygy"
+}
+
+install_static() {
+    log "Installing static build with bundled GLIBC 2.39..."
+
+    # Static builds are self-contained with GLIBC bundled
+    # They use a different naming convention: nikola-static-{platform}
+
+    # Download static NikolaChess binary
+    STATIC_TAR="${GITHUB_RELEASE}/nikola-static-${PLATFORM}-v${VERSION}.tar.gz"
+    if curl -fsSL "$STATIC_TAR" -o "/tmp/nikola-static-${PLATFORM}.tar.gz" 2>/dev/null; then
+        tar -xzf "/tmp/nikola-static-${PLATFORM}.tar.gz" -C "${INSTALL_DIR}/bin/"
+        chmod +x "${INSTALL_DIR}/bin/nikola"*
+        rm -f "/tmp/nikola-static-${PLATFORM}.tar.gz"
+        log "Downloaded static NikolaChess (GLIBC 2.39 bundled)"
+    else
+        warn "Static build not available, trying source build..."
+        install_from_source
+        return
+    fi
+
+    # Download static runtime library
+    STATIC_LIB="${GITHUB_RELEASE}/libmind_cpu_static_${PLATFORM}.${LIB_EXT}"
+    if curl -fsSL "$STATIC_LIB" -o "${INSTALL_DIR}/lib/libmind_cpu_${PLATFORM}.${LIB_EXT}" 2>/dev/null; then
+        log "Downloaded static CPU runtime"
+    else
+        # Try regular runtime (might work with bundled interpreter)
+        RUNTIME_URL="${GITHUB_RELEASE}/libmind_cpu_${PLATFORM}.${LIB_EXT}"
+        curl -fsSL "$RUNTIME_URL" -o "${INSTALL_DIR}/lib/libmind_cpu_${PLATFORM}.${LIB_EXT}" 2>/dev/null && \
+            log "Downloaded CPU runtime" || \
+            warn "Could not download runtime library"
+    fi
+
+    # Download static mindc compiler
+    STATIC_MINDC="${GITHUB_RELEASE}/mindc-static-${PLATFORM}.tar.gz"
+    if curl -fsSL "$STATIC_MINDC" -o "/tmp/mindc-static-${PLATFORM}.tar.gz" 2>/dev/null; then
+        tar -xzf "/tmp/mindc-static-${PLATFORM}.tar.gz" -C "${INSTALL_DIR}/bin/"
+        chmod +x "${INSTALL_DIR}/bin/mindc"
+        rm -f "/tmp/mindc-static-${PLATFORM}.tar.gz"
+        log "Downloaded static MIND compiler"
+    else
+        # Try from mind repo
+        MINDC_TAR="https://github.com/star-ga/mind/releases/download/v0.1.9/mindc-static-${PLATFORM}.tar.gz"
+        if curl -fsSL "$MINDC_TAR" -o "/tmp/mindc-static.tar.gz" 2>/dev/null; then
+            tar -xzf "/tmp/mindc-static.tar.gz" -C "${INSTALL_DIR}/bin/"
+            chmod +x "${INSTALL_DIR}/bin/mindc"
+            rm -f "/tmp/mindc-static.tar.gz"
+            log "Downloaded static mindc"
+        else
+            warn "Static mindc not available"
+        fi
+    fi
 }
 
 install_from_source() {
@@ -442,6 +502,8 @@ main() {
 
     if [ "$LOCAL_MODE" = true ]; then
         install_local
+    elif [ "$STATIC_BUILD" = true ]; then
+        install_static
     elif [ "$SOURCE_BUILD" = true ]; then
         install_from_source
     else
