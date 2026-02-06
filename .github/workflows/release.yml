@@ -22,7 +22,7 @@ permissions:
 
 env:
   NIKOLACHESS_VERSION: "3.21.0"
-  MIND_VERSION: "0.1.7"
+  MIND_VERSION: "0.1.9"
 
 jobs:
   # ==========================================================================
@@ -83,7 +83,7 @@ jobs:
         run: |
           # Download pre-built MLIR tools from star-ga/mlir-tools
           echo "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
-          MLIR_VERSION="llvmorg-18.1.8"
+          MLIR_VERSION="llvmorg-21.1.8"
           ARCHIVE="mlir-${{ matrix.platform }}.tar.gz"
 
           mkdir -p $HOME/.mlir-tools
@@ -106,7 +106,7 @@ jobs:
         run: |
           # Download pre-built MLIR tools from star-ga/mlir-tools
           echo "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
-          MLIR_VERSION="llvmorg-18.1.8"
+          MLIR_VERSION="llvmorg-21.1.8"
           ARCHIVE="mlir-${{ matrix.platform }}.tar.gz"
 
           mkdir -p $HOME/.mlir-tools
@@ -128,7 +128,7 @@ jobs:
         run: |
           # Download pre-built MLIR tools from star-ga/mlir-tools
           Write-Host "=== Downloading MLIR Tools from star-ga/mlir-tools ==="
-          $mlirVersion = "llvmorg-18.1.8"
+          $mlirVersion = "llvmorg-21.1.8"
           $archive = "mlir-${{ matrix.platform }}.zip"
 
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.mlir-tools" | Out-Null
