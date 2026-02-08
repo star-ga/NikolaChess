@@ -1,265 +1,233 @@
-# NikolaChess Roadmap (Updated February 2026)
+# NikolaChess Roadmap  
+## v4.0 — NIKOLA 2.0 (Neural-Symbolic Engine with Continuous-Time Reasoning)
 
-**Current Stable**: v3.21.0 (Feb 2026 – full MIND transition, GPU NNUE/SPTT hybrid)
-**Next Major**: v4.0.0 (Codename: NIKOLA 2.0 – Hybrid Neural-Symbolic + Remizov enhancements)
-**Repository**: github.com/star-ga/nikolachess
-**Core Technology**: 100% MindLang (mindlang.dev) – GPU-native, autodiff, deterministic
-**Target Release**: Q4 2026
-**Elo Goal**: 4000+ on consumer GPU, 4200+ on clusters
+This document outlines the strategic and technical development plan for **NikolaChess** as it transitions from a high-performance NNUE engine into a **Neural-Symbolic chess engine** with **continuous-time evaluation dynamics** and analytic stability guarantees.
 
 ---
 
-## Why This Roadmap?
+## 📍 Current Status
 
-v4.0 shifts from pure NNUE/alpha-beta → **hybrid symbolic-neural engine**:
-- Transformer policy/value net (better pattern understanding)
-- GPU-batched MCTS with **Remizov-Monte-Carlo rollouts** for long-horizon stability
-- Symbolic tools (Remizov ODE solvers) for fortress/draw detection & eval smoothing
-- Leverages MindLang examples: `remizov_feynman.mind`, `remizov_gpu.mind`, `remizov_inverse.mind`
-
----
-
-## Executive Summary
-
-NikolaChess v4.0 represents a generational leap from the current NNUE-based architecture to a **hybrid neural-symbolic engine** combining:
-
-- **Transformer-based evaluation** replacing NNUE for superior pattern recognition
-- **GPU-batched Monte Carlo Tree Search** (MCTS) with AlphaZero-style learning
-- **Remizov-Monte-Carlo integration** for stability in long-horizon calculations
-- **Compile-time symbolic reasoning** for endgames, fortresses, and theoretical positions
-- **Self-play training pipeline** leveraging MindLang's microsecond compile times
-
-**Target Performance**: 4000+ Elo on standard hardware, 4200+ on compute clusters.
+- **Current Stable**: v3.21.0  
+- **Playing Strength**: ~3850 Elo (CCRL / CEGT)  
+- **Architecture**: NNUE + Alpha-Beta / SPTT Hybrid  
+- **Language**: 100% MindLang  
+- **Execution**: Deterministic, GPU-native
 
 ---
 
-## Why MindLang?
+## 🎯 Vision & Motivation
 
-MindLang provides unique advantages that make this architecture possible:
+Modern engines — whether alpha-beta based or neural MCTS (Lc0 / KataGo) — excel tactically but still struggle with **stability reasoning** in positions that are:
 
-| Capability | Benefit for Chess Engines |
-|------------|---------------------------|
-| Microsecond compile times | Iterate neural architectures 100x faster than C++/Rust |
-| Compile-time autodiff | Training loops with zero runtime gradient overhead |
-| Bit-level determinism | Reproducible games across all hardware platforms |
-| Native GPU codegen | CUDA, ROCm, Metal, WebGPU from single source |
-| Unified scalar/tensor | Bitboard search + neural eval in one language |
+- Theoretically drawn but evaluated as winning  
+- Fortress-like with no clear breakthrough  
+- Long-horizon but shallow in search depth  
+
+We call these **Neural Blind Spots**.
+
+NikolaChess v4.0 addresses this fundamental gap by treating evaluation **as a continuous flow** over the game state, using **Remizov ODE solvers** as a **search primitive** — not just a heuristic addition.
+
+Instead of asking *“What is the best move now?”*, Nikola asks:  
+> **Where does this position converge?**  
+> Is its evaluation an attractor, or a transient illusion?
+
+This roadmap defines a **pragmatic yet ambitious** path to that future.
 
 ---
 
-## Version History & Migration Path
+## 🧠 Architecture Overview
 
+*(Rendered using GitHub-native Mermaid support)*
+
+```mermaid
+graph TD
+    A[Board Position] --> B{Search Mode}
+    B -->|v3.x Legacy| C[Alpha-Beta / SPTT]
+    B -->|v4.0 Hybrid| D[Remizov-Guided Hybrid Search]
+
+    D --> E[Transformer Policy/Value Eval]
+    D --> F[Remizov ODE Flow Solver]
+
+    E --> G[Local Policy + Value]
+    F --> H[Global Stability / Attractor Score]
+    F --> I[Continuous Value Projection t=5–10]
+
+    G --> J[Search Selection / Pruning]
+    H --> J
+    I --> J
+
+    J --> K[Best Move / Tree Update]
+
+    style F fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+    style H fill:#fff3e6,stroke:#cc6600,stroke-width:2px
+    style I fill:#e6ffe6,stroke:#006600,stroke-width:2px
 ```
-v1.x (2024)     Classical alpha-beta, handcrafted eval
-     │
-v2.x (2025)     NNUE integration, basic GPU acceleration
-     │
-v3.x (Current)  Full NNUE, multi-backend GPU, 3850+ Elo
-     │
-v4.0 (2026)     Transformer + MCTS + Remizov hybrid, 4000+ Elo target
-```
 
-**Backward Compatibility**: v4.0 will maintain UCI protocol compatibility. Existing GUIs, tournament software, and analysis tools will work without modification.
+**Flow Explanation**:
+- **Transformer** → fast, local pattern intuition  
+- **Remizov ODE Solver** → global stability & long-horizon projection  
+- **Hybrid Search** → combines both signals for final decisions  
 
 ---
 
-## Phase 0: v3.21.x Maintenance (Now – Q1 2026)
+## 📐 Key Principles
 
-Continue supporting the current stable branch while v4.0 development proceeds.
+1. **Continuous-Time Evaluation**  
+   Evaluation drift modeled as a differential process — a flow field, not discrete snapshots.
 
-- Bug fixes from tournaments
-- NNUE auto-detection & weight updates
-- Windows installer & WebGPU stabilization
-- SPTT hybrid search docs & benchmarks
+2. **Analytic Attractor Detection**  
+   Early identification of fortress/draw stability via ODE convergence criteria.
 
-**Deliverable**: Stable v3.21.1–v3.22.0 releases
+3. **Neural + Symbolic Harmony**  
+   Transformer pattern recognition + Remizov analytic guarantees in one pipeline.
 
-### v3.21.1 (February 2026)
-- [ ] Bug fixes from tournament feedback
-- [ ] Minor NNUE weight updates
-- [ ] Build system improvements
-
-### v3.22.0 (March 2026)
-- [ ] Final NNUE architecture optimizations
-- [ ] Improved time management heuristics
-- [ ] WebGPU backend stabilization
-
-**Note**: v3.x receives security and critical fixes through Q2 2027.
+4. **Pragmatic Incrementality**  
+   Phased rollout: rollout improvements → infrastructure → hybrid search → full training.
 
 ---
 
-## Phase 1: Remizov-Monte-Carlo Integration (Q1–Q2 2026) – Quick Win
+## 🛠 Strategic Phases
 
-**Goal**: Integrate Remizov-Monte-Carlo into MCTS for lower variance in long-horizon evaluations and stronger fortress/draw handling.
+### Phase 0 — Maintenance & Stabilization  
+**Timeline**: Now → Q1 2026  
+**Owner**: Core Team
 
-### Key Additions
-1. **Remizov-MC Rollouts** (high priority)
-   - Use `remizov_feynman.mind` / `remizov_gpu.mind` for short trajectories (n=30–100)
-   - Model eval features (material delta, king safety, center control) as 2nd-order ODE
-   - Replace 20–50% random rollouts → better endgame/draw stability
+Objectives:
+- Long-term support for v3.x  
+- Tournament bug fixes  
+- WebGPU / multi-platform stabilization  
 
-2. **Remizov Smoother in Evaluation**
-   - Hybrid: `score = nn_output + α * remizov_smooth(features, t=5–10 pseudo-moves)`
-   - GPU-batched via `remizov_gpu.mind`
+Deliverables:
 
-3. **Fortress/Draw Detector**
-   - Remizov limit → stability score (low variance across trajectories → fortress flag)
-   - Dynamic contempt & draw adjudication
-
-**Milestones**:
-- Feature flag `--remizov-rollout` in MCTS
+| Subphase | Goals | Status |
+|--------|------|--------|
+| v3.21.x | Feedback fixes, NNUE refresh | In progress |
+| v3.22.0 | Backend + time management | Planned |
+| Build | ARM64 / Windows improvements | Planned |
 
 ---
 
-## Phase 1.5: Core Infrastructure (Q1 2026)
+### Phase 1 — Remizov-Monte-Carlo  
+**Timeline**: Q1 2026  
+**Owner**: Search + Math Team
 
-**Objective**: Refactor the engine core to support hybrid evaluation and MCTS.
+Introduce continuous evaluation flow into rollouts.
 
-### 1.1 Board Representation Overhaul
-
-| Component | Current (v3.x) | Target (v4.0) |
-|-----------|----------------|---------------|
-| Bitboards | Partial MindLang | 100% pure MindLang |
-| Move generation | Mixed C/Mind | Fully vectorized Mind |
-| Position hashing | Zobrist 64-bit | Zobrist 128-bit + neural hash |
-| State encoding | NNUE input | 119-plane tensor |
-
-**Deliverable**: `board.mind` rewrite with 2x move generation throughput.
-
-### 1.2 Multi-Backend Tensor Runtime
-
-Ensure consistent tensor operations across all targets (CUDA, ROCm, Metal, WebGPU).
-
-**Benchmarks Required**:
-- Matrix multiply throughput (GFLOPS)
-- Batch inference latency (positions/sec)
-- Memory bandwidth utilization
-
-### 1.3 Search Architecture Preparation
-
-Introduce modular search interface supporting both paradigms (AlphaBeta, MCTS, Hybrid).
-
-**Milestone**: Both search strategies playable via UCI by end of Q1.
+Deliverables:
+- **Remizov-MC Rollouts** — replace 20–50% random playouts with ODE trajectories (`remizov_feynman.mind`)
+- **Variance Smoothing** — reduce oscillation in drawish regions
+- **Analytic Contempt** — dynamic scaling via attractor strength
 
 ---
 
-## Phase 2: Transformer Evaluator (Q2 2026)
+### Phase 1.5 — Core Infrastructure Refactor  
+**Timeline**: Q1 2026  
+**Owner**: Core / Infra Team
 
-**Goal**: Introduce transformer-based evaluator for better positional/pattern recognition.
+Targets:
 
-### 2.1 Architecture Specification
+| Component | From | To |
+|---------|------|----|
+| Move Generation | Scattered | 100% vectorized Mind |
+| Position Encoding | NNUE planes | 119-plane tensor |
+| Hashing | Zobrist-64 | Zobrist-128 + neural |
 
-**Input Encoding** (119 planes, 8x8 each) & **Network Architecture** (12–16 transformer blocks).
-
-- Input: 119 planes (pieces, attacks, history, repetition)
-- 12–16 transformer blocks (dim 512–1024, 8–16 heads)
-- Policy head: 1858 logits (masked legal moves)
-- Value head: scalar [-1, +1]
-
-**Fallback**: NNUE/hybrid mode for CPU/low-latency play.
-
-**Milestones**:
-- Standalone transformer eval ≥3500 Elo
-- Hybrid NNUE+Transformer testing
-- Complete: end Q3
+Deliverables:
+- `board.mind` full rewrite (~2× throughput)
+- Tensor runtime consistency across all backends
 
 ---
 
-## Phase 3: MCTS Implementation (Q2–Q3 2026)
+### Phase 2 — Transformer Evaluator  
+**Timeline**: Q2 2026  
+**Owner**: Neural Team
 
-**Goal**: High-throughput GPU MCTS (1M+ nps on consumer GPUs).
+Goals:
+- 16-block Transformer (512 hidden dim)
+- Convert ~5B v3.x positions to transformer-ready datasets
+- Hybrid inference (Transformer + NNUE fallback)
 
-### 3.1 Core MCTS Algorithm & GPU Batching
-- PUCT + Dirichlet noise + virtual loss
-- Batched inference (512–4096 positions)
-- Tree memory: 50M+ nodes (8GB budget)
-
-### 3.2 Remizov Synergy
-- Use Remizov-guided priors in selection (stability score boosts drawish/exploratory lines)
-
-**Milestone**: Tournament-ready MCTS by end of Q3.
+**Target**: ≥3500 Elo standalone
 
 ---
 
-## Phase 4: Self-Play & Training Loop (Q3 2026)
+### Phase 3 — Remizov-Guided Hybrid Search  
+**Timeline**: Q2 → Q3 2026  
+**Owner**: Search + Neural Team  
 
-**Goal**: Full self-play training pipeline closing the AlphaZero-style loop.
+**This phase defines the core novelty.**
 
-### 4.1 Training Pipeline
-- Generate 500+ positions/game (temperature schedule, Dirichlet)
-- Replay buffer: 2M+ augmented samples
-- **Remizov Regularizer**: Train transformer with Remizov regularizer (via `remizov_inverse.mind` for interpretable coefficients)
+Deliverables:
+- **Flow-Field Search** — evaluation treated as a dynamical system  
+- **Attractor Pruning** — prune converging-to-draw subtrees analytically  
+- **GPU Batching** — 4096+ positions/sec on consumer GPUs  
 
-### 4.2 Training Loop & Evaluation
-- MindLang compile-time autodiff
-- Automated tournament system for checkpoint evaluation
+**Key Insight**  
+Unlike standard MCTS (Lc0 / KataGo), decisions are driven by **analytic convergence** (Remizov ODE limits), not just visit counts or neural priors.
 
-**Milestone**: v4.0 release candidate – 4000+ Elo self-play.
-
----
-
-## Phase 5: Symbolic Integration (Q4 2026)
-
-**Objective**: Enhance neural evaluation with compile-time symbolic knowledge (Tablebases, Fortress Detection).
+This enables **early analytic detection of fortresses and draw convergence**, even in positions where neural networks remain overconfident.
 
 ---
 
-## Stretch Goals (Q4 2026+)
-- Inverse Remizov for eval learning (recover ODE coeffs from games)
-- Remizov in opening prep (continuous-time policy smoothing)
-- 8-man tablebase hints via symbolic Remizov verification
+### Phase 4 — Self-Play & Evolutionary Training  
+**Timeline**: Q3 2026  
+**Owner**: Training Team
+
+Deliverables:
+- Distributed self-play orchestration in MindLang
+- **Inverse Remizov Regularization** — train networks to favor stable attractors
+- Automated Elo benchmarking vs Stockfish, Lc0, Torch
+
+**Target**: 4000+ Elo self-play
 
 ---
 
-## Phase 6: Deployment & Ecosystem (Q4 2026+)
+### Phase 5 — Symbolic Layer & Release  
+**Timeline**: Q4 2026  
+**Owner**: Release + Infra Teams
 
-### 6.1 Platform Targets
-Linux, Windows, macOS, WebAssembly, Android, iOS.
-
-### 6.2 Deployment Modes
-Standalone, Server, Cluster, Embedded.
-
----
-
-## Performance Targets & Risk Assessment
-
-(Maintained from previous roadmap)
+Deliverables:
+- Fortress certification & symbolic proofs
+- Universal binaries (Windows, Linux, macOS Metal, Android)
+- Full technical whitepaper on Remizov-Guided Search
 
 ---
 
-## Contributing
+## 📈 Technical Performance Targets
 
-We welcome contributions across all phases, especially in:
-1. **Core Development**: MindLang proficiency required
-2. **Remizov Integration**: Symbolic math & physics-inspired ML
-3. **Training Infrastructure**: Distributed systems experience
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-## Timeline Summary
-
-| Phase | Dates | Key Deliverable |
-|-------|-------|-----------------|
-| 0 | Now – Q1 2026 | v3.21.x maintenance |
-| 1 | Q1–Q2 2026 | Remizov-Monte-Carlo Integration |
-| 1.5 | Q1 2026 | Infrastructure refactor |
-| 2 | Q2 2026 | Transformer evaluator |
-| 3 | Q2–Q3 2026 | GPU-batched MCTS |
-| 4 | Q3 2026 | Self-play training |
-| 5 | Q4 2026 | Symbolic integration |
-| 6 | Q4 2026+ | v4.0.0 release, ecosystem |
+| Metric | v3.21 (Current) | v4.0 (Target) |
+|------|------------------|--------------|
+| Elo (Consumer GPU) | ~3850 | 4000+ |
+| Elo (Cluster) | ~3900 | 4200+ |
+| Fortress Detection | Depth-reliant | Analytic / Immediate |
+| Endgame Variance | High | Minimal (Smoothed) |
+| Neural Blind Spot Reduction | ~10–20% | ≥40–60% |
+| Language Runtime | MindLang v1 | MindLang v2-Native |
 
 ---
 
-## References
+## 📝 Glossary
 
-- [AlphaZero Paper](https://arxiv.org/abs/1712.01815)
-- [Leela Chess Zero](https://lczero.org/)
-- [MindLang Documentation](https://mindlang.dev/docs)
-- [Remizov ODE Examples](https://mindlang.dev/examples/remizov)
+- **Remizov ODE Solver** — continuous-time framework modeling chess evaluation as a dynamical system  
+- **Attractor** — stable convergence point (forced draw or fortress)  
+- **Feynman–Kac Formula** — stochastic method used in Remizov-Monte-Carlo rollouts  
+- **MindLang** — GPU-native, autodiff-enabled language for neural + symbolic systems  
 
 ---
 
-*© 2026 STARGA Inc. All rights reserved.*
+## 🤝 Contributing
+
+We are actively seeking contributors with experience in:
+
+- MindLang and GPU programming  
+- Stochastic calculus / differential equations  
+- Transformer optimization & large-scale training  
+
+See `CONTRIBUTING.md` to get started.
+
+---
+
+**Repository**: https://github.com/star-ga/NikolaChess  
+**Last Updated**: February 2026  
+© 2026 **STARGA Inc.** All rights reserved.
+````0
