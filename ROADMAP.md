@@ -8,7 +8,7 @@ This document outlines the strategic and technical development plan for **Nikola
 ## 📍 Current Status
 
 - **Current Stable**: v3.21.0  
-- **Playing Strength**: ~3850 Elo (CCRL / CEGT)  
+- **Playing Strength**: ~3850 estimated Elo
 - **Architecture**: NNUE + Alpha-Beta / SPTT Hybrid  
 - **Language**: 100% MindLang  
 - **Execution**: Deterministic, GPU-native
@@ -31,7 +31,7 @@ Instead of asking *“What is the best move now?”*, Nikola asks:
 > **Where does this position converge?**  
 > Is its evaluation an attractor, or a transient illusion?
 
-This roadmap defines a **pragmatic yet ambitious** path to that future.
+This roadmap defines the technical path to that architecture.
 
 ---
 
@@ -88,8 +88,8 @@ graph TD
 
 ## 🛠 Strategic Phases
 
-### Phase 0 — Maintenance & Stabilization  
-**Timeline**: Now → Q1 2026  
+### Phase 0 — Maintenance & Stabilization
+**Timeline**: Ongoing (v3.x LTS)
 **Owner**: Core Team
 
 Objectives:
@@ -107,8 +107,8 @@ Deliverables:
 
 ---
 
-### Phase 1 — Remizov-Monte-Carlo  
-**Timeline**: Q1 2026  
+### Phase 1 — Remizov-Monte-Carlo
+**Timeline**: Q1 → Q2 2026
 **Owner**: Search + Math Team
 
 Introduce continuous evaluation flow into rollouts.
@@ -120,8 +120,8 @@ Deliverables:
 
 ---
 
-### Phase 1.5 — Core Infrastructure Refactor  
-**Timeline**: Q1 2026  
+### Phase 1.5 — Core Infrastructure Refactor
+**Timeline**: Q1 → Q2 2026
 **Owner**: Core / Infra Team
 
 Targets:
@@ -211,7 +211,8 @@ Deliverables:
 - **Remizov ODE Solver** — continuous-time framework modeling chess evaluation as a dynamical system  
 - **Attractor** — stable convergence point (forced draw or fortress)  
 - **Feynman–Kac Formula** — stochastic method used in Remizov-Monte-Carlo rollouts  
-- **MindLang** — GPU-native, autodiff-enabled language for neural + symbolic systems  
+- **SPTT** — Speculative Parallel Tree Traversal, a hybrid search method combining alpha-beta with speculative parallel expansion
+- **MindLang** — GPU-native, autodiff-enabled language for neural + symbolic systems
 
 ---
 
@@ -223,11 +224,10 @@ We are actively seeking contributors with experience in:
 - Stochastic calculus / differential equations  
 - Transformer optimization & large-scale training  
 
-See `CONTRIBUTING.md` to get started.
+See the [Issues](https://github.com/star-ga/NikolaChess/issues) tab to get started.
 
 ---
 
 **Repository**: https://github.com/star-ga/NikolaChess  
 **Last Updated**: February 2026  
 © 2026 **STARGA Inc.** All rights reserved.
-````0
