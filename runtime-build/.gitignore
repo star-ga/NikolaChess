@@ -4,6 +4,13 @@ runtime_cpu.c
 build_macos.sh
 build_windows.bat
 
+# Legacy C-stub auth client — replaced by MIND-language runtime auth
+# in v3.20.0. The old header carried embedded SipHash key material, so
+# even an accidental re-add is treated as a release blocker. The 100%
+# MIND build (Mind.toml `version = "3.20.0"`) does not reference it.
+nikola_auth.h
+nikola_auth.c
+
 # Compiled binaries
 *.so
 *.dylib
