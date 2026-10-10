@@ -73,7 +73,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -312,7 +312,7 @@ jobs:
           }
 
       - name: Upload Libraries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: runtime-${{ matrix.platform }}
           path: output/*
@@ -345,7 +345,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download MIND Compiler (Unix)
         if: runner.os != 'Windows'
@@ -391,7 +391,7 @@ jobs:
 
     steps:
       - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -405,7 +405,7 @@ jobs:
           echo "Total size: $(du -sh artifacts/ | awk '{print $1}')"
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ env.NIKOLACHESS_VERSION }}
           files: artifacts/*
