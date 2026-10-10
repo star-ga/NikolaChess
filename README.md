@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/nikolachess.svg" alt="NikolaChess logo" width="120">
+</p>
+
 # NikolaChess
 
 [![Build](https://github.com/star-ga/NikolaChess/actions/workflows/build.yml/badge.svg)](https://github.com/star-ga/NikolaChess/actions/workflows/build.yml)
@@ -66,6 +70,13 @@ fn batch_eval(positions: &[Board], results: &mut [i32]) {
 ```
 
 **MIND Language**: [mindlang.dev](https://mindlang.dev) | [GitHub](https://github.com/star-ga/mind)
+
+---
+
+## Status
+
+- **Latest release:** [v3.21.0](https://github.com/star-ga/NikolaChess/releases/tag/v3.21.0). The release assets include Linux engine binaries and the MIND-Runtime libraries for Linux, macOS and Windows.
+- **MIND toolchain:** CI and `make setup` pin the MIND compiler at v0.1.9, the version the public `.mind` sources were written against. The current MIND compiler release is [v0.10.2](https://github.com/star-ga/mind/releases/tag/v0.10.2); porting the public sources to MIND 0.10.x syntax is pending, so they do not yet build with mindc 0.10.x.
 
 ---
 

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="eco-nikolachess" role="img" aria-label="NikolaChess">
+<title>NikolaChess</title>
+<style>
+.eco-nikolachess{--i:oklch(0.50 0.17 315);--s:oklch(0.96 0.03 315)}
+@media (prefers-color-scheme:dark){.eco-nikolachess{--i:oklch(0.80 0.12 315);--s:oklch(0.28 0.05 315)}}
+.dark .eco-nikolachess{--i:oklch(0.80 0.12 315);--s:oklch(0.28 0.05 315)}
+.eco-nikolachess .b{fill:var(--eco-applications-surface,var(--s));stroke:var(--eco-applications-ink,var(--i));stroke-opacity:.18}
+.eco-nikolachess .g{fill:none;stroke:var(--eco-applications-ink,var(--i));stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
+.eco-nikolachess .d{stroke-dasharray:2 2.75}
+.eco-nikolachess .a{fill:var(--eco-applications-ink,var(--i))}
+.eco-nikolachess .k{fill:none;stroke:var(--eco-applications-surface,var(--s));stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+</style>
+<rect class="b" x=".5" y=".5" width="23" height="23" rx="5.5"/>
+  <path class="g" d="M7 19.5h10.5"/>
+  <path class="g" d="M8.75 17c.5-3 3.75-4.25 3-6.5l-3.5 1.5-1.75-1.75 3.5-4.25.5-1.75 1.5 1.5c3.5.5 5.25 3.75 4.75 11.25"/>
+  <circle class="a" cx="11.5" cy="8.25" r="1"/>
+</svg>
