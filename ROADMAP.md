@@ -103,6 +103,7 @@ Deliverables:
 |--------|------|--------|
 | v3.21.x | Feedback fixes, NNUE refresh | In progress |
 | v3.22.0 | Backend + time management | Planned |
+| Toolchain | Port the public `.mind` sources to the current MIND compiler release and build them in CI; the compiler pin in `make setup` and the README moves from v0.1.9 to the release that CI built with, written from the CI run | Planned |
 | Build | ARM64 / Windows improvements | Planned |
 
 ---
