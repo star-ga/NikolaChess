@@ -289,3 +289,16 @@ See the [Issues](https://github.com/star-ga/NikolaChess/issues) tab to get start
 **Repository**: https://github.com/star-ga/NikolaChess  
 **Last Updated**: February 2026  
 © 2026 **STARGA Inc.** All rights reserved.
+
+<!-- MIND-NUMERICAL-OPTIMIZATION-REVIEW:BEGIN -->
+## Numerical optimization — review only (2026-10-29)
+- [ ] Compare existing Adam NNUE updates against SGD with momentum and AdamW with pinned training datasets, matched compute and independent Elo/error evaluation.
+- [ ] Evaluate GD, SGD, momentum, Adam/AdamW, L-BFGS and optional BFGS, Newton-CG, SQP, interior-point, Nelder–Mead only on relevant workloads with matched baselines, independent correctness gates and explicit numeric profiles.
+<!-- MIND-NUMERICAL-OPTIMIZATION-REVIEW:END -->
+
+<!-- MIND-ANALYTIC-INEQUALITIES-REVIEW:BEGIN -->
+## Inequality and stability bounds — review only (2026-10-29)
+- [ ] Apply Cauchy–Schwarz, triangle and Chebyshev bounds only with a stated inference/statistical assumption; distinguish empirical confidence from theorem proof.
+- [ ] Review Young, triangle, Markov, Chebyshev, Cauchy–Schwarz, AM–GM, Minkowski, Grönwall, Hölder, Poincaré, Sobolev and Jensen selectively, with stated domain hypotheses and independently checkable finite-precision counterexamples.
+- [ ] No shipping or proof claims until numerical tests, reproducibility, and architecture review pass; existing gates and governance remain authoritative.
+<!-- MIND-ANALYTIC-INEQUALITIES-REVIEW:END -->
