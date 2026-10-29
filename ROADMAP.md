@@ -289,3 +289,11 @@ See the [Issues](https://github.com/star-ga/NikolaChess/issues) tab to get start
 **Repository**: https://github.com/star-ga/NikolaChess  
 **Last Updated**: February 2026  
 © 2026 **STARGA Inc.** All rights reserved.
+
+<!-- NUMERIC-REVIEW-REVISION-20261029:BEGIN -->
+## NNUE optimizer ablation (research)
+- [ ] Verify the present `src/training.mind` Adam training path compiles and executes against the current toolchain, before calling it shipped.
+- [ ] Compare pinned Adam baseline with SGD+momentum and AdamW on identical positions, splits, update counts and compute; report gradient/weight checks, held-out loss, actual match strength with confidence intervals and costs.
+- [ ] Apply Cauchy–Schwarz/triangle only to well-defined numerical norm/error checks; use Chebyshev only when variance and sampling assumptions are explicit.
+**Exit:** reproducible source/seed receipts and statistically defensible strength comparison. No BFGS/SQP/interior-point or PDE work by default.
+<!-- NUMERIC-REVIEW-REVISION-20261029:END -->
