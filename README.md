@@ -605,6 +605,12 @@ NikolaChess implements state-of-the-art chess engine techniques with novel optim
 
 ---
 
+## Community
+
+- **Discussions:** <https://github.com/star-ga/mind/discussions> — questions,
+  ideas and help for NikolaChess and the wider MIND ecosystem.
+- **Discord:** <https://mindlang.dev/discord> — the MindLang community server.
+
 ## License
 
 **Source Code**: Apache License 2.0 - See [LICENSE](LICENSE)
